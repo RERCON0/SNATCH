@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "downcli"
+version = "0.1.0"
+description = "Interactive yt-dlp + aria2c download companion for the terminal"
+requires-python = ">=3.10"
+dependencies = ["questionary>=2.0"]
+
+[project.scripts]
+snatch = "downcli.cli:main"
+down = "downcli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
