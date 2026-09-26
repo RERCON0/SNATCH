@@ -12,7 +12,10 @@ dynamic = ["version"]
 dependencies = ["questionary>=2.0"]
 
 [dependency-groups]
-dev = ["pytest>=8.0"]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.16.9",
+]
 
 [project.scripts]
 snatch = "snatch.cli:main"
@@ -23,3 +26,9 @@ where = ["src"]
 
 [tool.setuptools.dynamic]
 version = { attr = "snatch.__version__" }
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B"]

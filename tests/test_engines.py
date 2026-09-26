@@ -1,7 +1,8 @@
-import pytest
-
 from pathlib import Path
 
+import pytest
+
+from snatch import engines
 from snatch.engines import (
     BuildError,
     Job,
@@ -10,9 +11,10 @@ from snatch.engines import (
     detect_engine,
     is_direct_download,
     preflight_warning,
+    run,
     validate_url,
 )
-from snatch.tools import ToolNotFound, Toolchain
+from snatch.tools import Toolchain, ToolNotFound
 
 TC_BOTH = Toolchain(yt_dlp="yt-dlp", aria2c="aria2c")
 TC_YTDLP = Toolchain(yt_dlp="yt-dlp", aria2c=None)
@@ -50,6 +52,23 @@ def test_validate_rejects_magnet_without_xt():
         validate_url("magnet:?dn=NoHashHere")
 
 
+def test_validate_magnet_xt_key_case_insensitive():
+    m = "magnet:?XT=urn:btih:73510898AF9039563184FAFE9CB0F186DE6AAA4B"
+    assert validate_url(m) == m
+
+
+def test_validate_rejects_control_chars():
+    with pytest.raises(ValueError):
+        validate_url("https://host.com/pa\nth")
+    with pytest.raises(ValueError):
+        validate_url("https://host.com/pa\x00th")
+
+
+def test_validate_rejects_unparseable_url_with_clear_error():
+    with pytest.raises(ValueError, match="разобрать"):
+        validate_url("https://[::1")
+
+
 def test_validate_rejects_unsupported_schemes():
     for bad in ("file:///etc/passwd", "ws://host/x", "sftp://host/x", "ftps://host/x"):
         with pytest.raises(ValueError):
@@ -83,6 +102,19 @@ def test_detect_engine():
     assert detect_engine("https://youtube.com/watch?v=1") == "yt-dlp"
     assert detect_engine("https://host.com/file.zip") == "aria2"
     assert detect_engine("https://host.com/file.MP4?x=1") == "aria2"
+
+
+def test_detect_engine_torrent_goes_to_aria2(tmp_path):
+    f = tmp_path / "a.torrent"
+    f.write_bytes(b"d4:infod0:e")
+    assert detect_engine(str(f)) == "aria2"
+    assert detect_engine("https://host/x.torrent") == "aria2"
+    assert detect_engine("https://host/x.meta4") == "aria2"
+
+
+def test_detect_engine_malformed_url_no_crash():
+    assert detect_engine("https://[::1") == "yt-dlp"
+    assert detect_engine("https://[bad") == "yt-dlp"
 
 
 def test_is_direct_download():
@@ -156,7 +188,9 @@ def test_build_cookies_browser(tmp_path):
 
 def test_build_rejects_bad_browser_name(tmp_path):
     for bad in ("--exec=danger", "chrome;rm", "safari;rm -rf /", "",
-                "nonsense", "somesite:prof", " chrome"):
+                "nonsense", "somesite:prof", " chrome",
+                "chrome:..", "chrome:../evil", "firefox:prof::..\\cnt",
+                "chrome:pro\x00file", "chrome:a\nb"):
         job = Job(engine="yt-dlp", url="https://x", out_dir=tmp_path,
                   cookies_browser=bad)
         with pytest.raises(BuildError):
@@ -166,15 +200,94 @@ def test_build_rejects_bad_browser_name(tmp_path):
 def test_preflight_warns_on_aria2_with_cookies(tmp_path):
     job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path,
               cookies_browser="chrome")
-    warn = preflight_warning(job)
-    assert warn and "yt-dlp" in warn
+    warns = preflight_warning(job)
+    assert any("yt-dlp" in w for w in warns)
     cmd = build(job, TC_ARIA2)
     assert "--cookies-from-browser" not in cmd
 
 
+def test_preflight_warns_on_aria2_with_format(tmp_path):
+    job = Job(engine="aria2", url="https://h/f.zip", out_dir=tmp_path, fmt="audio")
+    warns = preflight_warning(job)
+    assert any("формат" in w.lower() for w in warns)
+
+
 def test_preflight_no_aria2_warning_without_cookies(tmp_path):
     job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path)
-    assert preflight_warning(job) is None
+    assert preflight_warning(job) == []
+
+
+def test_preflight_warns_ffmpeg_missing_for_all_ytdlp_formats(tmp_path, monkeypatch):
+    monkeypatch.setattr(engines.shutil, "which", lambda name: None)
+    for fmt in ("audio", "best", "1080p"):
+        job = Job(engine="yt-dlp", url="https://x", out_dir=tmp_path, fmt=fmt)
+        assert any("ffmpeg" in w for w in preflight_warning(job)), fmt
+
+
+def test_preflight_no_warning_when_ffmpeg_present(tmp_path, monkeypatch):
+    monkeypatch.setattr(engines.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    job = Job(engine="yt-dlp", url="https://x", out_dir=tmp_path, fmt="audio")
+    assert preflight_warning(job) == []
+
+
+def test_build_aria2_max_tries_bounded(tmp_path):
+    job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path)
+    cmd = build(job, TC_ARIA2)
+    assert "--max-tries=10" in cmd
+    assert "--max-tries=0" not in cmd
+
+
+class _FakeProc:
+    def __init__(self, results):
+        self.results = list(results)
+
+    def wait(self, timeout=None):
+        item = self.results.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
+
+
+def test_run_passthrough_codes(monkeypatch):
+    monkeypatch.setattr(engines.subprocess, "Popen", lambda cmd: _FakeProc([0]))
+    assert run(["x"]) == 0
+    monkeypatch.setattr(engines.subprocess, "Popen", lambda cmd: _FakeProc([3]))
+    assert run(["x"]) == 3
+
+
+def test_run_missing_binary_127(monkeypatch):
+    def boom(cmd):
+        raise OSError("nope")
+
+    monkeypatch.setattr(engines.subprocess, "Popen", boom)
+    assert run(["x"]) == 127
+
+
+def test_run_signal_code_mapped_posix_style(monkeypatch):
+    monkeypatch.setattr(engines.subprocess, "Popen", lambda cmd: _FakeProc([-2]))
+    assert run(["x"]) == 130
+    monkeypatch.setattr(engines.subprocess, "Popen", lambda cmd: _FakeProc([-9]))
+    assert run(["x"]) == 137
+
+
+def test_run_keyboard_interrupt_child_exits_130(monkeypatch):
+    proc = _FakeProc([KeyboardInterrupt(), 0])
+    monkeypatch.setattr(engines.subprocess, "Popen", lambda cmd: proc)
+    assert run(["x"]) == 130
+
+
+def test_run_keyboard_interrupt_child_stuck_terminates(monkeypatch):
+    import subprocess as sp
+
+    proc = _FakeProc([KeyboardInterrupt(), sp.TimeoutExpired(cmd="x", timeout=5), 0])
+    monkeypatch.setattr(engines.subprocess, "Popen", lambda cmd: proc)
+    assert run(["x"]) == 130
 
 
 def test_build_missing_tool(tmp_path):

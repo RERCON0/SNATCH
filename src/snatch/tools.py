@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +18,8 @@ _WINGET_GLOBS = {
         r"Microsoft\WinGet\Links\yt-dlp.exe",
     ],
     "aria2c": [
-        r"Microsoft\WinGet\Packages\aria2*\**\aria2c.exe",
+        r"Microsoft\WinGet\Packages\aria2*\*\aria2c.exe",
+        r"Microsoft\WinGet\Packages\aria2*\*\*\aria2c.exe",
         r"Microsoft\WinGet\Links\aria2c.exe",
     ],
 }
@@ -60,6 +62,8 @@ def find(name: str) -> str:
             resolved = Path(candidate).expanduser()
             if resolved.is_file():
                 return str(resolved)
+            print(f"⚠ {env} указывает на несуществующий файл: {candidate!r} "
+                  "— продолжаю обычный поиск.", file=sys.stderr)
 
     found = shutil.which(name)
     if found:
@@ -85,7 +89,7 @@ class Toolchain:
     aria2c: str | None
 
     @classmethod
-    def discover(cls) -> "Toolchain":
+    def discover(cls) -> Toolchain:
         return cls(yt_dlp=try_find("yt-dlp"), aria2c=try_find("aria2c"))
 
     def require(self, name: str) -> str:

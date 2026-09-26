@@ -8,10 +8,11 @@ import questionary
 from .config import Config
 from .engines import (
     ENGINE_LABELS,
-    FORMATS,
     FORMAT_LABELS,
+    FORMATS,
     detect_engine,
 )
+from .tools import Toolchain
 
 
 def _ask_link(cfg: Config, preset: str | None) -> str | None:
@@ -30,7 +31,12 @@ def _ask_link(cfg: Config, preset: str | None) -> str | None:
     return text.strip() if text else text
 
 
-def _ask_engine(cfg: Config, url: str) -> str | None:
+def _ask_engine(url: str, tc: Toolchain) -> str | None:
+    available = [name for name, exe in (("yt-dlp", tc.yt_dlp), ("aria2", tc.aria2c)) if exe]
+    if not available:
+        return None
+    if len(available) == 1:
+        return available[0]
     guess = detect_engine(url)
     other = "aria2" if guess == "yt-dlp" else "yt-dlp"
     choices = [
@@ -45,7 +51,7 @@ def _ask_format() -> str | None:
     return questionary.select("Формат (yt-dlp):", choices=choices).ask()
 
 
-MAX_BROWSE_ENTRIES = 300
+MAX_BROWSE_ENTRIES = 100
 
 
 def _browse_dir(start: Path) -> str | None:
@@ -97,13 +103,18 @@ def _ask_dir(cfg: Config) -> str | None:
         return None
     if pick != "__browse__":
         return pick
-    return _browse_dir(Path(cfg.default_dir))
+    return _browse_dir(Path(cfg.last_dir or cfg.default_dir))
 
 
-def _confirm(cfg: Config, engine: str, fmt: str, out_dir: str, url: str) -> bool:
+def _confirm(engine: str, fmt: str, out_dir: str, url: str,
+             cookies_browser: str | None) -> bool:
     line = _clip(url, 60)
-    msg = f" yt-dlp · {FORMAT_LABELS.get(fmt, fmt)} · → {_clip(out_dir, 40)}" if engine == "yt-dlp" \
-        else f" aria2c → {_clip(out_dir, 40)}"
+    if engine == "yt-dlp":
+        msg = f" yt-dlp · {FORMAT_LABELS.get(fmt, fmt)} · → {_clip(out_dir, 40)}"
+        if cookies_browser:
+            msg += f" · 🍪 куки: {cookies_browser}"
+    else:
+        msg = f" aria2c → {_clip(out_dir, 40)}"
     return questionary.confirm(f"{msg}\n  {line}\nСкачать?").ask() or False
 
 
@@ -119,13 +130,13 @@ def _safe_iterdir(path: Path):
         return []
 
 
-def collect(cfg: Config, link: str | None = None,
+def collect(cfg: Config, tc: Toolchain, link: str | None = None,
             cookies_browser: str | None = None) -> dict | None:
     """Run the prompts and return a plan dict, or None if the user aborts."""
     url = _ask_link(cfg, link)
     if not url:
         return None
-    engine = _ask_engine(cfg, url)
+    engine = _ask_engine(url, tc)
     if not engine:
         return None
     fmt = "best"
@@ -136,7 +147,8 @@ def collect(cfg: Config, link: str | None = None,
     out_dir = _ask_dir(cfg)
     if not out_dir:
         return None
-    if not _confirm(cfg, engine, fmt, out_dir, url):
+    shown_cookies = cookies_browser if engine == "yt-dlp" else None
+    if not _confirm(engine, fmt, out_dir, url, shown_cookies):
         return None
     return {"url": url, "engine": engine, "fmt": fmt, "out_dir": out_dir,
             "cookies_browser": cookies_browser}

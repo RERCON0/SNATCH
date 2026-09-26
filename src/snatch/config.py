@@ -40,7 +40,7 @@ class Config:
         return config_dir() / "config.json"
 
     @classmethod
-    def load(cls) -> "Config":
+    def load(cls) -> Config:
         p = config_dir() / "config.json"
         try:
             data = json.loads(p.read_text("utf-8"))
@@ -63,7 +63,10 @@ class Config:
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_suffix(".tmp")
-            tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), "utf-8")
+            payload = json.dumps(asdict(self), ensure_ascii=False, indent=2)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(payload)
             if os.name == "posix":
                 with contextlib.suppress(OSError):
                     os.chmod(tmp, 0o600)

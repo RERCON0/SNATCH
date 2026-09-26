@@ -1,7 +1,7 @@
 import pytest
 
 from snatch import tools
-from snatch.tools import ToolNotFound, Toolchain, find
+from snatch.tools import Toolchain, ToolNotFound, find
 
 
 def test_env_override_used(tmp_path, monkeypatch):
@@ -11,10 +11,13 @@ def test_env_override_used(tmp_path, monkeypatch):
     assert find("yt-dlp") == str(exe)
 
 
-def test_env_override_missing_file_ignored(tmp_path, monkeypatch):
+def test_env_override_missing_file_warns_and_falls_back(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("SNATCH_YT_DLP", str(tmp_path / "gone.exe"))
     monkeypatch.setattr(tools.shutil, "which", lambda name: "C:/fake/yt-dlp.exe")
     assert find("yt-dlp") == "C:/fake/yt-dlp.exe"
+    err = capsys.readouterr().err
+    assert "SNATCH_YT_DLP" in err
+    assert "gone.exe" in err
 
 
 def test_which_found(monkeypatch):

@@ -20,7 +20,7 @@ from .engines import (
     run,
     validate_url,
 )
-from .tools import ToolNotFound, Toolchain
+from .tools import Toolchain, ToolNotFound
 
 BANNER = r"""
  ____    __  __  ______  ______  ____     __  __
@@ -69,18 +69,20 @@ def _plan_from_args(args: argparse.Namespace) -> dict | None:
             "cookies_browser": args.cookies_browser}
 
 
-def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
+def _download(plan: dict, cfg: Config, tc: Toolchain | None = None) -> int:
     try:
         url = validate_url(plan["url"])
     except ValueError as exc:
         print(f"✘ {exc}", file=sys.stderr)
         return 2
 
+    if tc is None:
+        tc = Toolchain.discover()
+
     job = Job(engine=plan["engine"], url=url,
               out_dir=Path(plan["out_dir"]), fmt=plan["fmt"],
               cookies_browser=plan.get("cookies_browser"))
-    warn = preflight_warning(job)
-    if warn:
+    for warn in preflight_warning(job):
         print(f"⚠ {warn}", file=sys.stderr)
 
     try:
@@ -151,7 +153,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.yes:
         plan = _plan_from_args(args)
-        return _download(plan, cfg, Toolchain.discover()) if plan else 2
+        return _download(plan, cfg) if plan else 2
 
     tc = Toolchain.discover()
     if not (tc.yt_dlp or tc.aria2c):
@@ -159,15 +161,15 @@ def main(argv: list[str] | None = None) -> int:
               "(например, через winget).", file=sys.stderr)
         return 2
 
-    print(BANNER)
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         print("✘ Интерактивный режим требует настоящий терминал. "
               "Используй Windows Terminal/cmd или режим -y со ссылкой и -o.",
               file=sys.stderr)
         return 2
+    print(BANNER)
     try:
         while True:
-            plan = ui.collect(cfg, link=args.url, cookies_browser=args.cookies_browser)
+            plan = ui.collect(cfg, tc, link=args.url, cookies_browser=args.cookies_browser)
             args.url = None
             if plan is None:
                 print("Отменено.")
