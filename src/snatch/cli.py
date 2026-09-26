@@ -31,7 +31,10 @@ BANNER = r"""
    \ `\____\ \_\ \_\ \_\ \_\ \ \_\ \ \____/ \ \_\ \_\
     \/_____/\/_/\/_/\/_/\/_/  \/_/  \/___/   \/_/\/_/
                        yt-dlp + aria2c mini-combine
+                             by rercon prod.
 """
+
+WINDOW_TITLE = "\x1b]0;SNATCH — by rercon prod.\x07"
 
 
 def _force_utf8() -> None:
@@ -55,7 +58,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
                         "safari, chromium, whale) — для «Sign in to confirm you're not a bot» "
                         "и возрастных ограничений")
     p.add_argument("--clear-history", action="store_true", help="Забыть последние ссылки и папки")
-    p.add_argument("--version", action="version", version=f"snatch {__version__}")
+    p.add_argument("--version", action="version",
+                   version=f"snatch {__version__} — by rercon prod.")
     return p.parse_args(argv)
 
 
@@ -166,6 +170,7 @@ def main(argv: list[str] | None = None) -> int:
               "Используй Windows Terminal/cmd или режим -y со ссылкой и -o.",
               file=sys.stderr)
         return 2
+    print(WINDOW_TITLE, end="")
     print(BANNER)
     try:
         while True:
