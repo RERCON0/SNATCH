@@ -1,6 +1,7 @@
 """Persistent config and history (last dirs, last links)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
@@ -64,10 +65,8 @@ class Config:
             tmp = p.with_suffix(".tmp")
             tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), "utf-8")
             if os.name == "posix":
-                try:
+                with contextlib.suppress(OSError):
                     os.chmod(tmp, 0o600)
-                except OSError:
-                    pass
             tmp.replace(p)
         except OSError as exc:
             print(f"⚠ Не удалось сохранить настройки: {exc}", file=sys.stderr)

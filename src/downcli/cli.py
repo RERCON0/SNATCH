@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import sys
 from pathlib import Path
 
@@ -34,10 +35,8 @@ BANNER = r"""
 
 def _force_utf8() -> None:
     for stream in (sys.stdout, sys.stderr):
-        try:
+        with contextlib.suppress(AttributeError, OSError):
             stream.reconfigure(encoding="utf-8", errors="replace")
-        except (AttributeError, OSError):
-            pass
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:

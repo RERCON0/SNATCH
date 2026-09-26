@@ -18,10 +18,35 @@ TC_YTDLP = Toolchain(yt_dlp="yt-dlp", aria2c=None)
 TC_ARIA2 = Toolchain(yt_dlp=None, aria2c="aria2c")
 
 
+MAGNET_OK = "magnet:?xt=urn:btih:73510898AF9039563184FAFE9CB0F186DE6AAA4"
+
+
 def test_validate_accepts_supported():
     assert validate_url("https://example.com/v.mp4") == "https://example.com/v.mp4"
-    assert validate_url("  magnet:?xt=urn:btih:abc ") == "magnet:?xt=urn:btih:abc"
+    assert validate_url(f"  {MAGNET_OK} ") == MAGNET_OK
     assert validate_url("ftp://host/file.zip") == "ftp://host/file.zip"
+
+
+def test_validate_accepts_magnet_with_tracker_and_name():
+    magnet = f"{MAGNET_OK}&tr=http%3A%2F%2Fbt.example.org%2Fann&dn=Some%20Name"
+    assert validate_url(magnet) == magnet
+
+
+def test_validate_rejects_corrupted_magnet():
+    # Same link as MAGNET_OK, but with both "&" separators lost/mangled the
+    # way a Windows terminal paste bug in prompt_toolkit did in practice:
+    # one "&" dropped, the other replaced by a stray letter.
+    corrupted = (
+        "magnet:?xt=urn:btih:73510898AF9039563184FAFE9CB0F186DE6AAA4Btr="
+        "http%3A%2F%2Fbt.example.org%2Fanndn=Name"
+    )
+    with pytest.raises(ValueError):
+        validate_url(corrupted)
+
+
+def test_validate_rejects_magnet_without_xt():
+    with pytest.raises(ValueError):
+        validate_url("magnet:?dn=NoHashHere")
 
 
 def test_validate_rejects_unsupported_schemes():

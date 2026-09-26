@@ -1,11 +1,13 @@
 """Building and running yt-dlp / aria2c commands."""
 from __future__ import annotations
 
+import contextlib
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse
 
 from .tools import ToolNotFound, Toolchain
 
@@ -23,6 +25,11 @@ FILE_EXT = {
 
 ALLOWED_SCHEMES = {"http", "https", "ftp"}
 TORRENT_FILES = {".torrent", ".metalink", ".meta4"}
+
+# BEP-9: "xt" (exact topic, the info-hash) is the one mandatory magnet
+# parameter. If a terminal/paste bug mangles the query string (dropped or
+# mistranslated "&"), the params glue together and this stops matching.
+MAGNET_XT_RE = re.compile(r"^urn:[a-z0-9]+:[A-Za-z0-9]{16,100}$", re.IGNORECASE)
 
 FORMATS = {
     "best": [],
@@ -50,6 +57,14 @@ def clean_url(raw: str) -> str:
     return raw.strip().strip("\"'").strip()
 
 
+def _has_valid_xt(magnet: str) -> bool:
+    query = magnet.split("?", 1)[1] if "?" in magnet else ""
+    return any(
+        key == "xt" and MAGNET_XT_RE.match(value)
+        for key, value in parse_qsl(query, keep_blank_values=True)
+    )
+
+
 def validate_url(url: str) -> str:
     """Normalize and reject anything that could be parsed as tool options."""
     u = clean_url(url)
@@ -58,6 +73,12 @@ def validate_url(url: str) -> str:
     if u.startswith("-"):
         raise ValueError("Ссылка не может начинаться с «-» (похоже на опцию, а не на URL).")
     if u.lower().startswith("magnet:"):
+        if not _has_valid_xt(u):
+            raise ValueError(
+                "Ссылка magnet повреждена (не найден корректный xt=urn:...). "
+                "Похоже, часть символов «&» потерялась при вставке в терминал — "
+                "вставьте ссылку ещё раз или передайте её через -y."
+            )
         return u
     parsed = urlparse(u)
     if parsed.scheme in ALLOWED_SCHEMES and parsed.netloc:
@@ -70,7 +91,7 @@ def validate_url(url: str) -> str:
 
 def detect_engine(url: str) -> str:
     parsed = urlparse(clean_url(url))
-    if parsed.scheme in ("magnet", "torrent"):
+    if parsed.scheme == "magnet":
         return "aria2"
     suffix = Path(parsed.path).suffix.lower()
     if suffix in FILE_EXT:
@@ -142,7 +163,5 @@ def _terminate(proc: subprocess.Popen) -> None:
         proc.terminate()
         proc.wait(timeout=5)
     except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt):
-        try:
+        with contextlib.suppress(OSError):
             proc.kill()
-        except OSError:
-            pass

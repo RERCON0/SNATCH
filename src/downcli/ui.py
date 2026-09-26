@@ -19,15 +19,15 @@ def _ask_link(cfg: Config, preset: str | None) -> str | None:
         return preset.strip()
 
     choices = [questionary.Choice("Вставить новую ссылку", value="__new__")]
-    for url in cfg.urls[:6]:
-        choices.append(questionary.Choice(_clip(url), value=url))
+    choices.extend(questionary.Choice(_clip(url), value=url) for url in cfg.urls[:6])
 
     pick = questionary.select("Ссылка:", choices=choices).ask()
     if pick is None:
         return None
     if pick != "__new__":
         return pick
-    return questionary.text("Ссылка:").ask()
+    text = questionary.text("Ссылка:").ask()
+    return text.strip() if text else text
 
 
 def _ask_engine(cfg: Config, url: str) -> str | None:
@@ -61,8 +61,7 @@ def _browse_dir(start: Path) -> str | None:
             questionary.Choice("✓ Выбрать эту папку", value=str(current)),
             questionary.Choice("↑ Наверх", value=".."),
         ]
-        for d in entries:
-            choices.append(questionary.Choice(f"📁 {d.name}", value=f"down::{d}"))
+        choices.extend(questionary.Choice(f"📁 {d.name}", value=f"down::{d}") for d in entries)
         if len(all_dirs) > MAX_BROWSE_ENTRIES:
             choices.append(questionary.Choice(
                 f"… показаны не все папки ({len(all_dirs)}) — поднимитесь выше",
