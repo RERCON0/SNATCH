@@ -1,7 +1,10 @@
 use std::path::{Path, PathBuf};
 
 pub fn clip(text: &str, width: usize) -> String {
-    let t = text.trim();
+    // Labels may come from a hand-edited config or a remote filename. Never
+    // pass C0/DEL controls (notably ESC/OSC) into terminal menus or widgets.
+    let cleaned: String = text.trim().chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    let t = cleaned.trim();
     if t.chars().count() <= width {
         t.to_string()
     } else {
@@ -30,6 +33,9 @@ fn hidden_or_system(_p: &Path) -> bool {
 }
 
 pub fn safe_read_dirs(path: &Path) -> Vec<PathBuf> {
+    if crate::engines::is_unc_path(path) {
+        return Vec::new();
+    }
     let mut out: Vec<PathBuf> = match std::fs::read_dir(path) {
         Ok(entries) => entries
             .flatten()
@@ -59,6 +65,7 @@ mod tests {
         assert_eq!(clip("abcdef", 4), "abc…");
         assert_eq!(clip("abc", 10), "abc");
         assert_eq!(clip("  spaced  ", 20), "spaced");
+        assert_eq!(clip("name\x1b]0;fake title\x07.zip", 80), "name ]0;fake title .zip");
     }
 
     #[test]

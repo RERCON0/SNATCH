@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::ffi::OsString;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -61,7 +61,7 @@ const AUTH_HINTS: &[&str] = &[
 ];
 
 pub fn looks_like_auth(line: &str) -> bool {
-    let lower = line.to_lowercase();
+    let lower = line.to_ascii_lowercase();
     // Require a diagnostics context: both loaders prefix real problems
     // ("ERROR: ..." / "WARNING: ..." in yt-dlp, "... ERROR - ..." in aria2).
     // Without this, a filename or URI merely containing e.g. "forbidden"
@@ -119,6 +119,61 @@ pub fn decode_child_bytes(bytes: &[u8]) -> Cow<'_, str> {
     }
 }
 
+/// Strip terminal escape sequences supplied by downloaded titles/filenames,
+/// preserving CR/LF so a progress line can still update in place in the CLI.
+pub fn sanitize_child_output(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.next() {
+                Some('[') => {
+                    for ch in chars.by_ref() {
+                        if ('@'..='~').contains(&ch) { break; }
+                    }
+                }
+                Some(']') => {
+                    while let Some(ch) = chars.next() {
+                        if ch == '\x07' || (ch == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if matches!(c, '\r' | '\n' | '\t') || !c.is_control() {
+            out.push(c);
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+fn relay_stdout(mut reader: impl Read, mut writer: impl Write) -> std::io::Result<()> {
+    let mut chunk = [0u8; 4096];
+    let mut line = Vec::new();
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 { break; }
+        for &b in &chunk[..n] {
+            if b == b'\n' || b == b'\r' {
+                writer.write_all(sanitize_child_output(&decode_child_bytes(&line)).as_bytes())?;
+                writer.write_all(&[b])?;
+                writer.flush()?;
+                line.clear();
+            } else {
+                line.push(b);
+            }
+        }
+    }
+    if !line.is_empty() {
+        writer.write_all(sanitize_child_output(&decode_child_bytes(&line)).as_bytes())?;
+        writer.flush()?;
+    }
+    Ok(())
+}
+
 fn cp1251_to_utf8(bytes: &[u8]) -> String {
     /// cp1251 0x80-0x9F (0x98 is undefined -> U+FFFD).
     const SPECIAL: [char; 32] = [
@@ -168,10 +223,11 @@ fn has_control_chars(u: &str) -> bool {
 /// against the remote host, leaking the user's NetNTLMv2 hash (offline
 /// cracking / relay), so UNC inputs are refused before any filesystem call.
 fn is_unc_text(s: &str) -> bool {
-    s.starts_with("\\\\") || s.starts_with("//")
+    let bytes = s.as_bytes();
+    bytes.len() >= 2 && matches!(bytes[0], b'\\' | b'/') && matches!(bytes[1], b'\\' | b'/')
 }
 
-fn path_is_unc(p: &Path) -> bool {
+pub fn is_unc_path(p: &Path) -> bool {
     use std::path::{Component, Prefix};
     is_unc_text(&p.to_string_lossy())
         || matches!(
@@ -408,7 +464,7 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     // authentication against the remote host (NetNTLMv2 leak), and a
     // *successful* one would silently write the user's downloads to a
     // stranger's share (poisoned config/history or a pasted path).
-    if path_is_unc(&expanded) {
+    if is_unc_path(&expanded) {
         return Err(format!(
             "Папка сохранения {} — сетевой UNC-путь. Выберите локальную папку \
              (UNC отклоняется, чтобы Windows не отправляла учётные данные на \
@@ -467,6 +523,10 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
 }
 
 pub fn preflight_warning(job: &Job) -> Vec<String> {
+    preflight_warning_with_ffmpeg(job, job.engine == "yt-dlp" && which("ffmpeg").is_some())
+}
+
+fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool) -> Vec<String> {
     let mut warns = Vec::new();
     if job.engine != "yt-dlp" {
         if job.cookies_browser.is_some() {
@@ -478,7 +538,7 @@ pub fn preflight_warning(job: &Job) -> Vec<String> {
         if job.fmt != "best" {
             warns.push("Формат применим только к yt-dlp — для aria2 он проигнорирован.".to_string());
         }
-    } else if which("ffmpeg").is_none() {
+    } else if !has_ffmpeg {
         if job.fmt == "audio" {
             warns.push("Не найден ffmpeg — извлечение mp3 может не сработать.".to_string());
         } else {
@@ -503,13 +563,16 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
         // lossy decode below tolerates.
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
-        .stderr(if capture_stderr { Stdio::piped() } else { Stdio::inherit() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Ok(c) => c,
         Err(_) => return RunResult { code: 127, auth_hint: false },
     };
 
+    let stdout = child.stdout.take().expect("stdout piped");
+    let stdout_thread = std::thread::spawn(move || relay_stdout(stdout, std::io::stdout()));
     let mut auth_hint = false;
     if let Some(err) = child.stderr.take() {
         let mut reader = BufReader::new(err);
@@ -525,7 +588,7 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
             // the cp1251 bytes the frozen yt-dlp.exe emits and - via the old
             // `else { break }` - close this pipe out from under the child).
             let line = decode_child_bytes(&buf);
-            if !auth_hint && looks_like_auth(&line) {
+            if capture_stderr && !auth_hint && looks_like_auth(&line) {
                 auth_hint = true;
             }
             // Neutralize C0 control characters (except \n\t\r) before echoing:
@@ -534,16 +597,7 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
             // the decoded String (not raw bytes) also renders correctly on a
             // Windows console: std re-encodes it via WriteConsoleW, whereas
             // raw cp1251 bytes would turn into mojibake/U+FFFD.
-            let cleaned: String = line
-                .chars()
-                .map(|c| {
-                    if (c as u32) < 0x20 && !matches!(c, '\n' | '\t' | '\r') {
-                        ' '
-                    } else {
-                        c
-                    }
-                })
-                .collect();
+            let cleaned = sanitize_child_output(&line);
             let _ = sink.write_all(cleaned.as_bytes());
             let _ = sink.flush();
         }
@@ -553,6 +607,7 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
         Ok(status) => status.code().unwrap_or(130),
         Err(_) => 127,
     };
+    let _ = stdout_thread.join();
     RunResult { code, auth_hint }
 }
 
@@ -663,8 +718,11 @@ mod tests {
         for bad in [
             r"\\evil.com\share\movie.torrent",
             "//evil.com/share/movie.torrent",
+            r"\/evil.com\share\movie.torrent",
+            r"/\evil.com\share\movie.torrent",
             r"\\?\UNC\evil.com\share\movie.torrent",
         ] {
+            assert!(is_unc_path(Path::new(bad)), "{bad}");
             assert!(validate_url(bad).is_err(), "{bad}");
         }
     }
@@ -957,6 +1015,21 @@ mod tests {
     }
 
     #[test]
+    fn yt_dlp_warns_about_missing_ffmpeg_for_audio_and_video() {
+        let job = Job {
+            engine: "yt-dlp".into(),
+            url: "https://video.example/123".into(),
+            out_dir: PathBuf::from("out"),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
+        assert!(preflight_warning_with_ffmpeg(&job, false).iter().any(|w| w.contains("склейка")));
+        assert!(preflight_warning_with_ffmpeg(&job, true).is_empty());
+        let audio = Job { fmt: "audio".into(), ..job };
+        assert!(preflight_warning_with_ffmpeg(&audio, false).iter().any(|w| w.contains("mp3")));
+    }
+
+    #[test]
     fn auth_hint_patterns() {
         for line in [
             "ERROR: [youtube] x: Sign in to confirm you're not a bot",
@@ -1030,6 +1103,14 @@ mod tests {
         assert_eq!(decode_child_bytes(b"\xa8\xb8").as_ref(), "\u{0401}\u{0451}");
         // undefined 0x98 decodes to the replacement char, not a panic
         assert_eq!(decode_child_bytes(b"\x98").as_ref(), "\u{FFFD}");
+    }
+
+    #[test]
+    fn relayed_stdout_keeps_cr_progress_without_terminal_escape_injection() {
+        let source = b"[download] 10%\r\x1b]0;FAKE\x07[download] 20%\x1b[31m\n";
+        let mut output = Vec::new();
+        relay_stdout(&source[..], &mut output).unwrap();
+        assert_eq!(String::from_utf8(output).unwrap(), "[download] 10%\r[download] 20%\n");
     }
 
     #[test]

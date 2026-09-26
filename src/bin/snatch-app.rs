@@ -1,4 +1,4 @@
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -12,7 +12,7 @@ use eframe::egui;
 
 use snatch_rs::config::{home_dir, Config};
 use snatch_rs::engines::{
-    self, detect_engine, looks_like_auth, parse_progress, preflight_warning, validate_url, Job,
+    self, detect_engine, is_unc_path, looks_like_auth, parse_progress, preflight_warning, validate_url, Job,
     COOKIES_BROWSERS, FORMATS,
 };
 use snatch_rs::setup::{install_aria2, install_yt_dlp};
@@ -203,6 +203,12 @@ struct DirBrowser {
     listed_for: Option<PathBuf>,
 }
 
+fn apply_initial_discovery(current: &mut Toolchain, setup_started: bool, discovered: Toolchain) {
+    if !setup_started {
+        *current = discovered;
+    }
+}
+
 struct SnatchApp {
     url: String,
     engine_mode: EngineMode,
@@ -212,6 +218,9 @@ struct SnatchApp {
     cookies_browser: String,
     cfg: Config,
     tc: Toolchain,
+    /// Startup discovery may finish after an installer run; its stale result
+    /// must never replace the toolchain found by SetupDone.
+    setup_started: bool,
     phase: Phase,
     progress: Option<f32>,
     status: String,
@@ -237,6 +246,8 @@ struct SnatchApp {
     /// (CancelClose) until the job is actually killed, then drain() reissues
     /// Close - otherwise the process exits while the loader keeps running.
     close_requested: bool,
+    #[cfg(windows)]
+    maximized: bool,
     /// Bumped on every push_log; the log window re-joins its text only when
     /// this differs from log_cache_rev instead of every frame.
     log_rev: u64,
@@ -269,7 +280,7 @@ struct SnatchApp {
 /// building, adjust it up/down and rebuild - nothing else needs to change.
 const MONO_Y_OFFSET: f32 = 0.15;
 
-// SIL OFL 1.1 (c) Microsoft Corporation, see rust/fonts/OFL-notice.txt
+// SIL OFL 1.1 (c) Microsoft Corporation, see fonts/OFL-notice.txt
 const BUNDLED_MONO: &[u8] = include_bytes!("../../fonts/CascadiaMono-Light.ttf");
 
 fn setup_theme(ctx: &egui::Context) {
@@ -494,12 +505,11 @@ fn dashed_separator(ui: &mut egui::Ui) {
 /// from the mockup grew by the scale factor, so the app never matched the
 /// HTML side by side. Pinning pixels_per_point to a constant makes one
 /// design px equal UI_SCALE physical px on any display, whatever the OS
-/// reports. UI_SCALE is 1.0 (design px = physical px, exactly the mockup)
-/// plus a touch: side by side with the HTML the pure 1:1 read a hair small,
-/// so the whole interface got this one global nudge instead of per-widget
+/// reports. UI_SCALE is larger than 1.0: the original 1:1 version read too
+/// small, so the whole interface gets a global nudge instead of per-widget
 /// size edits. The viewport is sized in logical px (OS-scaled), so the
 /// desired physical size is divided back by the native scale.
-const UI_SCALE: f32 = 1.08;
+const UI_SCALE: f32 = 1.18;
 
 fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     if ctx.pixels_per_point() == UI_SCALE {
@@ -509,7 +519,7 @@ fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     ctx.set_pixels_per_point(UI_SCALE);
     if resize_viewport {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            640.0 * UI_SCALE / native,
+            660.0 * UI_SCALE / native,
             640.0 * UI_SCALE / native,
         )));
     }
@@ -576,6 +586,7 @@ impl SnatchApp {
             cookies_browser: "chrome".to_string(),
             cfg,
             tc: Toolchain { yt_dlp: None, aria2c: None },
+            setup_started: false,
             phase: Phase::Idle,
             progress: None,
             status: String::new(),
@@ -603,6 +614,8 @@ impl SnatchApp {
             rx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
             close_requested: false,
+            #[cfg(windows)]
+            maximized: false,
             log_rev: 0,
             log_cache_rev: 0,
             log_cache: String::new(),
@@ -661,7 +674,7 @@ impl SnatchApp {
                 Msg::Progress(p) => self.progress = Some(p),
                 Msg::Done(code) => self.finish_download(code, ctx),
                 Msg::SetupLog(line) => self.push_log(line),
-                Msg::ToolsReady(tc) => self.tc = tc,
+                Msg::ToolsReady(tc) => apply_initial_discovery(&mut self.tc, self.setup_started, tc),
                 Msg::SetupDone(ok, tc) => {
                     self.tc = tc;
                     // Only leave Setup from Setup: an unconditional Idle here
@@ -916,17 +929,17 @@ impl SnatchApp {
                             if due {
                                 last_progress_log = Some(Instant::now());
                                 let _ = tx_out.send(Msg::Log(line));
+                                ctx_out.request_repaint();
                             }
                         }
                         None => {
                             let _ = tx_out.send(Msg::Log(line));
+                            ctx_out.request_repaint();
                         }
                     }
-                    ctx_out.request_repaint();
                 }
             });
             let tx_err = tx.clone();
-            let ctx_err = ctx_w.clone();
             let h_err = std::thread::spawn(move || {
                 // Same lossy byte-read as stdout: stderr can carry the very
                 // same non-UTF-8 cp1251 bytes inside error/warning text.
@@ -940,7 +953,9 @@ impl SnatchApp {
                     }
                     let line = engines::decode_child_bytes(&buf).into_owned();
                     let _ = tx_err.send(Msg::ErrLine(line));
-                    ctx_err.request_repaint();
+                    // Running already schedules repaint every 150ms in drain;
+                    // per-line requests here would redraw the entire window
+                    // for every noisy warning from aria2c.
                 }
             });
 
@@ -975,6 +990,7 @@ impl SnatchApp {
     }
 
     fn start_setup(&mut self, ctx: &egui::Context) {
+        self.setup_started = true;
         self.phase = Phase::Setup;
         // A stale cookies-retry offer must not stay clickable through Setup
         // (it used to spawn a download on top of the installer, and the
@@ -1043,6 +1059,103 @@ impl SnatchApp {
             String::new()
         } else {
             format!("$ найдены: {}", found.join(", "))
+        }
+    }
+
+    #[cfg(windows)]
+    fn ui_title_bar(&mut self, ctx: &egui::Context) {
+        // Borderless Windows viewport: a roomier version of the HTML titlebar, flat,
+        // with a thin line below. The draggable area excludes the window
+        // buttons so a click there never accidentally moves the window.
+        egui::TopBottomPanel::top("app_titlebar")
+            .exact_height(42.0)
+            .show_separator_line(true)
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(0x0e, 0x0e, 0x11))
+                    .inner_margin(egui::Margin::symmetric(14.0, 0.0)),
+            )
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let title_width = (ui.available_width() - 3.0 * 40.0).max(0.0);
+                    let (rect, drag) = ui.allocate_exact_size(
+                        egui::vec2(title_width, 42.0),
+                        egui::Sense::click_and_drag(),
+                    );
+                    ui.painter().text(
+                        egui::pos2(rect.left(), rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        "SNATCH — by rercon prod.",
+                        egui::FontId::new(13.0, egui::FontFamily::Name("title".into())),
+                        egui::Color32::from_rgb(0x83, 0x83, 0x8c),
+                    );
+                    if drag.double_clicked() {
+                        self.maximized = !ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
+                    } else if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                    }
+                    if ui.add_sized([40.0, 38.0], egui::Button::new("─").frame(false))
+                        .on_hover_text("Свернуть")
+                        .clicked()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    }
+                    if ui.add_sized([40.0, 38.0], egui::Button::new("□").frame(false))
+                        .on_hover_text("Развернуть / восстановить")
+                        .clicked()
+                    {
+                        self.maximized = !ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
+                    }
+                    if ui.add_sized([40.0, 38.0], egui::Button::new("×").frame(false))
+                        .on_hover_text("Закрыть")
+                        .clicked()
+                    {
+                        match self.phase {
+                            Phase::Running => {
+                                self.close_requested = true;
+                                self.cancel();
+                            }
+                            Phase::Setup => {
+                                self.close_requested = true;
+                                self.set_status(StatusKind::Warn, "Завершаю установку перед закрытием…");
+                            }
+                            Phase::Idle => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        }
+                    }
+                });
+            });
+    }
+
+    #[cfg(windows)]
+    fn ui_resize_edges(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized)) { return; }
+        let screen = ctx.screen_rect();
+        let e = 6.0;
+        let w = screen.width();
+        let h = screen.height();
+        let handles = [
+            (egui::pos2(0.0, 0.0), egui::vec2(e, e), egui::ResizeDirection::NorthWest),
+            (egui::pos2(e, 0.0), egui::vec2(w - 2.0 * e, e), egui::ResizeDirection::North),
+            (egui::pos2(w - e, 0.0), egui::vec2(e, e), egui::ResizeDirection::NorthEast),
+            (egui::pos2(0.0, e), egui::vec2(e, h - 2.0 * e), egui::ResizeDirection::West),
+            (egui::pos2(w - e, e), egui::vec2(e, h - 2.0 * e), egui::ResizeDirection::East),
+            (egui::pos2(0.0, h - e), egui::vec2(e, e), egui::ResizeDirection::SouthWest),
+            (egui::pos2(e, h - e), egui::vec2(w - 2.0 * e, e), egui::ResizeDirection::South),
+            (egui::pos2(w - e, h - e), egui::vec2(e, e), egui::ResizeDirection::SouthEast),
+        ];
+        for (i, (pos, size, direction)) in handles.into_iter().enumerate() {
+            egui::Area::new(egui::Id::new(("window_resize", i)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .show(ctx, |ui| {
+                    let (_, response) = ui.allocate_exact_size(size, egui::Sense::drag());
+                    if response.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                    }
+                });
         }
     }
 
@@ -1251,9 +1364,13 @@ impl SnatchApp {
         // Cheap bitmask query - a drive plugged in since startup shows up.
         self.drives = list_drives();
         let typed = PathBuf::from(self.out_dir.trim());
+        if is_unc_path(&typed) {
+            self.set_status(StatusKind::Err, "Сетевую UNC-папку нельзя открывать. Выберите локальную папку.");
+            return;
+        }
         let start = if typed.is_dir() {
             typed
-        } else if let Some(parent) = typed.parent().filter(|p| p.is_dir()) {
+        } else if let Some(parent) = typed.parent().filter(|p| !is_unc_path(p) && p.is_dir()) {
             parent.to_path_buf()
         } else {
             home_dir().unwrap_or_else(|| PathBuf::from("."))
@@ -1277,7 +1394,7 @@ impl SnatchApp {
         let mut chosen: Option<PathBuf> = None;
         let mut navigate: Option<PathBuf> = None;
         let cur = self.browser.current.clone();
-        let entries = self.browser.entries.clone();
+        let entries = &self.browser.entries;
         let home = home_dir().unwrap_or_default();
         let drives = self.drives.clone();
 
@@ -1367,7 +1484,9 @@ impl SnatchApp {
         // open even though out_dir had already been updated.
         self.browser.open = still_open;
         if let Some(p) = navigate {
-            self.browser.current = p;
+            if !is_unc_path(&p) {
+                self.browser.current = p;
+            }
         }
         if let Some(p) = chosen {
             self.out_dir = p.to_string_lossy().into_owned();
@@ -1476,18 +1595,63 @@ impl eframe::App for SnatchApp {
         // the pin is re-asserted every frame, not just at startup.
         pin_pixel_scale(ctx, false);
         self.drain(ctx);
-        if ctx.input(|i| i.viewport().close_requested()) && self.phase == Phase::Running {
+        if ctx.input(|i| i.viewport().close_requested()) && self.phase != Phase::Idle {
             // eframe exits the event loop in THIS frame unless the close is
             // vetoed - the old flag-only version let the process die before
             // the monitor thread (100ms poll) reached kill(), orphaning the
             // loader mid-download. Veto, cancel properly (job object kills
             // the whole tree), and drain() re-issues Close once Idle.
             self.close_requested = true;
-            self.cancel();
+            if self.phase == Phase::Running {
+                self.cancel();
+            } else {
+                self.set_status(StatusKind::Warn, "Завершаю установку перед закрытием…");
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        #[cfg(windows)]
+        self.ui_title_bar(ctx);
+
+        // The mockup's footer is its own full-width band, with a hairline at
+        // the top and 26px side padding. Keeping it outside the scrollable
+        // form also prevents long status/warning text from overlapping it.
+        egui::TopBottomPanel::bottom("app_footer")
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(0x0e, 0x0e, 0x11))
+                    .inner_margin(egui::Margin::symmetric(26.0, 10.0)),
+            )
+            .show_separator_line(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.weak(egui::RichText::new(format!("snatch {APP_VERSION}")).size(11.0));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.hyperlink_to(
+                            egui::RichText::new("t.me/ArtemMurzin").size(11.0),
+                            TELEGRAM_URL,
+                        );
+                    });
+                });
+            });
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(0x0b, 0x0b, 0x0e))
+                    .inner_margin(egui::Margin::symmetric(26.0, 18.0)),
+            )
+            .show(ctx, |ui| {
+            // The HTML window is 660px wide, with 26px content padding. A
+            // resized native window may be wider; keep the form centred at
+            // the same 608px maximum instead of stretching fields edge to edge.
+            let width = ui.available_width().min(608.0);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, ui.available_height()),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
                 let lines: Vec<&str> = BANNER.trim().lines().collect();
@@ -1558,9 +1722,13 @@ impl eframe::App for SnatchApp {
                 // Actionable warning - this one earns the attention.
                 ui.colored_label(
                     WARN_COLOR,
-                    format!("Не найдены загрузчики: {} — могу скачать их сам.", missing.join(", ")),
+                    if cfg!(windows) {
+                        format!("Не найдены загрузчики: {} — могу скачать их сам.", missing.join(", "))
+                    } else {
+                        format!("Не найдены загрузчики: {} — установите их вручную.", missing.join(", "))
+                    },
                 );
-                if ui
+                if cfg!(windows) && ui
                     .add_enabled(
                         self.phase == Phase::Idle,
                         egui::Button::new("установить загрузчики"),
@@ -1642,40 +1810,25 @@ impl eframe::App for SnatchApp {
                 ui.colored_label(color, &self.status);
             }
 
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.weak(egui::RichText::new(format!("snatch {APP_VERSION}")).size(11.0));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.hyperlink_to(
-                            egui::RichText::new("t.me/ArtemMurzin").size(11.0),
-                            TELEGRAM_URL,
-                        );
-                    });
-                });
-                ui.separator();
-                // A CollapsingHeader inline here competed for space with the
-                // form above it inside this bottom_up section: once an error
-                // plus a full log pushed total content past the window's
-                // actual height, egui doesn't reflow/scroll the overflow, it
-                // just overlaps - the footer text rendered on top of the log.
-                // A separate floating Window (same pattern as "Выбор папки")
-                // has its own independent size and can't collide with the
-                // main layout at all.
-                // mockup's .collapsible is plain 12px mute text, not a boxed
-                // button - the frame made it read as a shrunken control.
-                if ui
-                    .add(
-                        egui::Button::new(egui::RichText::new("▸ журнал").color(LABEL_MUTE))
-                            .frame(false),
-                    )
-                    .clicked()
-                {
-                    self.show_log_window = true;
-                }
+            // The journal link belongs to the form content, above the footer.
+            ui.add_space(14.0);
+            if ui
+                .add(
+                    egui::Button::new(egui::RichText::new("▸ журнал").color(LABEL_MUTE))
+                        .frame(false),
+                )
+                .clicked()
+            {
+                self.show_log_window = true;
+            }
+            });
+                    },
+                );
             });
         });
         self.ui_log_window(ctx);
+        #[cfg(windows)]
+        self.ui_resize_edges(ctx);
     }
 }
 
@@ -1708,9 +1861,11 @@ fn app_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([640.0, 640.0])
+        .with_inner_size([660.0, 640.0])
         .with_min_inner_size([560.0, 520.0])
         .with_title("SNATCH — by rercon prod.");
+    #[cfg(windows)]
+    { viewport = viewport.with_decorations(false); }
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
@@ -1720,4 +1875,20 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(SnatchApp::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn late_startup_discovery_does_not_undo_installed_tools() {
+        let installed = PathBuf::from("installed-aria2c.exe");
+        let mut tools = Toolchain { yt_dlp: None, aria2c: Some(installed.clone()) };
+        apply_initial_discovery(&mut tools, true, Toolchain { yt_dlp: None, aria2c: None });
+        assert_eq!(tools.aria2c, Some(installed));
+        let mut not_installed = Toolchain { yt_dlp: None, aria2c: None };
+        apply_initial_discovery(&mut not_installed, false, tools);
+        assert!(not_installed.aria2c.is_some());
+    }
 }

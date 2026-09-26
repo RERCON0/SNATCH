@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -80,7 +80,26 @@ fn sha512_hex(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+fn yt_dlp_checksum(sums: &str) -> Option<&str> {
+    sums.lines().find_map(|line| {
+        let mut it = line.split_whitespace();
+        let hash = it.next()?;
+        let name = it.next()?;
+        (name.trim_start_matches('*') == "yt-dlp.exe").then_some(hash)
+    })
+}
+
+fn copy_limited(reader: impl Read, mut writer: impl Write, max: u64) -> Result<(), String> {
+    let n = std::io::copy(&mut reader.take(max + 1), &mut writer)
+        .map_err(|e| format!("сбой распаковки: {e}"))?;
+    if n > max { return Err(format!("aria2c.exe больше {max} байт — похоже на подмену или битый архив")); }
+    Ok(())
+}
+
 pub fn install_yt_dlp(bin: &Path) -> Result<PathBuf, String> {
+    if !cfg!(windows) {
+        return Err("Автоустановка yt-dlp поддерживается только на Windows.".to_string());
+    }
     match install_yt_dlp_inner(bin) {
         Ok(p) => Ok(p),
         Err(e) => {
@@ -94,7 +113,9 @@ fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, String> {
     let c = client()?;
     let dest = bin.join("yt-dlp.exe");
     let tmp = bin.join("yt-dlp.exe.part");
-    crate::outln("⬇ Скачиваю yt-dlp.exe (официальный релиз)…");
+    if std::io::stdout().is_terminal() {
+        crate::outln("⬇ Скачиваю yt-dlp.exe (официальный релиз)…");
+    }
     download(&c, YT_DLP_URL, &tmp, "yt-dlp.exe")?;
 
     let sums = c
@@ -106,21 +127,8 @@ fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, String> {
         // surfaces as the misleading "no entry for yt-dlp.exe" error.
         return Err(format!("не удалось скачать SHA2-512SUMS: HTTP {}", sums.status()));
     }
-    let expected = sums
-        .text()
-        .map_err(|e| format!("не удалось прочитать SHA2-512SUMS: {e}"))?
-        .lines()
-        .find_map(|line| {
-            let mut it = line.split_whitespace();
-            let hash = it.next()?;
-            let name = it.next()?;
-            if name.trim_start_matches('*') == "yt-dlp.exe" {
-                Some(hash.to_string())
-            } else {
-                None
-            }
-        })
-        .ok_or("в SHA2-512SUMS нет записи для yt-dlp.exe")?;
+    let sums_text = sums.text().map_err(|e| format!("не удалось прочитать SHA2-512SUMS: {e}"))?;
+    let expected = yt_dlp_checksum(&sums_text).ok_or("в SHA2-512SUMS нет записи для yt-dlp.exe")?;
 
     let got = sha512_hex(&tmp)?;
     if !got.eq_ignore_ascii_case(&expected) {
@@ -133,6 +141,9 @@ fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn install_aria2(bin: &Path) -> Result<PathBuf, String> {
+    if !cfg!(windows) {
+        return Err("Автоустановка aria2c поддерживается только на Windows.".to_string());
+    }
     match install_aria2_inner(bin) {
         Ok(p) => Ok(p),
         Err(e) => {
@@ -145,7 +156,9 @@ pub fn install_aria2(bin: &Path) -> Result<PathBuf, String> {
 
 fn install_aria2_inner(bin: &Path) -> Result<PathBuf, String> {
     let c = client()?;
-    crate::outln("⬇ Ищу свежий релиз aria2…");
+    if std::io::stdout().is_terminal() {
+        crate::outln("⬇ Ищу свежий релиз aria2…");
+    }
     let api = c
         .get(ARIA2_API)
         .send()
@@ -198,13 +211,7 @@ fn install_aria2_inner(bin: &Path) -> Result<PathBuf, String> {
                 archive.by_index(entry_idx).map_err(|e| format!("не удалось прочитать zip: {e}"))?;
             let mut out =
                 File::create(&tmp).map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
-            let mut limited = (&mut entry).take(MAX_ARIA2C_BYTES + 1);
-            let n = std::io::copy(&mut limited, &mut out).map_err(|e| format!("сбой распаковки: {e}"))?;
-            if n > MAX_ARIA2C_BYTES {
-                return Err(format!(
-                    "aria2c.exe больше {MAX_ARIA2C_BYTES} байт — похоже на подмену или битый архив"
-                ));
-            }
+            copy_limited(&mut entry, &mut out, MAX_ARIA2C_BYTES)?;
         }
         std::fs::rename(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))
     })();
@@ -214,4 +221,26 @@ fn install_aria2_inner(bin: &Path) -> Result<PathBuf, String> {
     let _ = std::fs::remove_file(&zip_path);
     extracted?;
     Ok(dest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checksum_selects_exact_executable_not_a_similar_name() {
+        let sums = "aaa  other-yt-dlp.exe\nbbb *yt-dlp.exe\nccc  yt-dlp.exe.bad\n";
+        assert_eq!(yt_dlp_checksum(sums), Some("bbb"));
+        assert_eq!(yt_dlp_checksum("aaa yt-dlp.exe.bad"), None);
+    }
+
+    #[test]
+    fn bounded_extraction_rejects_more_than_the_limit() {
+        let mut out = Vec::new();
+        assert!(copy_limited(&b"12345"[..], &mut out, 4).is_err());
+        assert!(out.len() <= 5);
+        let mut out = Vec::new();
+        copy_limited(&b"1234"[..], &mut out, 4).unwrap();
+        assert_eq!(out, b"1234");
+    }
 }

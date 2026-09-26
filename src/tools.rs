@@ -153,13 +153,9 @@ pub fn find(name: &str) -> Option<PathBuf> {
     winget_candidates(name).into_iter().max_by_key(|p| mtime(p))
 }
 
-pub fn try_find(name: &str) -> Option<PathBuf> {
-    find(name)
-}
-
 impl Toolchain {
     pub fn discover() -> Self {
-        Self { yt_dlp: try_find("yt-dlp"), aria2c: try_find("aria2c") }
+        Self { yt_dlp: find("yt-dlp"), aria2c: find("aria2c") }
     }
 
     // Shared by both binaries. The GUI has its own proactive "не найдены
