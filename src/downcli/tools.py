@@ -44,22 +44,30 @@ def _winget_candidates(name: str) -> list[Path]:
     return out
 
 
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def find(name: str) -> str:
     """Return an absolute path to the executable or raise ToolNotFound."""
     env = _ENV_OVERRIDES.get(name)
     if env:
         candidate = os.environ.get(env)
-        if candidate and Path(candidate).expanduser().is_file():
-            return str(Path(candidate).expanduser())
+        if candidate:
+            resolved = Path(candidate).expanduser()
+            if resolved.is_file():
+                return str(resolved)
 
-    for probe in (name, f"{name}.exe"):
-        found = shutil.which(probe)
-        if found:
-            return found
+    found = shutil.which(name)
+    if found:
+        return found
 
     hits = _winget_candidates(name)
     if hits:
-        return str(hits[-1])
+        return str(max(hits, key=_mtime))
 
     raise ToolNotFound(name)
 

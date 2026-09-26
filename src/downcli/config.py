@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -14,6 +15,16 @@ def config_dir() -> Path:
     if base:
         return Path(base) / "snatch"
     return Path.home() / ".config" / "snatch"
+
+
+def _opt_str(value: object) -> str:
+    return value if isinstance(value, str) else ""
+
+
+def _str_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, str)]
 
 
 @dataclass
@@ -34,17 +45,32 @@ class Config:
             data = json.loads(p.read_text("utf-8"))
         except (OSError, ValueError):
             data = {}
-        cfg = cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+        if not isinstance(data, dict):
+            data = {}
+        cfg = cls(
+            default_dir=_opt_str(data.get("default_dir")),
+            last_dir=_opt_str(data.get("last_dir")),
+            urls=_str_list(data.get("urls")),
+            dirs=_str_list(data.get("dirs")),
+        )
         if not cfg.default_dir:
             cfg.default_dir = str(Path.home() / "Downloads")
         return cfg
 
     def save(self) -> None:
         p = self.path
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), "utf-8")
-        tmp.replace(p)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(asdict(self), ensure_ascii=False, indent=2), "utf-8")
+            if os.name == "posix":
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
+            tmp.replace(p)
+        except OSError as exc:
+            print(f"⚠ Не удалось сохранить настройки: {exc}", file=sys.stderr)
 
     def remember_url(self, url: str) -> None:
         self.urls = [url, *(u for u in self.urls if u != url)][:MAX_HISTORY]

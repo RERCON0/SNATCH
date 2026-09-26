@@ -40,31 +40,42 @@ def _ask_engine(cfg: Config, url: str) -> str | None:
     return questionary.select("Чем скачивать:", choices=choices).ask()
 
 
-def _ask_format(url: str) -> str | None:
+def _ask_format() -> str | None:
     choices = [questionary.Choice(FORMAT_LABELS[key], value=key) for key in FORMATS]
     return questionary.select("Формат (yt-dlp):", choices=choices).ask()
+
+
+MAX_BROWSE_ENTRIES = 300
 
 
 def _browse_dir(start: Path) -> str | None:
     """Minimal interactive directory browser (name -> descend, .. -> up)."""
     current = start if start.exists() else Path.home()
     while True:
-        entries = [
+        all_dirs = [
             p for p in _safe_iterdir(current)
             if p.is_dir() and not p.name.startswith(".")
         ]
+        entries = all_dirs[:MAX_BROWSE_ENTRIES]
         choices = [
             questionary.Choice("✓ Выбрать эту папку", value=str(current)),
             questionary.Choice("↑ Наверх", value=".."),
         ]
         for d in entries:
             choices.append(questionary.Choice(f"📁 {d.name}", value=f"down::{d}"))
+        if len(all_dirs) > MAX_BROWSE_ENTRIES:
+            choices.append(questionary.Choice(
+                f"… показаны не все папки ({len(all_dirs)}) — поднимитесь выше",
+                value="__more__",
+            ))
         ans = questionary.select(f"Папка: {current}", choices=choices).ask()
         if ans is None:
             return None
         if ans == "..":
             if current.parent != current:
                 current = current.parent
+            continue
+        if ans == "__more__":
             continue
         if ans.startswith("down::"):
             current = Path(ans[len("down::"):])
@@ -119,7 +130,7 @@ def collect(cfg: Config, link: str | None = None) -> dict | None:
         return None
     fmt = "best"
     if engine == "yt-dlp":
-        fmt = _ask_format(url)
+        fmt = _ask_format()
         if fmt is None:
             return None
     out_dir = _ask_dir(cfg)

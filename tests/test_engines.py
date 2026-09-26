@@ -1,0 +1,135 @@
+import pytest
+
+from pathlib import Path
+
+from downcli.engines import (
+    BuildError,
+    Job,
+    build,
+    clean_url,
+    detect_engine,
+    is_direct_download,
+    validate_url,
+)
+from downcli.tools import ToolNotFound, Toolchain
+
+TC_BOTH = Toolchain(yt_dlp="yt-dlp", aria2c="aria2c")
+TC_YTDLP = Toolchain(yt_dlp="yt-dlp", aria2c=None)
+TC_ARIA2 = Toolchain(yt_dlp=None, aria2c="aria2c")
+
+
+def test_validate_accepts_supported():
+    assert validate_url("https://example.com/v.mp4") == "https://example.com/v.mp4"
+    assert validate_url("  magnet:?xt=urn:btih:abc ") == "magnet:?xt=urn:btih:abc"
+    assert validate_url("ftp://host/file.zip") == "ftp://host/file.zip"
+
+
+def test_validate_rejects_unsupported_schemes():
+    for bad in ("file:///etc/passwd", "ws://host/x", "sftp://host/x", "ftps://host/x"):
+        with pytest.raises(ValueError):
+            validate_url(bad)
+
+
+def test_validate_rejects_option_like():
+    with pytest.raises(ValueError):
+        validate_url("-x")
+    with pytest.raises(ValueError):
+        validate_url("   ")
+    with pytest.raises(ValueError):
+        validate_url("\"\"")
+
+
+def test_validate_torrent_file(tmp_path):
+    f = tmp_path / "a.torrent"
+    f.write_bytes(b"d4:infod0:e")
+    assert validate_url(str(f)) == str(f)
+    with pytest.raises(ValueError):
+        validate_url(str(tmp_path / "missing.torrent"))
+
+
+def test_clean_url_strips_quotes():
+    assert clean_url('  "https://x"  ') == "https://x"
+    assert clean_url("'https://x'") == "https://x"
+
+
+def test_detect_engine():
+    assert detect_engine("magnet:?xt=1") == "aria2"
+    assert detect_engine("https://youtube.com/watch?v=1") == "yt-dlp"
+    assert detect_engine("https://host.com/file.zip") == "aria2"
+    assert detect_engine("https://host.com/file.MP4?x=1") == "aria2"
+
+
+def test_is_direct_download():
+    assert is_direct_download("https://host/file.zip")
+    assert is_direct_download("ftp://host/file.iso")
+    assert not is_direct_download("https://youtube.com/watch?v=1")
+    assert not is_direct_download("magnet:?xt=1")
+    assert not is_direct_download("https://host/page.html")
+
+
+def test_build_aria2(tmp_path):
+    job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path / "d")
+    cmd = build(job, TC_ARIA2)
+    assert cmd[1] == "--no-conf"
+    assert cmd[cmd.index("-d") + 1] == str(tmp_path / "d")
+    assert cmd[-2] == "--"
+    assert cmd[-1] == "magnet:?xt=1"
+
+
+def test_build_ytdlp_page_no_external_downloader(tmp_path):
+    job = Job(engine="yt-dlp", url="https://youtube.com/watch?v=1", out_dir=tmp_path)
+    cmd = build(job, TC_BOTH)
+    assert "--ignore-config" in cmd
+    assert "--no-playlist" in cmd
+    assert "--external-downloader" not in cmd
+    assert cmd[-2:] == ["--", "https://youtube.com/watch?v=1"]
+
+
+def test_build_ytdlp_direct_link_uses_external_downloader(tmp_path):
+    job = Job(engine="yt-dlp", url="https://host/file.zip", out_dir=tmp_path)
+    cmd = build(job, TC_BOTH)
+    assert cmd[cmd.index("--external-downloader") + 1] == "aria2c"
+    args = cmd[cmd.index("--external-downloader-args") + 1]
+    assert "--no-conf" in args
+
+
+def test_build_ytdlp_no_aria2_tool_no_external(tmp_path):
+    job = Job(engine="yt-dlp", url="https://host/file.zip", out_dir=tmp_path)
+    cmd = build(job, TC_YTDLP)
+    assert "--external-downloader" not in cmd
+
+
+def test_build_format_flags(tmp_path):
+    job = Job(engine="yt-dlp", url="https://youtube.com/watch?v=1",
+              out_dir=tmp_path, fmt="1080p")
+    cmd = build(job, TC_YTDLP)
+    assert "bv*[height<=1080]+ba/b[height<=1080]" in cmd
+    job = Job(engine="yt-dlp", url="https://youtube.com/watch?v=1",
+              out_dir=tmp_path, fmt="audio")
+    cmd = build(job, TC_YTDLP)
+    assert "-x" in cmd
+
+
+def test_build_out_dir_neutralized(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    job = Job(engine="yt-dlp", url="https://x", out_dir=Path("-P"))
+    cmd = build(job, TC_YTDLP)
+    value = cmd[cmd.index("-P") + 1]
+    assert not value.startswith("-")
+    assert Path(value).is_absolute()
+
+
+def test_build_missing_tool(tmp_path):
+    job = Job(engine="yt-dlp", url="https://x", out_dir=tmp_path)
+    with pytest.raises(ToolNotFound):
+        build(job, TC_ARIA2)
+
+
+def test_build_mkdir_failure(tmp_path, monkeypatch):
+    def boom(self, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("pathlib.Path.mkdir", boom)
+    job = Job(engine="yt-dlp", url="https://x", out_dir=tmp_path / "sub")
+    with pytest.raises(BuildError):
+        build(job, TC_YTDLP)

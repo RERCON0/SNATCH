@@ -21,7 +21,7 @@ FILE_EXT = {
     ".mp3", ".flac", ".ogg", ".wav", ".jpg", ".jpeg", ".png", ".webp",
 }
 
-ALLOWED_SCHEMES = {"http", "https", "ftp", "ftps", "sftp", "ws", "wss"}
+ALLOWED_SCHEMES = {"http", "https", "ftp"}
 TORRENT_FILES = {".torrent", ".metalink", ".meta4"}
 
 FORMATS = {
@@ -40,6 +40,10 @@ ENGINE_LABELS = {
     "yt-dlp": "yt-dlp — видео и стримы (YouTube и ещё тысячи сайтов)",
     "aria2": "aria2c — прямые ссылки, torrent, magnet",
 }
+
+
+class BuildError(RuntimeError):
+    """Command could not be constructed."""
 
 
 def clean_url(raw: str) -> str:
@@ -61,7 +65,7 @@ def validate_url(url: str) -> str:
     p = Path(u)
     if p.suffix.lower() in TORRENT_FILES and p.is_file():
         return u
-    raise ValueError(f"Не понимаю ссылку: {u!r} (нужен http(s)://, ftp(s)://, magnet: или .torrent-файл).")
+    raise ValueError(f"Не понимаю ссылку: {u!r} (нужен http(s)://, ftp://, magnet: или .torrent-файл).")
 
 
 def detect_engine(url: str) -> str:
@@ -74,6 +78,12 @@ def detect_engine(url: str) -> str:
     return "yt-dlp"
 
 
+def is_direct_download(url: str) -> bool:
+    parsed = urlparse(url)
+    return (parsed.scheme in ALLOWED_SCHEMES
+            and Path(parsed.path).suffix.lower() in FILE_EXT)
+
+
 @dataclass
 class Job:
     engine: str
@@ -83,20 +93,25 @@ class Job:
 
 
 def build(job: Job, tc: Toolchain) -> list[str]:
-    job.out_dir.mkdir(parents=True, exist_ok=True)
+    out = job.out_dir.expanduser().absolute()
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise BuildError(f"Не удалось создать папку {out}: {exc}") from exc
+
     if job.engine == "aria2":
         exe = tc.require("aria2c")
         # --no-conf: never load aria2.conf from cwd/APPDATA (option hijacking)
-        return [exe, "--no-conf", "-d", str(job.out_dir),
+        return [exe, "--no-conf", "-d", str(out),
                 *ARIA2_RESUME, *ARIA2_WORKERS, "--", job.url]
 
     exe = tc.require("yt-dlp")
     # --ignore-config: never load yt-dlp.conf from cwd (would allow --exec RCE)
-    cmd = [exe, "--ignore-config", "-P", str(job.out_dir), "--no-playlist"]
+    cmd = [exe, "--ignore-config", "-P", str(out), "--no-playlist"]
     cmd += FORMATS.get(job.fmt, [])
-    if tc.aria2c:
-        name = "aria2c" if shutil.which("aria2c") else tc.aria2c
-        cmd += ["--external-downloader", name, "--external-downloader-args", EXTERNAL_ARIA2_ARGS]
+    if tc.aria2c and is_direct_download(job.url):
+        cmd += ["--external-downloader", tc.aria2c,
+                "--external-downloader-args", EXTERNAL_ARIA2_ARGS]
     cmd += ["--", job.url]
     return cmd
 
@@ -109,6 +124,25 @@ def preflight_warning(job: Job) -> str | None:
 
 def run(cmd: list[str]) -> int:
     try:
-        return subprocess.call(cmd)
+        proc = subprocess.Popen(cmd)
+    except OSError:
+        return 127
+    try:
+        return proc.wait()
     except KeyboardInterrupt:
+        try:
+            proc.wait(timeout=5)
+        except (subprocess.TimeoutExpired, KeyboardInterrupt):
+            _terminate(proc)
         return 130
+
+
+def _terminate(proc: subprocess.Popen) -> None:
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired, KeyboardInterrupt):
+        try:
+            proc.kill()
+        except OSError:
+            pass

@@ -9,7 +9,15 @@ import questionary
 
 from . import __version__, ui
 from .config import Config
-from .engines import Job, build, detect_engine, preflight_warning, run, validate_url
+from .engines import (
+    BuildError,
+    Job,
+    build,
+    detect_engine,
+    preflight_warning,
+    run,
+    validate_url,
+)
 from .tools import ToolNotFound, Toolchain
 
 BANNER = r"""
@@ -71,7 +79,7 @@ def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
 
     try:
         cmd = build(job, tc)
-    except ToolNotFound as exc:
+    except (ToolNotFound, BuildError) as exc:
         print(f"✘ {exc}", file=sys.stderr)
         return 2
 
@@ -84,6 +92,9 @@ def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
         print(f"✔ Готово: {plan['out_dir']}")
     elif code == 130:
         print("Прервано пользователем (файл можно докачать той же командой).")
+    elif code == 127:
+        print("✘ Не удалось запустить загрузчик (бинарник пропал или не исполняем).",
+              file=sys.stderr)
     else:
         print(f"✘ Ошибка (код {code}).", file=sys.stderr)
     return code
@@ -95,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
     cfg = Config.load()
 
     if args.clear_history:
-        cfg.urls, cfg.dirs = [], []
+        cfg.urls, cfg.dirs, cfg.last_dir = [], [], ""
         cfg.save()
         print("История очищена.")
         return 0
@@ -104,11 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         plan = _plan_from_args(args)
         return _download(plan, cfg, Toolchain.discover()) if plan else 2
 
-    try:
-        tc = Toolchain.discover()
-    except ToolNotFound as exc:  # pragma: no cover — discover never raises
-        print(f"✘ {exc}", file=sys.stderr)
-        return 2
+    tc = Toolchain.discover()
     if not (tc.yt_dlp or tc.aria2c):
         print("✘ Не найдено ни одного инструмента: поставь yt-dlp и/или aria2c "
               "(например, через winget).", file=sys.stderr)
