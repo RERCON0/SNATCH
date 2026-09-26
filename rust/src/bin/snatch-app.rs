@@ -1392,12 +1392,29 @@ impl eframe::App for SnatchApp {
     }
 }
 
+// Source PNG is 1262x1246 - egui::IconData wants a square whose side is a
+// multiple of 4 (viewport.rs's own doc comment recommends 256x256), so this
+// center-crops the shorter side away before downscaling rather than
+// distorting the aspect ratio.
+const ICON_PNG: &[u8] = include_bytes!("../../icons/icon.png");
+
+fn app_icon() -> egui::IconData {
+    use image::GenericImageView;
+    let img = image::load_from_memory(ICON_PNG).expect("bundled icons/icon.png is a valid PNG");
+    let (w, h) = img.dimensions();
+    let side = w.min(h);
+    let cropped = img.crop_imm((w - side) / 2, (h - side) / 2, side, side);
+    let rgba = cropped.resize_exact(256, 256, image::imageops::FilterType::Lanczos3).into_rgba8();
+    egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([640.0, 640.0])
             .with_min_inner_size([560.0, 520.0])
-            .with_title("SNATCH — by rercon prod."),
+            .with_title("SNATCH — by rercon prod.")
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
