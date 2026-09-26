@@ -1,7 +1,7 @@
 import pytest
 
-from downcli import tools
-from downcli.tools import ToolNotFound, Toolchain, find
+from snatch import tools
+from snatch.tools import ToolNotFound, Toolchain, find
 
 
 def test_env_override_used(tmp_path, monkeypatch):

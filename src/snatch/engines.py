@@ -111,6 +111,7 @@ class Job:
     url: str
     out_dir: Path
     fmt: str = "best"
+    cookies_browser: str | None = None
 
 
 def build(job: Job, tc: Toolchain) -> list[str]:
@@ -129,6 +130,10 @@ def build(job: Job, tc: Toolchain) -> list[str]:
     exe = tc.require("yt-dlp")
     # --ignore-config: never load yt-dlp.conf from cwd (would allow --exec RCE)
     cmd = [exe, "--ignore-config", "-P", str(out), "--no-playlist"]
+    if job.cookies_browser is not None:
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", job.cookies_browser):
+            raise BuildError(f"Некорректное имя браузера для куки: {job.cookies_browser!r}")
+        cmd += ["--cookies-from-browser", job.cookies_browser]
     cmd += FORMATS.get(job.fmt, [])
     if tc.aria2c and is_direct_download(job.url):
         cmd += ["--external-downloader", tc.aria2c,

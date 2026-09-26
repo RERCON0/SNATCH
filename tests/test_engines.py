@@ -2,7 +2,7 @@ import pytest
 
 from pathlib import Path
 
-from downcli.engines import (
+from snatch.engines import (
     BuildError,
     Job,
     build,
@@ -11,7 +11,7 @@ from downcli.engines import (
     is_direct_download,
     validate_url,
 )
-from downcli.tools import ToolNotFound, Toolchain
+from snatch.tools import ToolNotFound, Toolchain
 
 TC_BOTH = Toolchain(yt_dlp="yt-dlp", aria2c="aria2c")
 TC_YTDLP = Toolchain(yt_dlp="yt-dlp", aria2c=None)
@@ -142,6 +142,28 @@ def test_build_out_dir_neutralized(tmp_path, monkeypatch):
     value = cmd[cmd.index("-P") + 1]
     assert not value.startswith("-")
     assert Path(value).is_absolute()
+
+
+def test_build_cookies_browser(tmp_path):
+    job = Job(engine="yt-dlp", url="https://youtube.com/watch?v=1",
+              out_dir=tmp_path, cookies_browser="chrome")
+    cmd = build(job, TC_YTDLP)
+    assert cmd[cmd.index("--cookies-from-browser") + 1] == "chrome"
+
+
+def test_build_aria2_ignores_cookies(tmp_path):
+    job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path,
+              cookies_browser="chrome")
+    cmd = build(job, TC_ARIA2)
+    assert "--cookies-from-browser" not in cmd
+
+
+def test_build_rejects_bad_browser_name(tmp_path):
+    for bad in ("--exec=danger", "chrome;rm", " chrome", ""):
+        job = Job(engine="yt-dlp", url="https://x", out_dir=tmp_path,
+                  cookies_browser=bad)
+        with pytest.raises(BuildError):
+            build(job, TC_YTDLP)
 
 
 def test_build_missing_tool(tmp_path):

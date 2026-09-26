@@ -49,6 +49,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("-e", "--engine", choices=["yt-dlp", "aria2"], help="Движок (по умолчанию — авто-подсказка)")
     p.add_argument("-f", "--format", choices=["best", "1080p", "audio"], help="Формат для yt-dlp")
     p.add_argument("-y", "--yes", action="store_true", help="Пропустить все вопросы (нужны url и output)")
+    p.add_argument("--cookies-from-browser", dest="cookies_browser", metavar="BROWSER",
+                   help="Откуда взять куки (chrome, firefox, edge, brave, opera, vivaldi, "
+                        "safari, chromium, whale) — для «Sign in to confirm you're not a bot» "
+                        "и возрастных ограничений")
     p.add_argument("--clear-history", action="store_true", help="Забыть последние ссылки и папки")
     p.add_argument("--version", action="version", version=f"snatch {__version__}")
     return p.parse_args(argv)
@@ -60,7 +64,8 @@ def _plan_from_args(args: argparse.Namespace) -> dict | None:
         return None
     engine = args.engine or detect_engine(args.url)
     fmt = args.format or "best"
-    return {"url": args.url, "engine": engine, "fmt": fmt, "out_dir": args.output}
+    return {"url": args.url, "engine": engine, "fmt": fmt, "out_dir": args.output,
+            "cookies_browser": args.cookies_browser.lower() if args.cookies_browser else None}
 
 
 def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
@@ -71,7 +76,8 @@ def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
         return 2
 
     job = Job(engine=plan["engine"], url=url,
-              out_dir=Path(plan["out_dir"]), fmt=plan["fmt"])
+              out_dir=Path(plan["out_dir"]), fmt=plan["fmt"],
+              cookies_browser=plan.get("cookies_browser"))
     warn = preflight_warning(job)
     if warn:
         print(f"⚠ {warn}", file=sys.stderr)
@@ -96,6 +102,42 @@ def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
               file=sys.stderr)
     else:
         print(f"✘ Ошибка (код {code}).", file=sys.stderr)
+    return code
+
+
+BROWSERS = [
+    "chrome", "firefox", "edge", "brave", "opera", "vivaldi", "safari",
+    "chromium", "whale",
+]
+
+COOKIES_RETRY_CODES = frozenset({0, 2, 127, 130})
+
+
+def _should_offer_cookies(plan: dict, code: int) -> bool:
+    return (code not in COOKIES_RETRY_CODES
+            and plan["engine"] == "yt-dlp")
+
+
+def _retry_with_cookies(plan: dict, code: int, cfg: Config, tc: Toolchain) -> int:
+    while _should_offer_cookies(plan, code):
+        had_cookies = bool(plan.get("cookies_browser"))
+        retry = questionary.confirm(
+            f"\nНе скачалось (код {code}). "
+            + ("Попробовать с куками другого браузера?" if had_cookies
+               else "Сайту вроде YouTube часто нужна авторизация: можно взять куки "
+                    "из браузера и повторить. Попробовать?"),
+            default=not had_cookies,
+        ).ask()
+        if not retry:
+            return code
+        browser = questionary.select(
+            "Браузер:",
+            choices=[questionary.Choice(b, value=b) for b in BROWSERS],
+        ).ask()
+        if not browser:
+            return code
+        plan = {**plan, "cookies_browser": browser}
+        code = _download(plan, cfg, tc)
     return code
 
 
@@ -134,6 +176,7 @@ def main(argv: list[str] | None = None) -> int:
                 print("Отменено.")
                 return 130
             code = _download(plan, cfg, tc)
+            code = _retry_with_cookies(plan, code, cfg, tc)
             if not questionary.confirm("\nСкачать ещё что-нибудь?", default=False).ask():
                 return code
     except (KeyboardInterrupt, EOFError):

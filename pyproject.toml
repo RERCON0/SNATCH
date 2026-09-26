@@ -3,8 +3,8 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "downcli"
-version = "0.1.1"
+name = "snatch"
+version = "0.1.2"
 description = "Interactive yt-dlp + aria2c download companion for the terminal"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
@@ -15,8 +15,8 @@ dependencies = ["questionary>=2.0"]
 dev = ["pytest>=8.0"]
 
 [project.scripts]
-snatch = "downcli.cli:main"
-down = "downcli.cli:main"
+snatch = "snatch.cli:main"
+down = "snatch.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,6 +1,6 @@
 import json
 
-from downcli.config import Config
+from snatch.config import Config
 
 
 def _write_cfg(tmp_path, monkeypatch, data):

@@ -101,6 +101,7 @@ snatch "https://host/song.mp3" -y -o "D:\Music" -e aria2
 | `-o, --output <папка>` | Папка сохранения |
 | `-e, --engine {yt-dlp,aria2}` | Движок (по умолчанию — авто-определение) |
 | `-f, --format {best,1080p,audio}` | Формат для yt-dlp |
+| `--cookies-from-browser <браузер>` | Взять куки из браузера (chrome, firefox, edge, brave, opera, vivaldi, safari, chromium, whale) |
 | `-y, --yes` | Не задавать вопросов (требует url и `-o`) |
 | `--clear-history` | Забыть последние ссылки и папки |
 | `--version` | Версия |
@@ -128,6 +129,18 @@ set SNATCH_YT_DLP=C:\tools\yt-dlp.exe
 set SNATCH_ARIA2C=C:\tools\aria2c.exe
 snatch "magnet:?..."
 ```
+
+## Если YouTube просит «Sign in to confirm you're not a bot»
+
+YouTube требует авторизацию для части видео (бот-детект, возрастные ограничения, приватные списки). Залогиньтесь в YouTube в своём браузере и передайте его куки:
+
+```bash
+snatch "https://youtube.com/watch?v=..." -y -o "D:\Music" -f audio --cookies-from-browser chrome
+```
+
+В интерактивном режиме (без `-y`) при сбое SNATCH сам предложит повторить с куками и покажет список браузеров на выбор.
+
+Браузер должен быть закрыт не обязательно, но Firefox при запущенном браузере может держать lock на базе куки — тогда закройте его перед запуском.
 
 ## Безопасность
 
