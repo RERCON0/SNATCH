@@ -685,14 +685,17 @@ impl SnatchApp {
                         Ok(_) => {}
                     }
                     let line = String::from_utf8_lossy(&buf).into_owned();
-                    match parse_progress(&line) {
-                        Some(p) => {
-                            let _ = tx_out.send(Msg::Progress(p));
-                        }
-                        None => {
-                            let _ = tx_out.send(Msg::Log(line));
-                        }
+                    // A progress-shaped line still carries the detail Python's
+                    // CLI showed for free by inheriting the real console (aria2's
+                    // CN:/SD:/DL: peers+speed, yt-dlp's ETA/speed) - sending only
+                    // Progress and dropping the line reduced the GUI to a bare
+                    // percentage with no way to see that detail even by opening
+                    // the log. Send both: the bar still gets its fraction, and
+                    // the line still reaches the status text + log.
+                    if let Some(p) = parse_progress(&line) {
+                        let _ = tx_out.send(Msg::Progress(p));
                     }
+                    let _ = tx_out.send(Msg::Log(line));
                     ctx_out.request_repaint();
                 }
             });
