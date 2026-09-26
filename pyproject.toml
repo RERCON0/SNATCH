@@ -11,7 +11,7 @@ license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 dependencies = ["questionary>=2.0"]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = ["pytest>=8.0"]
 
 [project.scripts]

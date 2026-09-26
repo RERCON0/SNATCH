@@ -55,17 +55,19 @@ SNATCH находит binaries через `PATH`, а на Windows дополни
 
 ### 2. Сам SNATCH
 
-Из корня репозитория:
+Рекомендуется [uv](https://docs.astral.sh/uv/) — изолированное окружение и шимы без ручных venv:
+
+```bash
+uv tool install .
+```
+
+Обычный pip тоже работает:
 
 ```bash
 pip install .
 ```
 
-Либо для разработки (с тестами):
-
-```bash
-pip install -e .[dev]
-```
+Для разработки (с тестами) — см. раздел «Разработка».
 
 После установки доступны две команды-синонима: `snatch` и `down`.
 
@@ -136,8 +138,17 @@ snatch "magnet:?..."
 
 ## Разработка
 
+Проект использует [uv](https://docs.astral.sh/uv/) и lock-файл `uv.lock`:
+
 ```bash
-pip install -e .[dev]
+uv sync          # создать .venv и поставить всё из lock-файла
+uv run pytest    # тесты
+```
+
+Без uv (pip 25.1+):
+
+```bash
+pip install -e . --group dev
 pytest
 ```
 
