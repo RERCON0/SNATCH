@@ -136,8 +136,7 @@ pub fn find(name: &str) -> Option<PathBuf> {
                 return Some(p);
             }
             crate::errln(format!(
-                "⚠ {key} указывает на несуществующий файл: {:?} — продолжаю обычный поиск.",
-                candidate
+                "⚠ {key} указывает на несуществующий файл: {candidate:?} — продолжаю обычный поиск."
             ));
         }
     }
@@ -291,7 +290,11 @@ mod tests {
         std::env::set_var("SNATCH_YT_DLP", &exe);
         assert_eq!(find("yt-dlp"), Some(exe.clone()));
         std::env::set_var("SNATCH_YT_DLP", dir.join("gone.exe"));
-        assert_ne!(find("yt-dlp"), Some(dir.join("gone.exe")));
+        // The old `assert_ne!(find(..), Some(gone))` passed for ANY outcome
+        // (find can never return a non-existent file) - assert the actual
+        // contract instead: the fallback is either nothing or a real file.
+        let fallback = find("yt-dlp");
+        assert!(fallback.is_none_or(|p| p.is_file() && p != dir.join("gone.exe")));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

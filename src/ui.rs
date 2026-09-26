@@ -10,6 +10,25 @@ pub fn clip(text: &str, width: usize) -> String {
     }
 }
 
+/// Windows: FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM. Explorer hides
+/// these (System Volume Information, Recovery, …); the folder browser
+/// shouldn't show them either - picking one only produces a confusing
+/// access-denied deep inside the download.
+#[cfg(windows)]
+fn hidden_or_system(p: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    std::fs::metadata(p)
+        .map(|m| m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
+fn hidden_or_system(_p: &Path) -> bool {
+    false
+}
+
 pub fn safe_read_dirs(path: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = match std::fs::read_dir(path) {
         Ok(entries) => entries
@@ -20,6 +39,7 @@ pub fn safe_read_dirs(path: &Path) -> Vec<PathBuf> {
                     && !p.file_name()
                         .and_then(|n| n.to_str())
                         .is_some_and(|n| n.starts_with('.') || n.starts_with('$'))
+                    && !hidden_or_system(p)
             })
             .collect(),
         Err(_) => Vec::new(),

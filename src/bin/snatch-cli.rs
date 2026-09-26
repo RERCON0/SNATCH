@@ -1,9 +1,10 @@
-//! `snatch` / `down` terminal entry point - was a Rust port of the retired
-//! Python CLI's `cli.py`/`ui.py` (now the only CLI), built on the same
-//! shared `snatch_rs` lib the GUI uses.
+//! `snatch` terminal entry point - was a Rust port of the retired Python
+//! CLI's `cli.py`/`ui.py` (now the only CLI), built on the same shared
+//! `snatch_rs` lib the GUI uses. The old Python-era `down` alias is gone:
+//! it pointed at the exact same entry point and only doubled build/test time.
 
 use std::fmt;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -62,6 +63,10 @@ struct Args {
     /// Забыть последние ссылки и папки
     #[arg(long)]
     clear_history: bool,
+    /// Не докачивать прерванное, начать файл с начала — лечит протухший .part
+    /// («Invalid data» при склейке). В GUI такой повтор происходит автоматически.
+    #[arg(long)]
+    no_continue: bool,
 }
 
 struct Plan {
@@ -70,6 +75,7 @@ struct Plan {
     fmt: String,
     out_dir: String,
     cookies_browser: Option<String>,
+    no_continue: bool,
 }
 
 fn plan_from_args(args: &Args) -> Option<Plan> {
@@ -79,7 +85,14 @@ fn plan_from_args(args: &Args) -> Option<Plan> {
     };
     let engine = args.engine.clone().unwrap_or_else(|| detect_engine(&url).to_string());
     let fmt = args.format.clone().unwrap_or_else(|| "best".to_string());
-    Some(Plan { url, engine, fmt, out_dir: output, cookies_browser: args.cookies_browser.clone() })
+    Some(Plan {
+        url,
+        engine,
+        fmt,
+        out_dir: output,
+        cookies_browser: args.cookies_browser.clone(),
+        no_continue: args.no_continue,
+    })
 }
 
 /// `tc: None` discovers lazily, AFTER `validate_url` succeeds - mirrors
@@ -115,13 +128,19 @@ fn download(plan: &Plan, cfg: &mut Config, tc: Option<&Toolchain>) -> RunResult 
         errln(format!("⚠ {warn}"));
     }
 
-    let cmd = match build(&job, tc) {
+    let mut cmd = match build(&job, tc) {
         Ok(c) => c,
         Err(e) => {
             errln(format!("✘ {e}"));
             return RunResult { code: 2, auth_hint: false };
         }
     };
+    if plan.no_continue && plan.engine == "yt-dlp" {
+        // Same insertion the GUI does: build() always ends with ["--", url],
+        // so len-2 lands the flag after every option and before the URL.
+        let at = cmd.len().saturating_sub(2);
+        cmd.insert(at, "--no-continue".into());
+    }
 
     let result = engines::run(&cmd, plan.engine == "yt-dlp");
     match result.code {
@@ -303,7 +322,12 @@ impl fmt::Display for DirEntryChoice {
         match self {
             DirEntryChoice::Select(p) => write!(f, "✓ Выбрать эту папку ({})", p.display()),
             DirEntryChoice::Up => write!(f, "↑ Наверх"),
-            DirEntryChoice::More(n) => write!(f, "… показаны не все папки ({n}) — поднимитесь выше"),
+            // Honest wording: the list is alphabetical and the tail is never
+            // rendered - "поднимитесь выше" could not reveal it.
+            DirEntryChoice::More(n) => write!(
+                f,
+                "… показаны первые {MAX_BROWSE_ENTRIES} папок по алфавиту (всего {n})"
+            ),
             DirEntryChoice::Down(p) => {
                 write!(f, "📁 {}", p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())
             }
@@ -423,7 +447,7 @@ fn collect(cfg: &Config, tc: &Toolchain, link: Option<String>, cookies_browser: 
     if !confirm_plan(&engine, &fmt, &out_dir, &url, shown_cookies) {
         return None;
     }
-    Some(Plan { url, engine, fmt, out_dir, cookies_browser })
+    Some(Plan { url, engine, fmt, out_dir, cookies_browser, no_continue: false })
 }
 
 fn main() -> std::process::ExitCode {
@@ -445,12 +469,9 @@ fn main() -> std::process::ExitCode {
         return exit_code(code);
     }
 
-    let tc = Toolchain::discover();
-    if tc.yt_dlp.is_none() && tc.aria2c.is_none() {
-        errln("✘ Не найдено ни одного инструмента: поставь yt-dlp и/или aria2c (например, через winget).");
-        return exit_code(2);
-    }
-
+    // Terminal check BEFORE Toolchain::discover(): when stdin/stdout are
+    // piped there's nothing to prompt anyway, and discovery stats every PATH
+    // entry - no reason to pay for that scan just to print the refusal.
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         errln(
             "✘ Интерактивный режим требует настоящий терминал. \
@@ -459,16 +480,31 @@ fn main() -> std::process::ExitCode {
         return exit_code(2);
     }
 
-    print!("{WINDOW_TITLE}");
-    outln(BANNER);
-    outln(format!("                        ✈ {TELEGRAM_URL}\n"));
+    let tc = Toolchain::discover();
+    if tc.yt_dlp.is_none() && tc.aria2c.is_none() {
+        errln("✘ Не найдено ни одного инструмента: поставь yt-dlp и/или aria2c (например, через winget).");
+        return exit_code(2);
+    }
+
+    // The title escape is only printed once VT processing is actually on:
+    // on a legacy conhost (no VT) it used to render as literal "←]0;SNATCH…"
+    // garbage above the banner. inquire/crossterm enables VT later, at the
+    // first prompt - too late for this line.
+    if vt_processing_enabled() {
+        print!("{WINDOW_TITLE}");
+        let _ = std::io::stdout().flush();
+    }
+    outln(BANNER.trim());
+    outln(format!("                        ✈ {TELEGRAM_URL}"));
 
     let mut preset_url = args.url.clone();
     loop {
-        let Some(plan) = collect(&cfg, &tc, preset_url.take(), args.cookies_browser.clone()) else {
+        let Some(mut plan) = collect(&cfg, &tc, preset_url.take(), args.cookies_browser.clone())
+        else {
             outln("Отменено.");
             return exit_code(130);
         };
+        plan.no_continue = args.no_continue;
         let result = download(&plan, &mut cfg, Some(&tc));
         let result = retry_with_cookies(plan, result, &mut cfg, &tc);
         match Confirm::new("\nСкачать ещё что-нибудь?").with_default(false).prompt() {
@@ -478,8 +514,51 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+/// Turns on ENABLE_VIRTUAL_TERMINAL_PROCESSING for stdout; false when stdout
+/// isn't a switchable console (redirect) or the legacy API refuses - caller
+/// then skips the OSC title escape entirely.
+#[cfg(windows)]
+fn vt_processing_enabled() -> bool {
+    use std::ffi::c_void;
+    extern "system" {
+        fn GetStdHandle(n_std_handle: i32) -> *mut c_void;
+        fn GetConsoleMode(h: *mut c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: *mut c_void, mode: u32) -> i32;
+    }
+    const STD_OUTPUT_HANDLE: i32 = -11;
+    const INVALID_HANDLE_VALUE: isize = -1;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        if h.is_null() || h == INVALID_HANDLE_VALUE as *mut c_void {
+            return false;
+        }
+        let mut mode = 0u32;
+        if GetConsoleMode(h, &mut mode) == 0 {
+            return false; // not a console
+        }
+        SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn vt_processing_enabled() -> bool {
+    true
+}
+
+fn exit_code_u8(code: i32) -> u8 {
+    // Child crash statuses arrive as negative i32s (0xC0000005 access
+    // violation -> -1073741819); the old clamp(0,255) mapped ALL of them to
+    // 0 - `snatch -y` in a script would report a crashed download as success.
+    if (0..=255).contains(&code) {
+        code as u8
+    } else {
+        1
+    }
+}
+
 fn exit_code(code: i32) -> std::process::ExitCode {
-    std::process::ExitCode::from(code.clamp(0, 255) as u8)
+    std::process::ExitCode::from(exit_code_u8(code))
 }
 
 // Port of tests/test_cli.py + tests/test_ui.py from the retired Python CLI.
@@ -498,6 +577,7 @@ mod tests {
             fmt: "best".to_string(),
             out_dir: "d".to_string(),
             cookies_browser: None,
+            no_continue: false,
         }
     }
 
@@ -542,7 +622,28 @@ mod tests {
             yes: true,
             cookies_browser: cookies_browser.map(String::from),
             clear_history: false,
+            no_continue: false,
         }
+    }
+
+    #[test]
+    fn plan_from_args_carries_no_continue() {
+        let mut args = args_with(Some("https://x"), Some("d"), None);
+        assert!(!plan_from_args(&args).unwrap().no_continue);
+        args.no_continue = true;
+        assert!(plan_from_args(&args).unwrap().no_continue);
+    }
+
+    #[test]
+    fn exit_code_maps_out_of_range_to_failure() {
+        // A crashed child arrives as a negative i32 (0xC0000005 ->
+        // -1073741819); it must never become exit status 0 ("success").
+        assert_eq!(exit_code_u8(0), 0);
+        assert_eq!(exit_code_u8(1), 1);
+        assert_eq!(exit_code_u8(255), 255);
+        assert_eq!(exit_code_u8(-1073741819), 1);
+        assert_eq!(exit_code_u8(256), 1);
+        assert_eq!(exit_code_u8(-1), 1);
     }
 
     #[test]

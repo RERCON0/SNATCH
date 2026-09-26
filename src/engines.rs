@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -6,7 +7,11 @@ use std::process::{Command, Stdio};
 use crate::config::home_dir;
 use crate::tools::{which, Toolchain};
 
-pub const ARIA2_RESUME: &[&str] = &["-c", "--max-tries=10", "--retry-wait=2", "--auto-file-renaming=false"];
+// --seed-time=0: without it aria2c finishes the download and then keeps
+// seeding until ratio 1.0 (its default) - the process never exits, the GUI
+// sits in "Running" at 100% forever and the CLI never returns the terminal.
+pub const ARIA2_RESUME: &[&str] =
+    &["-c", "--max-tries=10", "--retry-wait=2", "--auto-file-renaming=false", "--seed-time=0"];
 pub const ARIA2_WORKERS: &[&str] = &["-x", "16", "-s", "16", "-k", "1M"];
 
 pub const FILE_EXT: &[&str] = &[
@@ -57,15 +62,27 @@ const AUTH_HINTS: &[&str] = &[
 
 pub fn looks_like_auth(line: &str) -> bool {
     let lower = line.to_lowercase();
-    AUTH_HINTS.iter().any(|p| lower.contains(p))
+    // Require a diagnostics context: both loaders prefix real problems
+    // ("ERROR: ..." / "WARNING: ..." in yt-dlp, "... ERROR - ..." in aria2).
+    // Without this, a filename or URI merely containing e.g. "forbidden"
+    // ("https://host/forbidden-songs.mp3" echoed in an unrelated failure)
+    // flips the auth heuristic and the app nags about browser cookies.
+    let dominated = lower.contains("error") || lower.contains("warning");
+    dominated && AUTH_HINTS.iter().any(|p| lower.contains(p))
 }
 
 pub fn parse_progress(line: &str) -> Option<f32> {
-    if let Some(i) = line.find("%)") {
-        if let Some(start) = line[..i].rfind('(') {
-            if let Ok(p) = line[start + 1..i].parse::<f32>() {
-                if (0.0..=100.0).contains(&p) {
-                    return Some(p / 100.0);
+    // aria2's "(NN%)" summary shape, gated on its "[#<gid> " marker. Without
+    // the gate ANY line containing "(N%)" parses as progress - e.g. a yt-dlp
+    // "[download] Destination: ...(100%).mp4" whose title happens to carry a
+    // percentage would jump the bar to that value.
+    if line.contains("[#") {
+        if let Some(i) = line.find("%)") {
+            if let Some(start) = line[..i].rfind('(') {
+                if let Ok(p) = line[start + 1..i].parse::<f32>() {
+                    if (0.0..=100.0).contains(&p) {
+                        return Some(p / 100.0);
+                    }
                 }
             }
         }
@@ -88,6 +105,46 @@ pub struct RunResult {
     pub auth_hint: bool,
 }
 
+/// Decode one line of child-pipe bytes best-effort: strict UTF-8 first
+/// (aria2c, and a non-frozen yt-dlp honoring our PYTHONIOENCODING=utf-8,
+/// both emit UTF-8), falling back to cp1251 - the Windows ANSI codepage the
+/// frozen yt-dlp.exe actually writes (it ignores the env vars). Plain
+/// from_utf8_lossy turned every cp1251 special into U+FFFD: em-dashes in
+/// video titles and, worse, Russian text inside yt-dlp error messages were
+/// unreadable mojibake in the GUI log and the CLI echo.
+pub fn decode_child_bytes(bytes: &[u8]) -> Cow<'_, str> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => Cow::Borrowed(s),
+        Err(_) => Cow::Owned(cp1251_to_utf8(bytes)),
+    }
+}
+
+fn cp1251_to_utf8(bytes: &[u8]) -> String {
+    /// cp1251 0x80-0x9F (0x98 is undefined -> U+FFFD).
+    const SPECIAL: [char; 32] = [
+        '\u{0402}', '\u{0403}', '\u{201A}', '\u{0453}', '\u{201E}', '\u{2026}', '\u{2020}',
+        '\u{2021}', '\u{20AC}', '\u{2030}', '\u{0409}', '\u{2039}', '\u{040A}', '\u{040C}',
+        '\u{040B}', '\u{040F}', '\u{0452}', '\u{2018}', '\u{2019}', '\u{201C}', '\u{201D}',
+        '\u{2022}', '\u{2013}', '\u{2014}', '\u{FFFD}', '\u{2122}', '\u{0459}', '\u{203A}',
+        '\u{045A}', '\u{045C}', '\u{045B}', '\u{045F}',
+    ];
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
+        let c = match b {
+            0x00..=0x7F => b as char,
+            0x80..=0x9F => SPECIAL[(b - 0x80) as usize],
+            0xA8 => '\u{0401}', // Ё
+            0xB8 => '\u{0451}', // ё
+            // 0xC0-0xFF: the Cyrillic block, contiguous from U+0410.
+            0xC0..=0xFF => char::from_u32(0x0410 + b as u32 - 0xC0).unwrap_or('\u{FFFD}'),
+            // 0xA0-0xBF (minus the two above) match Latin-1 exactly.
+            _ => char::from(b),
+        };
+        out.push(c);
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct Job {
     pub engine: String,
@@ -103,6 +160,25 @@ pub fn clean_url(raw: &str) -> String {
 
 fn has_control_chars(u: &str) -> bool {
     u.chars().any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
+}
+
+/// True for `\\server\share` / `//server/share` style paths (including the
+/// `\\?\UNC\` verbatim form, which also starts with `\\`). Touching such a
+/// path - even just `is_file()` - makes Windows perform SMB authentication
+/// against the remote host, leaking the user's NetNTLMv2 hash (offline
+/// cracking / relay), so UNC inputs are refused before any filesystem call.
+fn is_unc_text(s: &str) -> bool {
+    s.starts_with("\\\\") || s.starts_with("//")
+}
+
+fn path_is_unc(p: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    is_unc_text(&p.to_string_lossy())
+        || matches!(
+            p.components().next(),
+            Some(Component::Prefix(pre))
+                if matches!(pre.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..))
+        )
 }
 
 fn scheme_of(u: &str) -> String {
@@ -218,6 +294,16 @@ pub fn validate_url(url: &str) -> Result<String, String> {
     if u.starts_with('-') {
         return Err("Ссылка не может начинаться с «-» (похоже на опцию, а не на URL).".to_string());
     }
+    // Must come before the .torrent is_file() probe below: stat'ing a UNC
+    // path already authenticates to the remote host.
+    if is_unc_text(&u) {
+        return Err(
+            "Сетевые UNC-пути (\\\\сервер\\шара) не поддерживаются: обращение к ним \
+             отправляет ваши учётные данные Windows на чужой сервер. Сохраните \
+             .torrent-файл локально или используйте http(s)/ftp/magnet-ссылку."
+                .to_string(),
+        );
+    }
     if u.to_lowercase().starts_with("magnet:") {
         if !has_valid_xt(&u) {
             return Err(
@@ -250,7 +336,9 @@ pub fn detect_engine(url: &str) -> &'static str {
     if scheme_of(&u) == "magnet" {
         return "aria2";
     }
-    let suffix = suffix_of(&path_from_url(&u));
+    // Percent-decode first: https://host/file%2Ezip is a .zip just like the
+    // literal spelling and belongs to aria2.
+    let suffix = suffix_of(&percent_decode(&path_from_url(&u)));
     if TORRENT_FILES.contains(&suffix.as_str()) || FILE_EXT.contains(&suffix.as_str()) {
         "aria2"
     } else {
@@ -261,7 +349,7 @@ pub fn detect_engine(url: &str) -> &'static str {
 pub fn is_direct_download(url: &str) -> bool {
     let scheme = scheme_of(url);
     ALLOWED_SCHEMES.contains(&scheme.as_str())
-        && FILE_EXT.contains(&suffix_of(&path_from_url(url)).as_str())
+        && FILE_EXT.contains(&suffix_of(&percent_decode(&path_from_url(url))).as_str())
 }
 
 pub fn validate_cookies_browser(value: &str) -> Result<(), String> {
@@ -316,6 +404,18 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     }
 
     let expanded = expanduser(&job.out_dir);
+    // Before create_dir_all: even a failed mkdir on a UNC path performs SMB
+    // authentication against the remote host (NetNTLMv2 leak), and a
+    // *successful* one would silently write the user's downloads to a
+    // stranger's share (poisoned config/history or a pasted path).
+    if path_is_unc(&expanded) {
+        return Err(format!(
+            "Папка сохранения {} — сетевой UNC-путь. Выберите локальную папку \
+             (UNC отклоняется, чтобы Windows не отправляла учётные данные на \
+             чужой сервер).",
+            expanded.display()
+        ));
+    }
     let out = if expanded.is_absolute() {
         expanded
     } else {
@@ -393,8 +493,16 @@ pub fn preflight_warning(job: &Job) -> Vec<String> {
 }
 
 pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
-    let mut child = match Command::new(&cmd[0])
+    let Some(program) = cmd.first() else {
+        return RunResult { code: 127, auth_hint: false };
+    };
+    let mut child = match Command::new(program)
         .args(&cmd[1..])
+        // Same nudge as the GUI: makes a *non-frozen* (python-based) yt-dlp
+        // emit UTF-8 into pipes; the frozen yt-dlp.exe ignores it, which the
+        // lossy decode below tolerates.
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
         .stderr(if capture_stderr { Stdio::piped() } else { Stdio::inherit() })
         .spawn()
     {
@@ -413,15 +521,30 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
                 Ok(0) | Err(_) => break,
                 Ok(_) => {}
             }
-            // Detect auth hints on a lossy decode (the frozen yt-dlp.exe emits
-            // cp1251, so strict UTF-8 via `lines()` would Err here and the old
-            // `else { break }` closed this pipe), but pass the ORIGINAL bytes
-            // straight through to our stderr untouched.
-            let line = String::from_utf8_lossy(&buf);
+            // Detect auth hints on the decoded line (`lines()` would Err on
+            // the cp1251 bytes the frozen yt-dlp.exe emits and - via the old
+            // `else { break }` - close this pipe out from under the child).
+            let line = decode_child_bytes(&buf);
             if !auth_hint && looks_like_auth(&line) {
                 auth_hint = true;
             }
-            let _ = sink.write_all(&buf);
+            // Neutralize C0 control characters (except \n\t\r) before echoing:
+            // server-controlled text (video titles inside yt-dlp errors) must
+            // not inject raw ESC sequences into the user's terminal. Writing
+            // the decoded String (not raw bytes) also renders correctly on a
+            // Windows console: std re-encodes it via WriteConsoleW, whereas
+            // raw cp1251 bytes would turn into mojibake/U+FFFD.
+            let cleaned: String = line
+                .chars()
+                .map(|c| {
+                    if (c as u32) < 0x20 && !matches!(c, '\n' | '\t' | '\r') {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            let _ = sink.write_all(cleaned.as_bytes());
             let _ = sink.flush();
         }
     }
@@ -535,6 +658,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_unc_paths() {
+        // stat'ing these would leak the user's NetNTLMv2 hash to "evil.com"
+        for bad in [
+            r"\\evil.com\share\movie.torrent",
+            "//evil.com/share/movie.torrent",
+            r"\\?\UNC\evil.com\share\movie.torrent",
+        ] {
+            assert!(validate_url(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn build_rejects_unc_out_dir() {
+        let job = Job {
+            engine: "yt-dlp".into(),
+            url: "https://youtube.com/watch?v=1".into(),
+            out_dir: PathBuf::from(r"\\evil.com\share"),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
+        assert!(build(&job, &tc_ytdlp()).is_err());
+        let job = Job { out_dir: PathBuf::from("//evil.com/share"), ..job };
+        assert!(build(&job, &tc_ytdlp()).is_err());
+    }
+
+    #[test]
     fn clean_url_strips_quotes() {
         assert_eq!(clean_url("  \"https://x\"  "), "https://x");
         assert_eq!(clean_url("'https://x'"), "https://x");
@@ -596,6 +745,8 @@ mod tests {
         assert_eq!(s[s.len() - 2], "--");
         assert_eq!(s[s.len() - 1], "magnet:?xt=1");
         assert!(s.contains(&"--max-tries=10".to_string()));
+        // without it aria2c seeds until ratio 1.0 and never exits
+        assert!(s.contains(&"--seed-time=0".to_string()));
         std::fs::remove_dir_all(&out).ok();
     }
 
@@ -809,13 +960,13 @@ mod tests {
     fn auth_hint_patterns() {
         for line in [
             "ERROR: [youtube] x: Sign in to confirm you're not a bot",
-            "This video is age-restricted",
-            "Private video. Sign in",
-            "This video is members-only",
-            "Login required",
-            "HTTP Error 403: Forbidden",
+            "ERROR: [youtube] x: This video is age-restricted",
+            "ERROR: Private video. Sign in",
+            "WARNING: This video is members-only",
+            "ERROR: Login required",
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden",
             "ERROR: requires authentication",
-            "Join this channel to get access",
+            "ERROR: [youtube] x: Join this channel to get access",
         ] {
             assert!(looks_like_auth(line), "{line}");
         }
@@ -824,6 +975,10 @@ mod tests {
             "ERROR: Video unavailable",
             "HTTP Error 404: Not Found",
             "unable to download webpage: timeout",
+            // diagnostics context required: a bare filename/URI that happens
+            // to contain a hint phrase must not flip the heuristic
+            "CUID#7 - Download aborted. URI=`https://host/forbidden-songs.mp3'",
+            "Sign in to confirm you're not a bot",
         ] {
             assert!(!looks_like_auth(line), "{line}");
         }
@@ -842,6 +997,39 @@ mod tests {
         close(parse_progress("[download] 100% of 1MiB"), 1.0);
         assert_eq!(parse_progress("[download] Destination: file"), None);
         assert_eq!(parse_progress("ERROR: Unsupported URL"), None);
+        // a percentage inside a title/path is not progress
+        assert_eq!(parse_progress("[download] Destination: C:\\v\\Progress (100%).mp4"), None);
+        assert_eq!(parse_progress("[Merger] Merging (50%) something"), None);
+    }
+
+    #[test]
+    fn detect_engine_percent_encoded_suffix() {
+        assert_eq!(detect_engine("https://host/file%2Ezip"), "aria2");
+        assert!(is_direct_download("https://host/file%2Emp4"));
+        assert_eq!(detect_engine("https://host/page%2Ehtml"), "yt-dlp");
+    }
+
+    #[test]
+    fn run_empty_cmd_127() {
+        assert_eq!(run(&[], false).code, 127);
+    }
+
+    #[test]
+    fn decode_child_bytes_utf8_passthrough() {
+        assert_eq!(decode_child_bytes(b"plain ascii\n").as_ref(), "plain ascii\n");
+        assert_eq!(decode_child_bytes("UTF-8 строка — ok".as_bytes()).as_ref(), "UTF-8 строка — ok");
+    }
+
+    #[test]
+    fn decode_child_bytes_cp1251_fallback() {
+        // "Привет — мир" as the frozen yt-dlp.exe writes it on a cp1251
+        // system: Cyrillic in 0xC0-0xFF, em-dash 0x97, curly quote 0x92.
+        let cp1251: &[u8] = b"\xCF\xf0\xe8\xe2\xe5\xf2 \x97 \xec\xe8\xf0\x92";
+        assert_eq!(decode_child_bytes(cp1251).as_ref(), "Привет — мир\u{2019}");
+        // Ё/ё live outside the contiguous Cyrillic block
+        assert_eq!(decode_child_bytes(b"\xa8\xb8").as_ref(), "\u{0401}\u{0451}");
+        // undefined 0x98 decodes to the replacement char, not a panic
+        assert_eq!(decode_child_bytes(b"\x98").as_ref(), "\u{FFFD}");
     }
 
     #[test]

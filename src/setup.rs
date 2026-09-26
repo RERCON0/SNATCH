@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha512};
@@ -10,23 +11,54 @@ const YT_DLP_SUMS_URL: &str =
     "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-512SUMS";
 const ARIA2_API: &str = "https://api.github.com/repos/aria2/aria2/releases/latest";
 
+/// Sanity cap for the extracted aria2c.exe (real one is a few MB). Without a
+/// limit, `io::copy` out of the zip would happily fill the disk from a
+/// deflate bomb served by a compromised/mirrored "release".
+const MAX_ARIA2C_BYTES: u64 = 64 * 1024 * 1024;
+
 fn client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
         .user_agent(concat!("snatch-rs/", env!("CARGO_PKG_VERSION")))
+        // reqwest has NO timeouts by default: a half-dead connection (proxy
+        // accepted TCP, then went silent) blocks read() forever - in the GUI
+        // that's the Setup phase hung with no cancel button.
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| e.to_string())
 }
 
 fn download(c: &reqwest::blocking::Client, url: &str, dest: &Path, label: &str) -> Result<(), String> {
+    match download_inner(c, url, dest, label) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Never leave a truncated .part behind on failure.
+            let _ = std::fs::remove_file(dest);
+            Err(e)
+        }
+    }
+}
+
+fn download_inner(
+    c: &reqwest::blocking::Client,
+    url: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<(), String> {
     let mut resp = c.get(url).send().map_err(|e| format!("не удалось скачать {label}: {e}"))?;
     if !resp.status().is_success() {
         return Err(format!("не удалось скачать {label}: HTTP {}", resp.status()));
     }
     let total = resp.content_length().unwrap_or(0);
-    let bar = ProgressBar::new(total).with_style(
-        ProgressStyle::with_template("{spinner} {wide_bar} {bytes}/{total_bytes} (осталось {eta})")
-            .unwrap_or_else(|_| ProgressStyle::default_bar()),
-    );
+    let bar = if total > 0 {
+        ProgressBar::new(total).with_style(
+            ProgressStyle::with_template("{spinner} {wide_bar} {bytes}/{total_bytes} (осталось {eta})")
+                .unwrap_or_else(|_| ProgressStyle::default_bar()),
+        )
+    } else {
+        // No Content-Length: a determinate bar would read "N/0".
+        ProgressBar::new_spinner()
+    };
     let mut file = File::create(dest).map_err(|e| format!("не удалось создать {}: {e}", dest.display()))?;
     let mut buf = [0u8; 65536];
     loop {
@@ -49,17 +81,34 @@ fn sha512_hex(path: &Path) -> Result<String, String> {
 }
 
 pub fn install_yt_dlp(bin: &Path) -> Result<PathBuf, String> {
+    match install_yt_dlp_inner(bin) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let _ = std::fs::remove_file(bin.join("yt-dlp.exe.part"));
+            Err(e)
+        }
+    }
+}
+
+fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, String> {
     let c = client()?;
     let dest = bin.join("yt-dlp.exe");
     let tmp = bin.join("yt-dlp.exe.part");
     crate::outln("⬇ Скачиваю yt-dlp.exe (официальный релиз)…");
     download(&c, YT_DLP_URL, &tmp, "yt-dlp.exe")?;
 
-    let expected = c
+    let sums = c
         .get(YT_DLP_SUMS_URL)
         .send()
-        .and_then(|r| r.text())
-        .map_err(|e| format!("не удалось скачать SHA2-512SUMS: {e}"))?
+        .map_err(|e| format!("не удалось скачать SHA2-512SUMS: {e}"))?;
+    if !sums.status().is_success() {
+        // Without this check a 403/404 body gets parsed as the sums file and
+        // surfaces as the misleading "no entry for yt-dlp.exe" error.
+        return Err(format!("не удалось скачать SHA2-512SUMS: HTTP {}", sums.status()));
+    }
+    let expected = sums
+        .text()
+        .map_err(|e| format!("не удалось прочитать SHA2-512SUMS: {e}"))?
         .lines()
         .find_map(|line| {
             let mut it = line.split_whitespace();
@@ -84,13 +133,29 @@ pub fn install_yt_dlp(bin: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn install_aria2(bin: &Path) -> Result<PathBuf, String> {
+    match install_aria2_inner(bin) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let _ = std::fs::remove_file(bin.join("aria2c.exe.part"));
+            let _ = std::fs::remove_file(bin.join("aria2.zip.part"));
+            Err(e)
+        }
+    }
+}
+
+fn install_aria2_inner(bin: &Path) -> Result<PathBuf, String> {
     let c = client()?;
     crate::outln("⬇ Ищу свежий релиз aria2…");
-    let release: serde_json::Value = c
+    let api = c
         .get(ARIA2_API)
         .send()
-        .and_then(|r| r.json())
         .map_err(|e| format!("не удалось получить список релизов aria2: {e}"))?;
+    if !api.status().is_success() {
+        return Err(format!("не удалось получить список релизов aria2: HTTP {}", api.status()));
+    }
+    let release: serde_json::Value = api
+        .json()
+        .map_err(|e| format!("не удалось разобрать ответ API релизов aria2: {e}"))?;
     let url = release["assets"]
         .as_array()
         .and_then(|assets| {
@@ -108,31 +173,45 @@ pub fn install_aria2(bin: &Path) -> Result<PathBuf, String> {
     let zip_path = bin.join("aria2.zip.part");
     download(&c, &url, &zip_path, "aria2 (zip)")?;
 
-    let file = File::open(&zip_path).map_err(|e| e.to_string())?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("битый zip: {e}"))?;
-    let entry_idx = (0..archive.len())
-        .filter_map(|i| {
-            archive.by_index(i).ok().and_then(|e| {
-                let name = e.name().to_string();
-                if !e.is_dir() && name.ends_with("aria2c.exe") {
-                    Some((i, name.len()))
-                } else {
-                    None
-                }
-            })
-        })
-        .min_by_key(|(_, len)| *len)
-        .map(|(i, _)| i)
-        .ok_or("внутри zip нет aria2c.exe")?;
-
     let dest = bin.join("aria2c.exe");
     let tmp = bin.join("aria2c.exe.part");
-    {
-        let mut entry = archive.by_index(entry_idx).map_err(|e| e.to_string())?;
-        let mut out = File::create(&tmp).map_err(|e| e.to_string())?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| format!("сбой распаковки: {e}"))?;
-    }
-    std::fs::rename(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))?;
+    let extracted = (|| -> Result<(), String> {
+        let file = File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("битый zip: {e}"))?;
+        let entry_idx = (0..archive.len())
+            .filter_map(|i| {
+                archive.by_index(i).ok().and_then(|e| {
+                    let name = e.name().to_string();
+                    if !e.is_dir() && name.ends_with("aria2c.exe") {
+                        Some((i, name.len()))
+                    } else {
+                        None
+                    }
+                })
+            })
+            .min_by_key(|(_, len)| *len)
+            .map(|(i, _)| i)
+            .ok_or("внутри zip нет aria2c.exe")?;
+
+        {
+            let mut entry =
+                archive.by_index(entry_idx).map_err(|e| format!("не удалось прочитать zip: {e}"))?;
+            let mut out =
+                File::create(&tmp).map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
+            let mut limited = (&mut entry).take(MAX_ARIA2C_BYTES + 1);
+            let n = std::io::copy(&mut limited, &mut out).map_err(|e| format!("сбой распаковки: {e}"))?;
+            if n > MAX_ARIA2C_BYTES {
+                return Err(format!(
+                    "aria2c.exe больше {MAX_ARIA2C_BYTES} байт — похоже на подмену или битый архив"
+                ));
+            }
+        }
+        std::fs::rename(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))
+    })();
+    // The archive file handle must be dropped before Windows lets us delete
+    // it, so cleanup happens after the extraction block regardless of outcome
+    // (previously the zip leaked in bin\ on every failure path).
     let _ = std::fs::remove_file(&zip_path);
+    extracted?;
     Ok(dest)
 }

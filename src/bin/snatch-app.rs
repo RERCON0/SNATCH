@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -59,7 +59,135 @@ enum Msg {
     Progress(f32),
     Done(i32),
     SetupLog(String),
-    SetupDone(bool),
+    /// (успех, обновлённая цепочка инструментов - discover делается в том же
+    /// фоновом потоке, а не на UI-потоке)
+    SetupDone(bool, Toolchain),
+    ToolsReady(Toolchain),
+}
+
+/// Win32 job object with KILL_ON_JOB_CLOSE, hand-rolled FFI (the project
+/// deliberately has no windows/winapi crate). The spawned loader is assigned
+/// to a job for the lifetime of its monitor thread, which fixes two orphan
+/// classes at once:
+/// - "отменить" used to `Child::kill()` only the direct child; yt-dlp's own
+///   children (ffmpeg mid-merge, aria2c as external downloader) survived and
+///   kept writing to the output folder;
+/// - if the GUI itself dies (crash, task-manager kill), the OS closes the
+///   last job handle and takes the whole downloader tree with it.
+///
+/// `TerminateJobObject` on cancel kills the tree in one call.
+#[cfg(windows)]
+mod job_object {
+    use std::ffi::c_void;
+
+    type Handle = *mut c_void;
+
+    #[repr(C)]
+    struct IoCounters {
+        read_ops: u64,
+        write_ops: u64,
+        other_ops: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        other_bytes: u64,
+    }
+
+    #[repr(C)]
+    struct BasicLimitInformation {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    struct ExtendedLimitInformation {
+        basic: BasicLimitInformation,
+        io: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    }
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
+    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+
+    extern "system" {
+        fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> Handle;
+        fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, len: u32) -> i32;
+        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
+        fn CloseHandle(h: Handle) -> i32;
+    }
+
+    pub struct Job {
+        handle: Handle,
+    }
+
+    // The handle is process-global state; it is created on the UI thread and
+    // then owned exclusively by one monitor thread.
+    unsafe impl Send for Job {}
+
+    impl Job {
+        /// Returns None (and leaks nothing) if any step fails - the caller
+        /// falls back to plain Child::kill semantics.
+        pub fn create_and_assign(process: Handle) -> Option<Self> {
+            unsafe {
+                let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+                if handle.is_null() {
+                    return None;
+                }
+                let mut info: ExtendedLimitInformation = std::mem::zeroed();
+                info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+                let ok = SetInformationJobObject(
+                    handle,
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<ExtendedLimitInformation>() as u32,
+                );
+                if ok == 0 || AssignProcessToJobObject(handle, process) == 0 {
+                    CloseHandle(handle);
+                    return None;
+                }
+                Some(Self { handle })
+            }
+        }
+
+        pub fn terminate(&self) {
+            unsafe {
+                TerminateJobObject(self.handle, 1);
+            }
+        }
+    }
+
+    impl Drop for Job {
+        fn drop(&mut self) {
+            unsafe {
+                // Last handle closes -> KILL_ON_JOB_CLOSE reaps whatever of
+                // the tree is still alive.
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+/// Non-Windows placeholder so the monitor-loop code below stays cfg-free.
+#[cfg(not(windows))]
+mod job_object {
+    pub struct Job;
+
+    impl Job {
+        pub fn create_and_assign(_process: *mut std::ffi::c_void) -> Option<Self> {
+            None
+        }
+        pub fn terminate(&self) {}
+    }
 }
 
 struct LastPlan {
@@ -105,6 +233,15 @@ struct SnatchApp {
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
     cancel_flag: Arc<AtomicBool>,
+    /// Set when the user closed the window mid-download: the close is vetoed
+    /// (CancelClose) until the job is actually killed, then drain() reissues
+    /// Close - otherwise the process exits while the loader keeps running.
+    close_requested: bool,
+    /// Bumped on every push_log; the log window re-joins its text only when
+    /// this differs from log_cache_rev instead of every frame.
+    log_rev: u64,
+    log_cache_rev: u64,
+    log_cache: String,
 }
 
 /// "Terminal Native" theme (mockups/b-terminal.html, the approved direction):
@@ -382,6 +519,27 @@ fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     )));
 }
 
+/// Drive letters from the GetLogicalDrives bitmask - defined letters only,
+/// zero filesystem I/O (see new(): the exists() probe could hang startup on
+/// dead network shares). Refreshed each time the folder browser opens, so a
+/// USB stick plugged in mid-session shows up.
+#[cfg(windows)]
+fn list_drives() -> Vec<PathBuf> {
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| (mask >> i) & 1 == 1)
+        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+fn list_drives() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 impl SnatchApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         setup_theme(&cc.egui_ctx);
@@ -393,14 +551,22 @@ impl SnatchApp {
             cfg.default_dir.clone()
         };
         let (tx, rx) = channel();
-        let drives = if cfg!(windows) {
-            (b'A'..=b'Z')
-                .map(|c| PathBuf::from(format!("{}:\\", c as char)))
-                .filter(|p| p.exists())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        // Bitmask query, no filesystem I/O: the old per-letter exists() probe
+        // blocked startup for seconds when a mapped network drive was dead
+        // (SMB redirector timeouts), with the window already created but not
+        // yet painting.
+        let drives = list_drives();
+        // Toolchain::discover() stats every PATH entry and scans the WinGet
+        // package dirs - same dead-network-share stall risk, so it runs off
+        // the UI thread; the CTA stays disabled until ToolsReady arrives
+        // (it requires a tool anyway).
+        let tc_tx = tx.clone();
+        let tc_ctx = cc.egui_ctx.clone();
+        std::thread::spawn(move || {
+            let tc = Toolchain::discover();
+            let _ = tc_tx.send(Msg::ToolsReady(tc));
+            tc_ctx.request_repaint();
+        });
         Self {
             url: String::new(),
             engine_mode: EngineMode::Auto,
@@ -409,7 +575,7 @@ impl SnatchApp {
             use_cookies: false,
             cookies_browser: "chrome".to_string(),
             cfg,
-            tc: Toolchain::discover(),
+            tc: Toolchain { yt_dlp: None, aria2c: None },
             phase: Phase::Idle,
             progress: None,
             status: String::new(),
@@ -436,6 +602,10 @@ impl SnatchApp {
             tx,
             rx,
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            close_requested: false,
+            log_rev: 0,
+            log_cache_rev: 0,
+            log_cache: String::new(),
         }
     }
 
@@ -453,6 +623,7 @@ impl SnatchApp {
             let extra = self.log.len() - MAX_LOG_LINES;
             self.log.drain(..extra);
         }
+        self.log_rev += 1;
     }
 
     fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
@@ -465,7 +636,12 @@ impl SnatchApp {
             match msg {
                 Msg::Log(line) => {
                     let trimmed = line.trim_end();
-                    if trimmed.contains("Resuming download") {
+                    // Exact yt-dlp prefix, not a substring search anywhere in
+                    // the line: an uploader-chosen title containing
+                    // "Resuming download" (arriving inside a Destination line)
+                    // used to arm the automatic from-scratch retry for any
+                    // subsequent failure of that download.
+                    if trimmed.starts_with("[download] Resuming download") {
                         self.resumed_seen = true;
                     }
                     if !trimmed.is_empty() {
@@ -485,9 +661,15 @@ impl SnatchApp {
                 Msg::Progress(p) => self.progress = Some(p),
                 Msg::Done(code) => self.finish_download(code, ctx),
                 Msg::SetupLog(line) => self.push_log(line),
-                Msg::SetupDone(ok) => {
-                    self.phase = Phase::Idle;
-                    self.tc = Toolchain::discover();
+                Msg::ToolsReady(tc) => self.tc = tc,
+                Msg::SetupDone(ok, tc) => {
+                    self.tc = tc;
+                    // Only leave Setup from Setup: an unconditional Idle here
+                    // could re-enable the CTA on top of an already-running
+                    // job (the retry button used to make that reachable).
+                    if self.phase == Phase::Setup {
+                        self.phase = Phase::Idle;
+                    }
                     if ok {
                         self.set_status(StatusKind::Ok, "Загрузчики установлены");
                     } else {
@@ -500,13 +682,21 @@ impl SnatchApp {
         if self.phase != Phase::Idle {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
+        // The window close was vetoed while a job was being killed; now that
+        // the phase is back to Idle, actually close.
+        if self.close_requested && self.phase == Phase::Idle {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
     }
 
     fn finish_download(&mut self, code: i32, ctx: &egui::Context) {
         self.phase = Phase::Idle;
         self.progress = None;
-        if self.cancelled {
-            self.cancelled = false;
+        // Cancel that lost the race with a completed download still gets the
+        // "Готово" branch: the file IS complete, claiming "отменено, можно
+        // докачать" would send the user to re-download a finished file.
+        let cancelled = std::mem::replace(&mut self.cancelled, false);
+        if cancelled && code != 0 {
             self.set_status(StatusKind::Warn, "Отменено (файл можно докачать)");
             return;
         }
@@ -541,6 +731,10 @@ impl SnatchApp {
                     && self.last_job.as_ref().is_some_and(|j| j.engine == "yt-dlp")
                 {
                     if let Some(job) = self.last_job.clone() {
+                        // Re-detect auth from the retry's own stderr instead of
+                        // carrying the first attempt's hint into a possible
+                        // cookies offer for a completely different failure.
+                        self.auth_seen = false;
                         self.start_job(ctx, job, true);
                         if self.phase == Phase::Running {
                             self.set_status(
@@ -557,8 +751,6 @@ impl SnatchApp {
     fn start_download(&mut self, ctx: &egui::Context) {
         self.offer_retry = false;
         self.auth_seen = false;
-        self.log.clear();
-        self.progress = None;
 
         let engine = self.effective_engine().to_string();
         let url = match validate_url(&self.url) {
@@ -572,6 +764,11 @@ impl SnatchApp {
             self.set_status(StatusKind::Err, "Укажите папку сохранения");
             return;
         }
+        // Only wipe the previous run's log once the new job is actually
+        // valid: a typo in the URL field shouldn't destroy the log the user
+        // may still be reading.
+        self.log.clear();
+        self.progress = None;
         let fmt = if engine == "yt-dlp" { self.fmt.clone() } else { "best".to_string() };
         let cookies = if engine == "yt-dlp" && self.use_cookies {
             Some(self.cookies_browser.clone())
@@ -648,6 +845,21 @@ impl SnatchApp {
                 return;
             }
         };
+        // Put the loader into a kill-on-close job object before it has
+        // spawned children of its own (ffmpeg, aria2c-as-external-downloader)
+        // - see mod job_object for the two orphan classes this closes.
+        // Named proc_job: `job` is the engines::Job parameter below.
+        let proc_job = {
+            #[cfg(windows)]
+            {
+                use std::os::windows::io::AsRawHandle;
+                job_object::Job::create_and_assign(child.as_raw_handle())
+            }
+            #[cfg(not(windows))]
+            {
+                job_object::Job::create_and_assign(std::ptr::null_mut())
+            }
+        };
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
@@ -678,24 +890,38 @@ impl SnatchApp {
                 // pipe no matter what bytes arrive.
                 let mut reader = BufReader::new(stdout);
                 let mut buf = Vec::new();
+                // yt-dlp with --newline emits a progress line per downloaded
+                // chunk - dozens per second on a fast link. Logging ALL of
+                // them (a) evicted the meaningful lines ([info], Destination,
+                // Merger, warnings) out of the 500-line cap within seconds of
+                // a big download, and (b) invalidated the log-window text
+                // every frame, forcing epaint to re-layout+re-tessellate the
+                // whole 500-line galley on each new line. The progress BAR
+                // still gets every tick (cheap, one widget); the text log and
+                // status line get at most ~2 progress lines per second.
+                // Non-progress lines always pass through immediately.
+                let mut last_progress_log: Option<Instant> = None;
                 loop {
                     buf.clear();
                     match reader.read_until(b'\n', &mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
-                    let line = String::from_utf8_lossy(&buf).into_owned();
-                    // A progress-shaped line still carries the detail Python's
-                    // CLI showed for free by inheriting the real console (aria2's
-                    // CN:/SD:/DL: peers+speed, yt-dlp's ETA/speed) - sending only
-                    // Progress and dropping the line reduced the GUI to a bare
-                    // percentage with no way to see that detail even by opening
-                    // the log. Send both: the bar still gets its fraction, and
-                    // the line still reaches the status text + log.
-                    if let Some(p) = parse_progress(&line) {
-                        let _ = tx_out.send(Msg::Progress(p));
+                    let line = engines::decode_child_bytes(&buf).into_owned();
+                    match parse_progress(&line) {
+                        Some(p) => {
+                            let _ = tx_out.send(Msg::Progress(p));
+                            let due = last_progress_log
+                                .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
+                            if due {
+                                last_progress_log = Some(Instant::now());
+                                let _ = tx_out.send(Msg::Log(line));
+                            }
+                        }
+                        None => {
+                            let _ = tx_out.send(Msg::Log(line));
+                        }
                     }
-                    let _ = tx_out.send(Msg::Log(line));
                     ctx_out.request_repaint();
                 }
             });
@@ -712,16 +938,25 @@ impl SnatchApp {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
-                    let line = String::from_utf8_lossy(&buf).into_owned();
+                    let line = engines::decode_child_bytes(&buf).into_owned();
                     let _ = tx_err.send(Msg::ErrLine(line));
                     ctx_err.request_repaint();
                 }
             });
 
             let child = Arc::new(std::sync::Mutex::new(child));
+            // Held (not used) until the thread ends: dropping the job closes
+            // its last handle, and KILL_ON_JOB_CLOSE then reaps whatever of
+            // the process tree is still alive (e.g. an ffmpeg left mid-merge
+            // by a cancelled yt-dlp). If this process dies outright, the OS
+            // closes the handle for us - same effect, no orphaned seeders.
+            let proc_job = proc_job;
             let status = loop {
                 if cancel.load(Ordering::SeqCst) {
                     let mut c = child.lock().unwrap();
+                    if let Some(j) = &proc_job {
+                        j.terminate();
+                    }
                     let _ = c.kill();
                     break c.wait();
                 }
@@ -741,6 +976,12 @@ impl SnatchApp {
 
     fn start_setup(&mut self, ctx: &egui::Context) {
         self.phase = Phase::Setup;
+        // A stale cookies-retry offer must not stay clickable through Setup
+        // (it used to spawn a download on top of the installer, and the
+        // SetupDone handler then flipped the phase out from under it).
+        self.offer_retry = false;
+        // Preflight warnings belong to the previous job, not to the installer.
+        self.warns.clear();
         self.log.clear();
         self.set_status(StatusKind::None, "Устанавливаю загрузчики…");
         let tx = self.tx.clone();
@@ -774,7 +1015,12 @@ impl SnatchApp {
             } else {
                 let _ = tx.send(Msg::SetupLog("Не удалось создать папку bin".to_string()));
             }
-            let _ = tx.send(Msg::SetupDone(ok));
+            // Re-discover in THIS thread: Toolchain::discover() walks PATH and
+            // the WinGet dirs, and doing that on the UI thread froze the
+            // window for as long as the scan took (dead network PATH entries:
+            // seconds).
+            let tc = Toolchain::discover();
+            let _ = tx.send(Msg::SetupDone(ok, tc));
             ctx_w.request_repaint();
         });
     }
@@ -970,6 +1216,15 @@ impl SnatchApp {
         if !self.show_log_window {
             return;
         }
+        // Re-join only when the log actually changed. egui's galley cache is
+        // keyed on the full LayoutJob (text included): an identical string is
+        // a cheap cache hit, but joining ~500 lines EVERY frame produced a
+        // new String every frame anyway and any change forced a full
+        // re-layout + re-tessellation of the whole log.
+        if self.log_cache_rev != self.log_rev {
+            self.log_cache = self.log.join("\n");
+            self.log_cache_rev = self.log_rev;
+        }
         let mut open = true;
         egui::Window::new(window_title("Журнал"))
             .open(&mut open)
@@ -981,14 +1236,20 @@ impl SnatchApp {
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
-                        let text = self.log.join("\n");
-                        ui.label(egui::RichText::new(text).monospace().size(11.0).weak());
+                        ui.label(
+                            egui::RichText::new(self.log_cache.as_str())
+                                .monospace()
+                                .size(11.0)
+                                .weak(),
+                        );
                     });
             });
         self.show_log_window = open;
     }
 
     fn open_dir_browser(&mut self) {
+        // Cheap bitmask query - a drive plugged in since startup shows up.
+        self.drives = list_drives();
         let typed = PathBuf::from(self.out_dir.trim());
         let start = if typed.is_dir() {
             typed
@@ -1070,8 +1331,11 @@ impl SnatchApp {
                         if entries.is_empty() {
                             ui.weak("(нет вложенных папок)");
                         } else if entries.len() > shown {
+                            // The old "поднимитесь выше" advice was a lie:
+                            // the list is alphabetical and the tail is simply
+                            // never rendered, no navigation reveals it.
                             ui.weak(format!(
-                                "… показаны не все папки ({}) — поднимитесь выше",
+                                "… показаны первые {shown} папок по алфавиту (всего {})",
                                 entries.len()
                             ));
                         }
@@ -1139,9 +1403,13 @@ impl SnatchApp {
                         // height/2) unless overridden - Rounding isn't part
                         // of Visuals for this widget, so the square-corners
                         // theme never reached it.
+                        // .text() instead of .show_percentage(): that one
+                        // truncates ((p*100) as usize), displaying "99%"
+                        // until the very end; floor() rounds the same way
+                        // but we control it (and 100% shows only at 100%).
                         ui.add(
                             egui::ProgressBar::new(p)
-                                .show_percentage()
+                                .text(format!("{}%", (p * 100.0).floor() as u32))
                                 .rounding(egui::Rounding::ZERO)
                                 .fill(ACCENT_COLOR)
                                 .desired_height(36.0),
@@ -1209,7 +1477,14 @@ impl eframe::App for SnatchApp {
         pin_pixel_scale(ctx, false);
         self.drain(ctx);
         if ctx.input(|i| i.viewport().close_requested()) && self.phase == Phase::Running {
-            self.cancel_flag.store(true, Ordering::SeqCst);
+            // eframe exits the event loop in THIS frame unless the close is
+            // vetoed - the old flag-only version let the process die before
+            // the monitor thread (100ms poll) reached kill(), orphaning the
+            // loader mid-download. Veto, cancel properly (job object kills
+            // the whole tree), and drain() re-issues Close once Idle.
+            self.close_requested = true;
+            self.cancel();
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -1332,15 +1607,27 @@ impl eframe::App for SnatchApp {
                 }
             }
 
-            if self.offer_retry {
+            // Gated on Idle: during Setup/Running this block used to stay
+            // clickable and could spawn a second concurrent job sharing one
+            // cancel flag and one message channel.
+            if self.offer_retry && self.phase == Phase::Idle {
                 ui.add_space(6.0);
                 ui.colored_label(
                     WARN_COLOR,
                     "Похоже, сайту нужна авторизация (бот-детект или возрастные ограничения).",
                 );
                 if ui.button("Повторить с куками из браузера").clicked() {
-                    self.use_cookies = true;
-                    self.start_download(ctx);
+                    // One-shot: retry the PREVIOUS job with cookies, without
+                    // flipping the persistent checkbox. A single (possibly
+                    // provoked) 403 shouldn't silently opt every future
+                    // download into reading the browser's cookie store.
+                    if let Some(mut job) = self.last_job.clone() {
+                        job.cookies_browser = Some(self.cookies_browser.clone());
+                        self.offer_retry = false;
+                        self.auth_seen = false;
+                        self.log.clear();
+                        self.start_job(ctx, job, false);
+                    }
                 }
             }
 
@@ -1392,31 +1679,42 @@ impl eframe::App for SnatchApp {
     }
 }
 
-// Source PNG is 1262x1246 - egui::IconData wants a square whose side is a
-// multiple of 4 (viewport.rs's own doc comment recommends 256x256), so this
-// center-crops the shorter side away before downscaling rather than
-// distorting the aspect ratio.
-const ICON_PNG: &[u8] = include_bytes!("../../icons/icon.png");
+// icons/icon-256.png is icons/icon.png (1278x1230) pre-shrunk offline with
+// the exact same center-crop + Lanczos3 pipeline this function used to run
+// AT EVERY STARTUP - decoding the 1.5MB source and resampling it ~5x cost
+// a visible chunk of launch time under opt-level="z" and bloated the exe.
+// egui::IconData wants a square with a side that's a multiple of 4; 256x256
+// is its documented recommendation. The crop/resize branch stays as a
+// fallback if the asset is ever replaced by a non-256 one again. Decode
+// failure degrades to "no icon" instead of the old expect(): release builds
+// are panic="abort" with no console, so that expect was a silent startup
+// death with no window and no message.
+const ICON_PNG: &[u8] = include_bytes!("../../icons/icon-256.png");
 
-fn app_icon() -> egui::IconData {
+fn app_icon() -> Option<egui::IconData> {
     use image::GenericImageView;
-    let img = image::load_from_memory(ICON_PNG).expect("bundled icons/icon.png is a valid PNG");
+    let img = image::load_from_memory(ICON_PNG).ok()?;
     let (w, h) = img.dimensions();
-    let side = w.min(h);
-    let cropped = img.crop_imm((w - side) / 2, (h - side) / 2, side, side);
-    let rgba = cropped.resize_exact(256, 256, image::imageops::FilterType::Lanczos3).into_rgba8();
-    egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() }
+    let img = if w == 256 && h == 256 {
+        img
+    } else {
+        let side = w.min(h);
+        img.crop_imm((w - side) / 2, (h - side) / 2, side, side)
+            .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
+    };
+    let rgba = img.into_rgba8();
+    Some(egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() })
 }
 
 fn main() -> eframe::Result {
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 640.0])
-            .with_min_inner_size([560.0, 520.0])
-            .with_title("SNATCH — by rercon prod.")
-            .with_icon(app_icon()),
-        ..Default::default()
-    };
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_inner_size([640.0, 640.0])
+        .with_min_inner_size([560.0, 520.0])
+        .with_title("SNATCH — by rercon prod.");
+    if let Some(icon) = app_icon() {
+        viewport = viewport.with_icon(icon);
+    }
+    let options = eframe::NativeOptions { viewport, ..Default::default() };
     eframe::run_native(
         "SNATCH",
         options,

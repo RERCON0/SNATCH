@@ -92,9 +92,16 @@ impl Config {
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let tmp = p.with_extension("tmp");
+            // Unique tmp name (pid + nanos): with the old fixed "config.tmp",
+            // two instances (GUI + CLI) saving concurrently would truncate
+            // each other's tmp and rename a half-written file into place.
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let tmp = p.with_file_name(format!("config-{}-{stamp}.tmp", std::process::id()));
             let payload = serde_json::to_string_pretty(self)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+                .map_err(std::io::Error::other)?;
             {
                 let mut opts = std::fs::OpenOptions::new();
                 opts.write(true).create(true).truncate(true);
@@ -112,7 +119,9 @@ impl Config {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
             }
-            std::fs::rename(&tmp, p)
+            std::fs::rename(&tmp, p).inspect_err(|_| {
+                let _ = std::fs::remove_file(&tmp);
+            })
         })();
         if let Err(e) = result {
             crate::errln(format!("⚠ Не удалось сохранить настройки: {e}"));
@@ -204,7 +213,12 @@ mod tests {
         assert_eq!(again.urls, cfg.urls);
         assert_eq!(again.dirs, cfg.dirs);
         assert_eq!(again.last_dir, cfg.last_dir);
-        assert!(!dir.join("config.tmp").exists());
+        let tmp_leftovers = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+            .count();
+        assert_eq!(tmp_leftovers, 0, "save_to must not leave .tmp files behind");
         std::fs::remove_dir_all(&dir).ok();
     }
 
