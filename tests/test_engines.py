@@ -9,6 +9,7 @@ from snatch.engines import (
     clean_url,
     detect_engine,
     is_direct_download,
+    preflight_warning,
     validate_url,
 )
 from snatch.tools import ToolNotFound, Toolchain
@@ -145,25 +146,35 @@ def test_build_out_dir_neutralized(tmp_path, monkeypatch):
 
 
 def test_build_cookies_browser(tmp_path):
-    job = Job(engine="yt-dlp", url="https://youtube.com/watch?v=1",
-              out_dir=tmp_path, cookies_browser="chrome")
-    cmd = build(job, TC_YTDLP)
-    assert cmd[cmd.index("--cookies-from-browser") + 1] == "chrome"
-
-
-def test_build_aria2_ignores_cookies(tmp_path):
-    job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path,
-              cookies_browser="chrome")
-    cmd = build(job, TC_ARIA2)
-    assert "--cookies-from-browser" not in cmd
+    for value in ("chrome", "Chrome", "chrome:Profile 1",
+                  "firefox+keyring:prof::C:\\container.sqli"):
+        job = Job(engine="yt-dlp", url="https://youtube.com/watch?v=1",
+                  out_dir=tmp_path, cookies_browser=value)
+        cmd = build(job, TC_YTDLP)
+        assert cmd[cmd.index("--cookies-from-browser") + 1] == value, value
 
 
 def test_build_rejects_bad_browser_name(tmp_path):
-    for bad in ("--exec=danger", "chrome;rm", " chrome", ""):
+    for bad in ("--exec=danger", "chrome;rm", "safari;rm -rf /", "",
+                "nonsense", "somesite:prof", " chrome"):
         job = Job(engine="yt-dlp", url="https://x", out_dir=tmp_path,
                   cookies_browser=bad)
         with pytest.raises(BuildError):
             build(job, TC_YTDLP)
+
+
+def test_preflight_warns_on_aria2_with_cookies(tmp_path):
+    job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path,
+              cookies_browser="chrome")
+    warn = preflight_warning(job)
+    assert warn and "yt-dlp" in warn
+    cmd = build(job, TC_ARIA2)
+    assert "--cookies-from-browser" not in cmd
+
+
+def test_preflight_no_aria2_warning_without_cookies(tmp_path):
+    job = Job(engine="aria2", url="magnet:?xt=1", out_dir=tmp_path)
+    assert preflight_warning(job) is None
 
 
 def test_build_missing_tool(tmp_path):

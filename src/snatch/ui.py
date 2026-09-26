@@ -119,7 +119,8 @@ def _safe_iterdir(path: Path):
         return []
 
 
-def collect(cfg: Config, link: str | None = None) -> dict | None:
+def collect(cfg: Config, link: str | None = None,
+            cookies_browser: str | None = None) -> dict | None:
     """Run the prompts and return a plan dict, or None if the user aborts."""
     url = _ask_link(cfg, link)
     if not url:
@@ -137,4 +138,5 @@ def collect(cfg: Config, link: str | None = None) -> dict | None:
         return None
     if not _confirm(cfg, engine, fmt, out_dir, url):
         return None
-    return {"url": url, "engine": engine, "fmt": fmt, "out_dir": out_dir}
+    return {"url": url, "engine": engine, "fmt": fmt, "out_dir": out_dir,
+            "cookies_browser": cookies_browser}

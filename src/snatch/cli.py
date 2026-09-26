@@ -11,6 +11,7 @@ import questionary
 from . import __version__, ui
 from .config import Config
 from .engines import (
+    COOKIES_BROWSERS,
     BuildError,
     Job,
     build,
@@ -65,7 +66,7 @@ def _plan_from_args(args: argparse.Namespace) -> dict | None:
     engine = args.engine or detect_engine(args.url)
     fmt = args.format or "best"
     return {"url": args.url, "engine": engine, "fmt": fmt, "out_dir": args.output,
-            "cookies_browser": args.cookies_browser.lower() if args.cookies_browser else None}
+            "cookies_browser": args.cookies_browser}
 
 
 def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
@@ -105,17 +106,13 @@ def _download(plan: dict, cfg: Config, tc: Toolchain) -> int:
     return code
 
 
-BROWSERS = [
-    "chrome", "firefox", "edge", "brave", "opera", "vivaldi", "safari",
-    "chromium", "whale",
-]
+BROWSERS = sorted(COOKIES_BROWSERS)
 
-COOKIES_RETRY_CODES = frozenset({0, 2, 127, 130})
+RETRY_CODE = 1
 
 
 def _should_offer_cookies(plan: dict, code: int) -> bool:
-    return (code not in COOKIES_RETRY_CODES
-            and plan["engine"] == "yt-dlp")
+    return code == RETRY_CODE and plan["engine"] == "yt-dlp"
 
 
 def _retry_with_cookies(plan: dict, code: int, cfg: Config, tc: Toolchain) -> int:
@@ -170,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     try:
         while True:
-            plan = ui.collect(cfg, link=args.url)
+            plan = ui.collect(cfg, link=args.url, cookies_browser=args.cookies_browser)
             args.url = None
             if plan is None:
                 print("Отменено.")

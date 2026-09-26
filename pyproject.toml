@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "snatch"
-version = "0.1.2"
 description = "Interactive yt-dlp + aria2c download companion for the terminal"
 requires-python = ">=3.10"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
+dynamic = ["version"]
 dependencies = ["questionary>=2.0"]
 
 [dependency-groups]
@@ -20,3 +20,6 @@ down = "snatch.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = { attr = "snatch.__version__" }

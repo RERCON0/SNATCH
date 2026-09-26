@@ -1,16 +1,14 @@
-from snatch.cli import _should_offer_cookies
+import argparse
+
+from snatch.cli import _plan_from_args, _should_offer_cookies
 
 BASE_PLAN = {"url": "u", "engine": "yt-dlp", "fmt": "best", "out_dir": "d"}
 
 
-def test_offers_after_child_failure():
+def test_offers_only_on_child_generic_failure():
     assert _should_offer_cookies(BASE_PLAN, 1)
-    assert _should_offer_cookies(BASE_PLAN, 3)
-
-
-def test_no_offer_on_success_or_own_errors():
-    for code in (0, 2, 127, 130):
-        assert not _should_offer_cookies(BASE_PLAN, code)
+    for code in (0, 2, 3, 127, 130, -9):
+        assert not _should_offer_cookies(BASE_PLAN, code), code
 
 
 def test_no_offer_for_aria2_engine():
@@ -19,3 +17,13 @@ def test_no_offer_for_aria2_engine():
 
 def test_offer_repeats_after_failed_cookies_attempt():
     assert _should_offer_cookies({**BASE_PLAN, "cookies_browser": "chrome"}, 1)
+
+
+def test_plan_from_args_keeps_cookies_value():
+    args = argparse.Namespace(url="https://x", output="d", engine=None,
+                              format=None, cookies_browser="Chrome:Profile 1")
+    plan = _plan_from_args(args)
+    assert plan["cookies_browser"] == "Chrome:Profile 1"
+
+    args.cookies_browser = None
+    assert _plan_from_args(args)["cookies_browser"] is None

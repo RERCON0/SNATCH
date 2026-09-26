@@ -105,6 +105,12 @@ def is_direct_download(url: str) -> bool:
             and Path(parsed.path).suffix.lower() in FILE_EXT)
 
 
+COOKIES_BROWSERS = frozenset({
+    "chrome", "chromium", "brave", "opera", "edge", "vivaldi",
+    "firefox", "safari", "whale",
+})
+
+
 @dataclass
 class Job:
     engine: str
@@ -114,7 +120,20 @@ class Job:
     cookies_browser: str | None = None
 
 
+def _validate_cookies_browser(value: str) -> None:
+    head = re.split(r"[+:]", value, 1)[0].lower()
+    if head not in COOKIES_BROWSERS:
+        known = ", ".join(sorted(COOKIES_BROWSERS))
+        raise BuildError(
+            f"Неизвестный браузер для куки: {value!r} (поддерживаются: {known}; "
+            "профиль можно указать так: chrome:Profile 1)"
+        )
+
+
 def build(job: Job, tc: Toolchain) -> list[str]:
+    if job.cookies_browser is not None and job.engine == "yt-dlp":
+        _validate_cookies_browser(job.cookies_browser)
+
     out = job.out_dir.expanduser().absolute()
     try:
         out.mkdir(parents=True, exist_ok=True)
@@ -131,8 +150,6 @@ def build(job: Job, tc: Toolchain) -> list[str]:
     # --ignore-config: never load yt-dlp.conf from cwd (would allow --exec RCE)
     cmd = [exe, "--ignore-config", "-P", str(out), "--no-playlist"]
     if job.cookies_browser is not None:
-        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", job.cookies_browser):
-            raise BuildError(f"Некорректное имя браузера для куки: {job.cookies_browser!r}")
         cmd += ["--cookies-from-browser", job.cookies_browser]
     cmd += FORMATS.get(job.fmt, [])
     if tc.aria2c and is_direct_download(job.url):
@@ -143,6 +160,8 @@ def build(job: Job, tc: Toolchain) -> list[str]:
 
 
 def preflight_warning(job: Job) -> str | None:
+    if job.engine != "yt-dlp" and job.cookies_browser is not None:
+        return "Куки из браузера применимы только к yt-dlp — для этого движка они проигнорированы."
     if job.engine == "yt-dlp" and job.fmt == "audio" and not shutil.which("ffmpeg"):
         return "Не найден ffmpeg — извлечение mp3 может не сработать."
     return None
