@@ -415,6 +415,15 @@ fn setup_theme(ctx: &egui::Context, dark: bool) {
             y_offset_factor: 0.0, ..Default::default()
         }));
     fonts.families.insert(egui::FontFamily::Name("button".into()), vec!["mono-button".to_owned()]);
+    // TextEdit's inner text: the boxed controls' no-nudge rendering. Body's
+    // +0.15em glyph shift (below) reads fine in free-standing labels, but
+    // inside an input's tight margins it sits visibly below the box centre;
+    // boxed controls should also share one baseline with each other.
+    fonts.font_data.insert("mono-field".to_owned(),
+        egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
+            y_offset_factor: 0.0, ..Default::default()
+        }));
+    fonts.families.insert(egui::FontFamily::Name("field".into()), vec!["mono-field".to_owned()]);
     fonts.font_data.insert("mono-title".to_owned(),
         egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
             y_offset_factor: -0.08, ..Default::default()
@@ -724,6 +733,13 @@ fn window_title(text: &str) -> egui::RichText {
     // glyphs rode on top of the window's top stroke; 13 sits inside it. The
     // "title" family is the un-tweaked face (see setup_theme).
     egui::RichText::new(text).font(egui::FontId::new(13.0, egui::FontFamily::Name("title".into())))
+}
+
+/// Input-field text: body size, but rendered with the boxed controls' font
+/// ("field" family, no glyph nudge - see setup_theme) so the text sits
+/// centred inside the field's margins.
+fn field_font() -> egui::FontSelection {
+    egui::FontSelection::FontId(egui::FontId::new(13.0, egui::FontFamily::Name("field".into())))
 }
 
 fn clicked_outside(ctx: &egui::Context, rect: egui::Rect) -> bool {
@@ -1722,6 +1738,7 @@ impl SnatchApp {
                     pick_torrent = true;
                 }
                 let edit = egui::TextEdit::singleline(&mut self.url)
+                    .font(field_font())
                     .desired_width(f32::INFINITY)
                     // Default TextEdit margin is (4,2) - the mockup's inputs
                     // use `padding: 9px 11px`, noticeably roomier.
@@ -1866,6 +1883,7 @@ impl SnatchApp {
                 ui.add_enabled(
                     enabled,
                     egui::TextEdit::singleline(&mut self.out_dir)
+                        .font(field_font())
                         .desired_width(f32::INFINITY)
                         .margin(egui::Margin::symmetric(11.0, 9.0)),
                 );
