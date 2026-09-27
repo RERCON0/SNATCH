@@ -1637,9 +1637,10 @@ impl SnatchApp {
                             self.cancel_all();
                         } else {
                             // Setup is an in-process worker. Closing the app
-                            // stops it immediately; the next install replaces
-                            // any incomplete .part files. No child process
-                            // needs to be reaped here.
+                            // stops it immediately; the next install resumes
+                            // any incomplete .part files (Range) instead of
+                            // restarting them. No child process needs to be
+                            // reaped here.
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
