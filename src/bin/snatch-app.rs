@@ -1361,7 +1361,8 @@ impl SnatchApp {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
-                    let line = engines::sanitize_child_output(&engines::decode_child_bytes(&buf));
+                    let decoded = engines::decode_child_bytes(&buf);
+                    let line = engines::sanitize_child_output(&decoded);
                     if aria2 {
                         let mut latest = None;
                         for fragment in line.replace('\r', "\n").lines() {
@@ -1399,12 +1400,12 @@ impl SnatchApp {
                                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
                             if due {
                                 last_progress_log = Some(Instant::now());
-                                let _ = tx_out.send(Msg::Log(id, line));
+                                let _ = tx_out.send(Msg::Log(id, line.to_string()));
                                 ctx_out.request_repaint();
                             }
                         }
                         None => {
-                            let _ = tx_out.send(Msg::Log(id, line));
+                            let _ = tx_out.send(Msg::Log(id, line.to_string()));
                             ctx_out.request_repaint();
                         }
                     }
@@ -1422,7 +1423,7 @@ impl SnatchApp {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
-                    let line = engines::sanitize_child_output(&engines::decode_child_bytes(&buf));
+                    let line = engines::sanitize_child_output(&engines::decode_child_bytes(&buf)).into_owned();
                     let _ = tx_err.send(Msg::ErrLine(id, line));
                     // Running already schedules repaint every 150ms in drain;
                     // per-line requests here would redraw the entire window

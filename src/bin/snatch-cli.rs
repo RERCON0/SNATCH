@@ -188,8 +188,13 @@ enum BatchEvent {
     Finished(usize, String, String, RunResult),
 }
 
-fn clean_loader_text(text: &str) -> String {
-    engines::sanitize_child_output(text).replace('\r', "\n")
+fn clean_loader_text(text: &str) -> std::borrow::Cow<'_, str> {
+    let cleaned = engines::sanitize_child_output(text);
+    if cleaned.contains('\r') {
+        std::borrow::Cow::Owned(cleaned.replace('\r', "\n"))
+    } else {
+        cleaned
+    }
 }
 
 struct BatchView {
@@ -338,7 +343,8 @@ fn read_batch_pipe(
             Ok(0) | Err(_) => break,
             Ok(_) => {}
         }
-        let decoded = clean_loader_text(&engines::decode_child_bytes(&buf));
+        let decoded_bytes = engines::decode_child_bytes(&buf);
+        let decoded = clean_loader_text(&decoded_bytes);
         let mut latest = None;
         for line in decoded.lines().map(str::trim).filter(|s| !s.is_empty()) {
             if engines::looks_like_auth(line) { auth.store(true, Ordering::Relaxed); }
@@ -359,10 +365,13 @@ fn read_batch_pipe(
             } else if line.contains("Allocating disk space") {
                 let _ = tx.send(BatchEvent::Progress(id, "выделение места на диске…".into()));
             } else if !line.starts_with("[#") && !line.starts_with("[FileAlloc:") {
-                let lower = line.to_ascii_lowercase();
-                if !aria2 || ["error", "warning", "failed", "aborted", "exception"]
-                    .iter().any(|hint| lower.contains(hint))
-                {
+                // Нижний регистр не считаем заранее: для yt-dlp он не нужен, а
+                // для aria2 большинство строк ни одного из слов не содержит.
+                let worth_reporting = !aria2
+                    || ["error", "warning", "failed", "aborted", "exception"]
+                        .iter()
+                        .any(|hint| engines::contains_ignore_ascii_case(line, hint));
+                if worth_reporting {
                     let _ = tx.send(BatchEvent::Line(id, line.to_string()));
                 }
             }

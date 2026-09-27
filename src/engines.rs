@@ -29,10 +29,23 @@ pub const TORRENT_FILES: &[&str] = &[".torrent", ".metalink", ".meta4"];
 
 pub const ARIA2_MISSING_CONTROL_HINT: &str = "Файлы этой раздачи уже есть, но файл докачки .aria2 отсутствует. Чтобы не стереть данные, загрузка остановлена. Выберите новую пустую папку; не включайте перезапись существующих файлов.";
 
+/// Поиск ASCII-подстроки без временной копии строки (в отличие от
+/// `to_ascii_lowercase().contains(..)`): `needle` обязан быть непустым и уже
+/// в нижнем регистре. Регистронезависимость ровно та же, что давал нижний
+/// регистр: не-ASCII символы сравниваются побайтово, как и раньше.
+pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    !needle.is_empty()
+        && needle.len() <= hay.len()
+        && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+}
+
 pub fn aria2_missing_control(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
-    lower.contains("errorcode=13") && lower.contains("control file")
-        && lower.contains(".aria2") && lower.contains("does not exist")
+    contains_ignore_ascii_case(line, "errorcode=13")
+        && contains_ignore_ascii_case(line, "control file")
+        && contains_ignore_ascii_case(line, ".aria2")
+        && contains_ignore_ascii_case(line, "does not exist")
 }
 
 pub const COOKIES_BROWSERS: &[&str] = &[
@@ -70,14 +83,14 @@ const AUTH_HINTS: &[&str] = &[
 ];
 
 pub fn looks_like_auth(line: &str) -> bool {
-    let lower = line.to_ascii_lowercase();
     // Require a diagnostics context: both loaders prefix real problems
     // ("ERROR: ..." / "WARNING: ..." in yt-dlp, "... ERROR - ..." in aria2).
     // Without this, a filename or URI merely containing e.g. "forbidden"
     // ("https://host/forbidden-songs.mp3" echoed in an unrelated failure)
     // flips the auth heuristic and the app nags about browser cookies.
-    let dominated = lower.contains("error") || lower.contains("warning");
-    dominated && AUTH_HINTS.iter().any(|p| lower.contains(p))
+    let dominated = contains_ignore_ascii_case(line, "error")
+        || contains_ignore_ascii_case(line, "warning");
+    dominated && AUTH_HINTS.iter().any(|p| contains_ignore_ascii_case(line, p))
 }
 
 pub fn parse_progress(line: &str) -> Option<f32> {
@@ -213,7 +226,15 @@ pub fn decode_child_bytes(bytes: &[u8]) -> Cow<'_, str> {
 
 /// Strip terminal escape sequences supplied by downloaded titles/filenames,
 /// preserving CR/LF so a progress line can still update in place in the CLI.
-pub fn sanitize_child_output(text: &str) -> String {
+/// Чистую строку (типичный вывод загрузчиков) возвращает заимствованной —
+/// без аллокации и копирования на каждую строку.
+pub fn sanitize_child_output(text: &str) -> Cow<'_, str> {
+    let dirty = text
+        .chars()
+        .any(|c| c == '\x1b' || (c.is_control() && !matches!(c, '\r' | '\n' | '\t')));
+    if !dirty {
+        return Cow::Borrowed(text);
+    }
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
@@ -239,7 +260,7 @@ pub fn sanitize_child_output(text: &str) -> String {
             out.push(' ');
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 fn relay_stdout(mut reader: impl Read, mut writer: impl Write) -> std::io::Result<()> {
