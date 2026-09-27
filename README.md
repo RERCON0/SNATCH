@@ -13,8 +13,7 @@
    \ `\____\ \_\ \_\ \_\ \_\ \ \_\ \ \____/ \ \_\ \_\
     \/_____/\/_/\/_/\/_/\/_/  \/_/  \/___/   \/_/\/_/
                        yt-dlp + aria2c mini-combine
-                             by rercon prod.
-                        ✈ https://t.me/ArtemMurzin
+                             by rercon prod. | https://t.me/rercon
 ```
 
 ## Возможности
@@ -163,7 +162,7 @@ snatch "https://youtube.com/watch?v=..." -y -o "D:\Music" -f audio --cookies-fro
 - История ссылок и папок хранится в `config.json` открытым текстом; URL с учётными данными (`https://user:token@…`) попадают туда как есть. На Linux/macOS файл создаётся с правами `0600`. Очистка — `--clear-history`
 - Докачка (`-c`): если в папке уже лежит файл с таким же именем от *другой* ссылки, aria2c продолжит писать в него — перед повтором проверяйте имена
 
-Telegram-канал автора: https://t.me/ArtemMurzin
+Telegram-канал автора: https://t.me/rercon
 
 ## Разработка
 

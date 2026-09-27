@@ -16,7 +16,7 @@ pub const BANNER: &str = r#"
                              by rercon prod.
 "#;
 
-pub const TELEGRAM_URL: &str = "https://t.me/ArtemMurzin";
+pub const TELEGRAM_URL: &str = "https://t.me/rercon";
 
 pub fn outln(s: impl AsRef<str>) {
     println!("{}", s.as_ref());

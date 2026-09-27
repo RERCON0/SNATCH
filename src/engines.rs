@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 
 use crate::config::home_dir;
 use crate::tools::{which, Toolchain};
+use crate::ui::clip;
 
 // --seed-time=0: without it aria2c finishes the download and then keeps
 // seeding until ratio 1.0 (its default) - the process never exits, the GUI
@@ -141,6 +142,54 @@ pub fn aria2_name_from_file(line: &str) -> Option<String> {
     let file = parts.next()?.trim();
     let name = if multi_file { parts.next().unwrap_or(file) } else { file };
     (!name.is_empty()).then(|| name.to_string())
+}
+
+/// Short display name for a URL before anything better is known (a torrent's
+/// real name only arrives once aria2 reads its metadata) - shared by the
+/// CLI's batch display and the GUI's per-job row/log-prefix label.
+pub fn batch_name(url: &str) -> String {
+    if let Some(hash) = url.split_once("btih:").map(|(_, s)| s.split('&').next().unwrap_or(s)) {
+        return format!("magnet {}", clip(hash, 12));
+    }
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let segment = path.rsplit('/').next().unwrap_or(path);
+    // Generic route segments (YouTube's /watch, most players' /embed or
+    // /index.*) aren't a video name - they're the same for every link, so
+    // showing them as the job label is worse than showing nothing. Prefer
+    // the id/v query parameter instead; the real title arrives later via
+    // yt-dlp's own "Destination:" line (see ytdlp_title_from_line).
+    const GENERIC_SEGMENTS: &[&str] = &["watch", "embed", "player", "index.html", "index.php", ""];
+    if GENERIC_SEGMENTS.contains(&segment) {
+        if let Some(query) = url.split_once('?').map(|(_, q)| q.split('#').next().unwrap_or(q)) {
+            for pair in query.split('&') {
+                if let Some((key, val)) = pair.split_once('=') {
+                    if (key == "v" || key == "id") && !val.is_empty() {
+                        return val.to_string();
+                    }
+                }
+            }
+        }
+    }
+    if segment.is_empty() { "загрузка".to_string() } else { segment.to_string() }
+}
+
+/// Pull the real media title out of a yt-dlp stdout line, once it announces
+/// one - used to upgrade a job's label from `batch_name`'s URL guess (which,
+/// for a `/watch` URL, is at best a video id) to the actual title, mirroring
+/// how TorrentMeta/TorrentName upgrade an aria2/torrent job's label.
+pub fn ytdlp_title_from_line(line: &str) -> Option<String> {
+    let path = if let Some(rest) = line.strip_prefix("[download] Destination: ") {
+        rest
+    } else if let Some(rest) = line.strip_prefix("[download] ") {
+        rest.strip_suffix(" has already been downloaded")?
+    } else if let Some(rest) = line.strip_prefix("[Merger] Merging formats into \"") {
+        rest.strip_suffix('"')?
+    } else {
+        return None;
+    };
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    (!stem.is_empty()).then(|| stem.to_string())
 }
 
 pub struct RunResult {
@@ -1251,5 +1300,42 @@ mod tests {
         let r = run(&cmd, true);
         assert_eq!(r.code, 1);
         assert!(!r.auth_hint);
+    }
+
+    #[test]
+    fn batch_name_uses_query_id_for_generic_route_segments() {
+        assert_eq!(batch_name("https://youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+        assert_eq!(batch_name("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+        assert_eq!(batch_name("https://example.com/embed?id=abc123"), "abc123");
+        assert_eq!(batch_name("https://example.com/some-video-title"), "some-video-title");
+        assert_eq!(batch_name("https://example.com/watch"), "watch");
+    }
+
+    #[test]
+    fn batch_name_still_handles_magnets() {
+        let name = batch_name("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Foo");
+        assert!(name.starts_with("magnet "));
+    }
+
+    #[test]
+    fn ytdlp_title_from_line_reads_destination_and_merger_lines() {
+        assert_eq!(
+            ytdlp_title_from_line("[download] Destination: C:\\out\\Rick Astley - Never Gonna Give You Up.mp4"),
+            Some("Rick Astley - Never Gonna Give You Up".to_string())
+        );
+        assert_eq!(
+            ytdlp_title_from_line("[Merger] Merging formats into \"Some Title.mkv\""),
+            Some("Some Title".to_string())
+        );
+        assert_eq!(
+            ytdlp_title_from_line("/out/Already Downloaded.mp4 has already been downloaded"),
+            None
+        );
+        assert_eq!(
+            ytdlp_title_from_line("[download] /out/Already Downloaded.mp4 has already been downloaded"),
+            Some("Already Downloaded".to_string())
+        );
+        assert_eq!(ytdlp_title_from_line("[download]  42.0% of 10.00MiB"), None);
+        assert_eq!(ytdlp_title_from_line("some unrelated line"), None);
     }
 }

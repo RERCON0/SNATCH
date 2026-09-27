@@ -18,7 +18,7 @@ use inquire::{Confirm, Select, Text};
 
 use snatch_rs::config::Config;
 use snatch_rs::engines::{
-    self, build, detect_engine, is_unc_path, preflight_warning, validate_cookies_browser, validate_url, Job, RunResult,
+    self, batch_name, build, detect_engine, is_unc_path, preflight_warning, validate_cookies_browser, validate_url, Job, RunResult,
     COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
 };
 #[cfg(windows)]
@@ -190,15 +190,6 @@ enum BatchEvent {
 
 fn clean_loader_text(text: &str) -> String {
     engines::sanitize_child_output(text).replace('\r', "\n")
-}
-
-fn batch_name(url: &str) -> String {
-    if let Some(hash) = url.split_once("btih:").map(|(_, s)| s.split('&').next().unwrap_or(s)) {
-        return format!("magnet {}", clip(hash, 12));
-    }
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let name = path.rsplit('/').next().unwrap_or(path);
-    if name.is_empty() { "загрузка".to_string() } else { name.to_string() }
 }
 
 struct BatchView {
@@ -898,8 +889,15 @@ fn main() -> std::process::ExitCode {
         print!("{WINDOW_TITLE}");
         let _ = std::io::stdout().flush();
     }
-    outln(BANNER.trim());
-    outln(format!("                        ✈ {TELEGRAM_URL}"));
+    // Merge the tagline with the Telegram link on one line instead of a
+    // separate "✈ https://..." line below it - saves a line of banner
+    // height. Keep the "https://" scheme here (unlike the GUI's shortened
+    // hyperlink label): most terminals only auto-linkify a bare URL when it
+    // has a scheme, so a trimmed "t.me/rercon" wouldn't be clickable.
+    let banner = BANNER.trim();
+    let (art, tagline) = banner.rsplit_once('\n').unwrap_or(("", banner));
+    outln(art);
+    outln(format!("{tagline} | {TELEGRAM_URL}"));
 
     let mut preset_urls = args.urls.clone();
     loop {

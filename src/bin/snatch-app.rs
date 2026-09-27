@@ -1,5 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -39,10 +40,11 @@ enum EngineMode {
     Aria2,
 }
 
+/// Only tracks the installer now - "is a download running" is
+/// `!self.jobs.is_empty()`, since there can be several at once.
 #[derive(PartialEq, Clone, Copy)]
 enum Phase {
     Idle,
-    Running,
     Setup,
 }
 
@@ -54,15 +56,19 @@ enum StatusKind {
     Err,
 }
 
+/// Every per-job variant is tagged with that job's id so drain() can route
+/// it to the right entry in `self.jobs` - concurrent downloads share the one
+/// channel. Setup* /ToolsReady stay untagged: the installer is a single
+/// global operation, not a job.
 enum Msg {
-    Log(String),
-    ErrLine(String),
-    Progress(f32),
-    TorrentStatus(f32, String),
-    TorrentMeta(String),
-    TorrentName(String),
-    TorrentLog(String),
-    Done(i32),
+    Log(u64, String),
+    ErrLine(u64, String),
+    Progress(u64, f32),
+    TorrentStatus(u64, f32, String),
+    TorrentMeta(u64, String),
+    TorrentName(u64, String),
+    TorrentLog(u64, String),
+    Done(u64, i32),
     SetupLog(String),
     /// (успех, обновлённая цепочка инструментов - discover делается в том же
     /// фоновом потоке, а не на UI-потоке)
@@ -195,10 +201,49 @@ mod job_object {
     }
 }
 
-struct LastPlan {
-    url: String,
-    engine: String,
-    out_dir: String,
+/// One running or just-finished-and-being-retried download. Everything that
+/// used to be a scalar field on SnatchApp (progress, torrent_name, per-run
+/// auth_seen/resumed_seen/...) now lives here instead, one per concurrent job.
+struct ActiveJob {
+    id: u64,
+    job: Job,
+    /// Torrent name once known, else the URL clipped - used for the row
+    /// header and to prefix this job's lines in the shared log.
+    label: String,
+    progress: Option<f32>,
+    status: String,
+    status_kind: StatusKind,
+    warns: Vec<String>,
+    cancel_flag: Arc<AtomicBool>,
+    cancelled: bool,
+    /// Set by the "пауза" button - kills the process the same way `cancelled`
+    /// does, but finish_job() moves the job into `SnatchApp::paused` instead
+    /// of dropping it, so one click on "продолжить" respawns it. Works
+    /// because yt-dlp/aria2c already continue an interrupted download from
+    /// its own partial file (see resumed_seen/no_continue below); pausing
+    /// doesn't need any extra IPC to the child, just an ordinary kill+restart.
+    pausing: bool,
+    auth_seen: bool,
+    missing_control_file: bool,
+    resumed_seen: bool,
+    /// Whether *this* run already used --no-continue (a from-scratch retry
+    /// of a corrupt resume) - distinct from resumed_seen, which is whether
+    /// yt-dlp printed "Resuming download" during this run.
+    no_continue: bool,
+}
+
+impl ActiveJob {
+    fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
+        self.status_kind = kind;
+        self.status = text.into();
+    }
+}
+
+/// A job stopped via "пауза" instead of "отмена" - just enough to redisplay
+/// it and respawn it unchanged when the user clicks "продолжить".
+struct PausedJob {
+    job: Job,
+    label: String,
 }
 
 struct DirBrowser {
@@ -208,7 +253,7 @@ struct DirBrowser {
     listed_for: Option<PathBuf>,
 }
 
-fn torrent_console_line(line: &str) -> Option<Msg> {
+fn torrent_console_line(id: u64, line: &str) -> Option<Msg> {
     let line = line.trim();
     if line.is_empty() || line.contains("Download Progress Summary as of")
         || line.chars().all(|c| matches!(c, '=' | '-')) {
@@ -216,21 +261,21 @@ fn torrent_console_line(line: &str) -> Option<Msg> {
     }
     if line.starts_with("FILE:") && line.contains("[MEMORY][METADATA]") {
         let name = line.split_once("[DL]").map_or("", |(_, name)| name.trim());
-        return Some(Msg::TorrentMeta(name.to_string()));
+        return Some(Msg::TorrentMeta(id, name.to_string()));
     }
     if let Some(name) = engines::aria2_name_from_file(line) {
-        return Some(Msg::TorrentName(name));
+        return Some(Msg::TorrentName(id, name));
     }
     if let (Some(p), Some(stat)) = (parse_progress(line), engines::aria2_stat(line)) {
-        return Some(Msg::TorrentStatus(p, stat));
+        return Some(Msg::TorrentStatus(id, p, stat));
     }
     if line.contains("Allocating disk space") {
-        return Some(Msg::TorrentLog("Выделение места на диске…".into()));
+        return Some(Msg::TorrentLog(id, "Выделение места на диске…".into()));
     }
     let lower = line.to_ascii_lowercase();
     if ["error", "warning", "failed", "aborted", "exception"]
         .iter().any(|hint| lower.contains(hint)) {
-        return Some(Msg::ErrLine(line.to_string()));
+        return Some(Msg::ErrLine(id, line.to_string()));
     }
     None
 }
@@ -266,31 +311,34 @@ struct SnatchApp {
     /// must never replace the toolchain found by SetupDone.
     setup_started: bool,
     phase: Phase,
-    progress: Option<f32>,
-    torrent_name: Option<String>,
+    /// Currently running downloads, most recently started last. Up to
+    /// MAX_CONCURRENT at once, matching the CLI's `-j` default.
+    jobs: Vec<ActiveJob>,
+    next_job_id: u64,
+    /// A job that just finished with an auth-shaped failure, offering a
+    /// cookies retry. Lives here (not in `jobs`, which only holds active
+    /// ones) so the offer survives after the failed job is removed.
+    retry_offer: Option<Job>,
+    /// Jobs stopped via "пауза" - shown below the active ones with a
+    /// "продолжить" button. Not in `jobs` (no process running) or `queue`
+    /// (not waiting for a free slot on its own).
+    paused: Vec<PausedJob>,
+    /// App-level status line (setup results, "added to queue", the most
+    /// recently finished job's outcome) - each job's own live progress text
+    /// shows in its own row instead.
     status: String,
     status_kind: StatusKind,
-    warns: Vec<String>,
     log: Vec<String>,
     show_log_window: bool,
-    auth_seen: bool,
-    missing_control_file: bool,
-    cancelled: bool,
-    offer_retry: bool,
-    last_plan: Option<LastPlan>,
-    last_job: Option<Job>,
-    last_no_continue: bool,
-    resumed_seen: bool,
     show_url_history: bool,
     show_dir_history: bool,
     browser: DirBrowser,
     drives: Vec<PathBuf>,
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
-    cancel_flag: Arc<AtomicBool>,
     /// Set when the user closed the window mid-download: the close is vetoed
-    /// (CancelClose) until the job is actually killed, then drain() reissues
-    /// Close - otherwise the process exits while the loader keeps running.
+    /// (CancelClose) until every job is actually killed, then drain() reissues
+    /// Close - otherwise the process exits while loaders keep running.
     close_requested: bool,
     #[cfg(windows)]
     maximized: bool,
@@ -300,7 +348,14 @@ struct SnatchApp {
     log_cache_rev: u64,
     log_cache: String,
     dark_mode: bool,
+    /// Links added past MAX_CONCURRENT active jobs. FIFO, except an explicit
+    /// cookies retry jumps the line (push_front) - see the retry button.
+    queue: VecDeque<Job>,
 }
+
+/// CLI's `-j` defaults to 3 concurrent downloads; match it here so the two
+/// frontends behave the same way out of the box.
+const MAX_CONCURRENT: usize = 3;
 
 /// "Terminal Native" theme (mockups/b-terminal.html, the approved direction):
 /// monospace everywhere, thin 1px hairlines instead of thick borders, ghost
@@ -364,7 +419,18 @@ fn setup_theme(ctx: &egui::Context, dark: bool) {
     // ~6-7px); the *loose* rhythm between field groups (mockup's ~16-18px)
     // is added explicitly via ui.add_space() between groups - one uniform
     // spacing value can't express both.
-    ctx.style_mut(|style| {
+    //
+    // all_styles_mut, not style_mut: egui 0.29 keeps a *separate* Style per
+    // Theme (dark_style/light_style) and both style_mut/set_visuals act on
+    // whichever one ctx.theme() currently resolves to - which tracks the OS
+    // preference independently of our own `dark` toggle. setup_theme() only
+    // runs once at startup, so if ctx.theme() later settles on the other
+    // bucket (e.g. once eframe reports the real OS theme a frame or two in),
+    // this spacing config would silently apply to a style nothing renders
+    // with - that's what left the scroll bar on its unstyled default despite
+    // the fix below. Writing both buckets up front sidesteps the whole
+    // class of bug regardless of which one ends up active.
+    ctx.all_styles_mut(|style| {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         // TextEdit's 9px vertical margin made its row ~6px taller than the
         // neighbouring buttons. Raise their vertical padding to match.
@@ -376,6 +442,18 @@ fn setup_theme(ctx: &egui::Context, dark: bool) {
         // line away from the text in every popup; the horizontal part just
         // gives popup content some air.
         style.spacing.window_margin = egui::Margin::symmetric(10.0, 15.0);
+        // Default egui scrollbars are a floating, translucent overlay that
+        // pops up over content and hides when idle - fine for a generic app,
+        // but it breaks this app's whole premise that nothing overlaps and
+        // every element always reserves its own flat, bordered space. Use a
+        // solid bar (own space, always opaque, square corners already come
+        // from the widgets.* rounding=ZERO below) with a hairline-colored
+        // handle (foreground_color -> fg_stroke) instead of bg_fill, which
+        // here is the same color as the track and would be invisible.
+        style.spacing.scroll = egui::style::ScrollStyle {
+            foreground_color: true,
+            ..egui::style::ScrollStyle::solid()
+        };
         // egui's defaults (Body/Button 14, Small 10) are all a step above the
         // mockup, which is why every string in the app read larger than its
         // HTML twin: mockup sizes are input/select/checkbox 13, .btn 12.5,
@@ -664,21 +742,14 @@ impl SnatchApp {
             tc: Toolchain { yt_dlp: None, aria2c: None },
             setup_started: false,
             phase: Phase::Idle,
-            progress: None,
-            torrent_name: None,
+            jobs: Vec::new(),
+            next_job_id: 0,
+            retry_offer: None,
+            paused: Vec::new(),
             status: String::new(),
             status_kind: StatusKind::None,
-            warns: Vec::new(),
             log: Vec::new(),
             show_log_window: false,
-            auth_seen: false,
-            missing_control_file: false,
-            cancelled: false,
-            offer_retry: false,
-            last_plan: None,
-            last_job: None,
-            last_no_continue: false,
-            resumed_seen: false,
             show_url_history: false,
             show_dir_history: false,
             browser: DirBrowser {
@@ -690,7 +761,6 @@ impl SnatchApp {
             drives,
             tx,
             rx,
-            cancel_flag: Arc::new(AtomicBool::new(false)),
             close_requested: false,
             #[cfg(windows)]
             maximized: false,
@@ -698,6 +768,7 @@ impl SnatchApp {
             log_cache_rev: 0,
             log_cache: String::new(),
             dark_mode,
+            queue: VecDeque::new(),
         }
     }
 
@@ -749,55 +820,117 @@ impl SnatchApp {
         self.status = text.into();
     }
 
+    fn job_mut(&mut self, id: u64) -> Option<&mut ActiveJob> {
+        self.jobs.iter_mut().find(|j| j.id == id)
+    }
+
+    /// Prefixes a job's line with its label so concurrent jobs stay
+    /// distinguishable in the one shared log window. Falls back to an
+    /// unprefixed line if the job already finished (id no longer in `jobs`)
+    /// by the time this drains - can happen for the last couple of lines a
+    /// reader thread queues right as Done races in behind them.
+    fn push_job_log(&mut self, id: u64, line: String) {
+        match self.job_mut(id).map(|j| j.label.clone()) {
+            Some(label) if !label.is_empty() => self.push_log(format!("[{label}] {line}")),
+            _ => self.push_log(line),
+        }
+    }
+
     fn drain(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                Msg::Log(line) => {
-                    let trimmed = line.trim_end();
+                Msg::Log(id, line) => {
+                    let trimmed = line.trim_end().to_string();
                     // Exact yt-dlp prefix, not a substring search anywhere in
                     // the line: an uploader-chosen title containing
                     // "Resuming download" (arriving inside a Destination line)
                     // used to arm the automatic from-scratch retry for any
                     // subsequent failure of that download.
                     if trimmed.starts_with("[download] Resuming download") {
-                        self.resumed_seen = true;
+                        if let Some(j) = self.job_mut(id) {
+                            j.resumed_seen = true;
+                        }
+                    }
+                    if let Some(title) = engines::ytdlp_title_from_line(&trimmed) {
+                        if let Some(j) = self.job_mut(id) {
+                            j.label = title;
+                        }
                     }
                     if !trimmed.is_empty() {
-                        self.set_status(StatusKind::None, clip(trimmed, 96));
-                        self.push_log(trimmed.to_string());
-                    }
-                }
-                Msg::ErrLine(line) => {
-                    if looks_like_auth(&line) {
-                        self.auth_seen = true;
-                    }
-                    let trimmed = line.trim_end();
-                    if engines::aria2_missing_control(trimmed) {
-                        if !self.missing_control_file {
-                            self.missing_control_file = true;
-                            self.push_log(engines::ARIA2_MISSING_CONTROL_HINT.to_owned());
+                        // yt-dlp's own speed/ETA estimator occasionally comes
+                        // up empty for one tick - especially under several
+                        // concurrent downloads competing for I/O - and prints
+                        // that tick as literally "Unknown B/s ETA Unknown"
+                        // (confirmed in the CLI too, so this is yt-dlp's own
+                        // output, not something this app generates or can
+                        // fix). Just not updating the status line for that
+                        // one tick keeps the last real speed/ETA on screen
+                        // instead of flashing "Unknown" every second or two;
+                        // the percentage keeps moving regardless (Progress is
+                        // sent unconditionally, separately from this line).
+                        if !trimmed.contains("Unknown B/s") {
+                            if let Some(j) = self.job_mut(id) {
+                                j.set_status(StatusKind::None, clip(&trimmed, 96));
+                            }
                         }
-                    } else if !trimmed.is_empty() && !(trimmed.contains("Exception caught")
-                        && self.last_plan.as_ref().is_some_and(|p| p.engine == "aria2")) {
-                        self.push_log(trimmed.to_string());
+                        self.push_job_log(id, trimmed);
                     }
                 }
-                Msg::Progress(p) => self.progress = Some(p),
-                Msg::TorrentStatus(p, status) => {
-                    self.progress = Some(p);
-                    self.set_status(StatusKind::None, status);
+                Msg::ErrLine(id, line) => {
+                    if looks_like_auth(&line) {
+                        if let Some(j) = self.job_mut(id) {
+                            j.auth_seen = true;
+                        }
+                    }
+                    let trimmed = line.trim_end().to_string();
+                    if engines::aria2_missing_control(&trimmed) {
+                        let already = self.job_mut(id).is_some_and(|j| j.missing_control_file);
+                        if !already {
+                            if let Some(j) = self.job_mut(id) {
+                                j.missing_control_file = true;
+                            }
+                            self.push_job_log(id, engines::ARIA2_MISSING_CONTROL_HINT.to_owned());
+                        }
+                    } else if !trimmed.is_empty() {
+                        let aria2_exception = trimmed.contains("Exception caught")
+                            && self.job_mut(id).is_some_and(|j| j.job.engine == "aria2");
+                        if !aria2_exception {
+                            self.push_job_log(id, trimmed);
+                        }
+                    }
                 }
-                Msg::TorrentMeta(name) => {
-                    self.progress = None;
+                Msg::Progress(id, p) => {
+                    if let Some(j) = self.job_mut(id) {
+                        j.progress = Some(p);
+                    }
+                }
+                Msg::TorrentStatus(id, p, status) => {
+                    if let Some(j) = self.job_mut(id) {
+                        j.progress = Some(p);
+                        j.set_status(StatusKind::None, status);
+                    }
+                }
+                Msg::TorrentMeta(id, name) => {
+                    if let Some(j) = self.job_mut(id) {
+                        j.progress = None;
+                    }
                     if !name.is_empty() {
-                        self.push_log(format!("Торрент: {name}"));
-                        self.torrent_name = Some(name);
+                        self.push_job_log(id, format!("Торрент: {name}"));
+                        if let Some(j) = self.job_mut(id) {
+                            j.label = name;
+                        }
                     }
-                    self.set_status(StatusKind::None, "Получаю метаданные торрента…");
+                    if let Some(j) = self.job_mut(id) {
+                        j.set_status(StatusKind::None, "Получаю метаданные торрента…");
+                    }
                 }
-                Msg::TorrentName(name) => self.torrent_name = Some(name),
-                Msg::TorrentLog(line) => self.push_log(line),
-                Msg::Done(code) => self.finish_download(code, ctx),
+                Msg::TorrentName(id, name) => {
+                    if let Some(j) = self.job_mut(id) {
+                        j.label = name;
+                    }
+                }
+                Msg::TorrentLog(id, line) => self.push_job_log(id, line),
+                Msg::Done(id, code) => self.finish_job(id, code, ctx),
                 Msg::SetupLog(line) => self.push_log(line),
                 Msg::ToolsReady(tc) => apply_initial_discovery(&mut self.tc, self.setup_started, tc),
                 Msg::SetupDone(ok, tc) => {
@@ -817,85 +950,110 @@ impl SnatchApp {
                 }
             }
         }
-        if self.phase != Phase::Idle {
+        if self.phase == Phase::Setup || !self.jobs.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(150));
         }
-        // The window close was vetoed while a job was being killed; now that
-        // the phase is back to Idle, actually close.
-        if self.close_requested && self.phase == Phase::Idle {
+        // The window close was vetoed while jobs were being killed; now that
+        // everything's actually finished, close for real.
+        if self.close_requested && self.phase == Phase::Idle && self.jobs.is_empty() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
 
-    fn finish_download(&mut self, code: i32, ctx: &egui::Context) {
-        self.phase = Phase::Idle;
-        self.progress = None;
+    /// One specific job (by id) finished - success, failure or cancelled.
+    /// Concurrent siblings in `self.jobs` are untouched.
+    fn finish_job(&mut self, id: u64, code: i32, ctx: &egui::Context) {
+        let Some(pos) = self.jobs.iter().position(|j| j.id == id) else {
+            // Already removed (e.g. a duplicate Done somehow) - nothing to do.
+            return;
+        };
+        let aj = self.jobs.remove(pos);
+        let label = clip(&aj.label, 60);
+
         // Cancel that lost the race with a completed download still gets the
         // "Готово" branch: the file IS complete, claiming "отменено, можно
         // докачать" would send the user to re-download a finished file.
-        let cancelled = std::mem::replace(&mut self.cancelled, false);
-        if cancelled && code != 0 {
-            self.set_status(StatusKind::Warn, "Отменено (файл можно докачать)");
+        if aj.cancelled && code != 0 {
+            self.set_status(StatusKind::Warn, format!("«{label}» отменено (файл можно докачать)"));
+            self.fill_free_slots(ctx);
             return;
         }
-        if code == 13 && self.missing_control_file {
-            self.offer_retry = false;
-            self.set_status(StatusKind::Err, "Файлы уже есть без .aria2 — выберите новую пустую папку");
+        // Same "still finished on its own" race as cancel above: if it hit
+        // code 0 right as pause was requested, treat it as done, not paused.
+        if aj.pausing && code != 0 {
+            self.set_status(StatusKind::None, format!("«{label}» на паузе"));
+            self.paused.push(PausedJob { job: aj.job.clone(), label });
+            self.fill_free_slots(ctx);
+            return;
+        }
+        if code == 13 && aj.missing_control_file {
+            self.set_status(
+                StatusKind::Err,
+                format!("«{label}»: файлы уже есть без .aria2 — выберите новую пустую папку"),
+            );
             self.show_log_window = true;
+            self.fill_free_slots(ctx);
             return;
         }
         match code {
             0 => {
-                if let Some(plan) = &self.last_plan {
-                    self.cfg.remember_url(&plan.url);
-                    self.cfg.remember_dir(&plan.out_dir);
-                    self.cfg.save();
-                    let dir = plan.out_dir.clone();
-                    self.set_status(StatusKind::Ok, format!("Готово: {dir}"));
-                } else {
-                    self.set_status(StatusKind::Ok, "Готово");
-                }
-                self.offer_retry = false;
+                self.cfg.remember_url(&aj.job.url);
+                self.cfg.remember_dir(&aj.job.out_dir.to_string_lossy());
+                self.cfg.save();
+                self.set_status(StatusKind::Ok, format!("«{label}» готово: {}", aj.job.out_dir.display()));
             }
             127 => self.set_status(
                 StatusKind::Err,
-                "Не удалось запустить загрузчик (бинарник пропал или не исполняем)",
+                format!("«{label}»: не удалось запустить загрузчик (бинарник пропал или не исполняем)"),
             ),
-            130 => self.set_status(StatusKind::Warn, "Прервано (файл можно докачать)"),
+            130 => self.set_status(StatusKind::Warn, format!("«{label}» прервано (файл можно докачать)")),
             c => {
-                self.set_status(StatusKind::Err, format!("Ошибка (код {c}) — см. журнал"));
+                self.set_status(StatusKind::Err, format!("«{label}»: ошибка (код {c}) — см. журнал"));
                 self.show_log_window = true;
-                self.offer_retry = c == 1 && self.auth_seen && self.last_plan.as_ref().is_some_and(|p| p.engine == "yt-dlp");
+                let offer_retry = c == 1 && aj.auth_seen && aj.job.engine == "yt-dlp";
                 // The run resumed a .part and still failed: the old part is
                 // unusable (stale range / corrupt bytes), so retry the same
                 // job once from scratch instead of making the user click.
-                if self.resumed_seen
-                    && !self.last_no_continue
-                    && !self.offer_retry
-                    && self.last_job.as_ref().is_some_and(|j| j.engine == "yt-dlp")
-                {
-                    if let Some(job) = self.last_job.clone() {
-                        // Re-detect auth from the retry's own stderr instead of
-                        // carrying the first attempt's hint into a possible
-                        // cookies offer for a completely different failure.
-                        self.auth_seen = false;
-                        self.start_job(ctx, job, true);
-                        if self.phase == Phase::Running {
-                            self.set_status(
-                                StatusKind::Warn,
-                                "Докачка дала битый файл — повторяю с начала",
-                            );
-                        }
-                    }
+                let retry_from_scratch =
+                    aj.resumed_seen && !aj.no_continue && !offer_retry && aj.job.engine == "yt-dlp";
+                if offer_retry {
+                    // Only the most recent auth failure offers a retry - a
+                    // stacked "3 jobs want cookies" list would need its own
+                    // per-job UI for one-shot, rarely-needed friction.
+                    self.retry_offer = Some(aj.job.clone());
+                } else if retry_from_scratch {
+                    self.spawn_job(ctx, aj.job.clone(), true);
+                    self.set_status(StatusKind::Warn, format!("«{label}»: докачка дала битый файл — повторяю с начала"));
                 }
             }
         }
+        self.fill_free_slots(ctx);
     }
 
-    fn start_download(&mut self, ctx: &egui::Context) {
-        self.offer_retry = false;
-        self.auth_seen = false;
+    /// Starts queued jobs until MAX_CONCURRENT is reached or the queue runs
+    /// out. Called after any job finishes, freeing a slot.
+    fn fill_free_slots(&mut self, ctx: &egui::Context) {
+        if self.close_requested {
+            return;
+        }
+        while self.jobs.len() < MAX_CONCURRENT {
+            let Some(job) = self.queue.pop_front() else { break };
+            self.spawn_job(ctx, job, false);
+        }
+    }
 
+    /// The "▶ СКАЧАТЬ" / "+ В ОЧЕРЕДЬ" button always calls this. Starts right
+    /// away while there's a free concurrent slot (MAX_CONCURRENT, matching
+    /// the CLI's `-j` default of 3 at once); once full, queues instead of
+    /// locking the form - engine is auto-detected per link right now
+    /// (whatever the current движок/формат/папка choice resolves to),
+    /// matching the CLI's `-j` batch where each URL picks its own engine but
+    /// shares format/folder.
+    fn start_download(&mut self, ctx: &egui::Context) {
+        if self.phase == Phase::Setup {
+            self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
+            return;
+        }
         let engine = self.effective_engine().to_string();
         let url = match validate_url(&self.url) {
             Ok(u) => u,
@@ -908,54 +1066,60 @@ impl SnatchApp {
             self.set_status(StatusKind::Err, "Укажите папку сохранения");
             return;
         }
-        // Only wipe the previous run's log once the new job is actually
-        // valid: a typo in the URL field shouldn't destroy the log the user
-        // may still be reading.
-        self.clear_log();
-        self.progress = None;
         let fmt = if engine == "yt-dlp" { self.fmt.clone() } else { "best".to_string() };
         let cookies = if engine == "yt-dlp" && self.use_cookies {
             Some(self.cookies_browser.clone())
         } else {
             None
         };
-
+        let already_running = self.jobs.iter().any(|j| j.job.url == url)
+            || self.queue.iter().any(|j| j.url == url)
+            || self.paused.iter().any(|p| p.job.url == url);
+        if already_running {
+            self.set_status(StatusKind::Err, "Эта ссылка уже скачивается, в очереди или на паузе");
+            return;
+        }
         let job = Job {
-            engine: engine.clone(),
-            url: url.clone(),
+            engine,
+            url,
             out_dir: PathBuf::from(&self.out_dir),
             fmt,
             cookies_browser: cookies,
         };
-        self.start_job(ctx, job, false);
+        // Cleared once the job is valid and either starting or queued - not
+        // on a validation error above, so a typo doesn't lose what's typed.
+        self.url.clear();
+        if self.jobs.len() < MAX_CONCURRENT {
+            self.spawn_job(ctx, job, false);
+        } else {
+            self.queue.push_back(job);
+            self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+        }
     }
 
-    /// Spawns the loader for an already-validated job. `no_continue` retries
-    /// a resumed yt-dlp download from scratch: a stale/corrupt .part can't
-    /// be validated by yt-dlp and poisons the run (Errno 22 mid-download or
-    /// a merger "Invalid data" afterwards), so one clean retry heals it.
-    fn start_job(&mut self, ctx: &egui::Context, job: Job, no_continue: bool) {
-        let engine = job.engine.clone();
-        let url = job.url.clone();
-        self.progress = None;
-        self.torrent_name = None;
-        self.missing_control_file = false;
-        self.warns = preflight_warning(&job);
+    /// Spawns the loader for an already-validated job as a new concurrent
+    /// entry in `self.jobs`. `no_continue` retries a resumed yt-dlp download
+    /// from scratch: a stale/corrupt .part can't be validated by yt-dlp and
+    /// poisons the run (Errno 22 mid-download or a merger "Invalid data"
+    /// afterwards), so one clean retry heals it.
+    fn spawn_job(&mut self, ctx: &egui::Context, job: Job, no_continue: bool) {
+        let label = engines::batch_name(&job.url);
+        let warns = preflight_warning(&job);
         let mut cmd = match engines::build(&job, &self.tc) {
             Ok(c) => c,
             Err(e) => {
-                self.set_status(StatusKind::Err, e);
+                self.set_status(StatusKind::Err, format!("«{label}»: {e}"));
                 return;
             }
         };
 
         let insert_at = cmd.len().saturating_sub(2);
-        if engine == "yt-dlp" {
+        if job.engine == "yt-dlp" {
             cmd.insert(insert_at, "--newline".into());
         } else {
             cmd.insert(insert_at, "--summary-interval=1".into());
         }
-        if no_continue && engine == "yt-dlp" {
+        if no_continue && job.engine == "yt-dlp" {
             cmd.insert(insert_at, "--no-continue".into());
         }
 
@@ -987,7 +1151,7 @@ impl SnatchApp {
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(_) => {
-                self.set_status(StatusKind::Err, "Не удалось запустить загрузчик");
+                self.set_status(StatusKind::Err, format!("«{label}»: не удалось запустить загрузчик"));
                 return;
             }
         };
@@ -1009,19 +1173,29 @@ impl SnatchApp {
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
-        self.last_plan = Some(LastPlan { url, engine, out_dir: self.out_dir.clone() });
-        self.last_job = Some(job.clone());
-        self.last_no_continue = no_continue;
-        self.resumed_seen = false;
-        self.phase = Phase::Running;
-        self.cancelled = false;
-        self.cancel_flag.store(false, Ordering::SeqCst);
-        self.set_status(StatusKind::None, "Запускаю…");
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+        let aria2 = job.engine == "aria2";
+        self.jobs.push(ActiveJob {
+            id,
+            job: job.clone(),
+            label,
+            progress: None,
+            status: "Запускаю…".to_string(),
+            status_kind: StatusKind::None,
+            warns,
+            cancel_flag: cancel_flag.clone(),
+            cancelled: false,
+            pausing: false,
+            auth_seen: false,
+            missing_control_file: false,
+            resumed_seen: false,
+            no_continue,
+        });
 
         let tx = self.tx.clone();
-        let cancel = self.cancel_flag.clone();
         let ctx_w = ctx.clone();
-        let aria2 = job.engine == "aria2";
         std::thread::spawn(move || {
             let tx_out = tx.clone();
             let ctx_out = ctx_w.clone();
@@ -1059,11 +1233,11 @@ impl SnatchApp {
                     if aria2 {
                         let mut latest = None;
                         for fragment in line.replace('\r', "\n").lines() {
-                            if let Some(msg) = torrent_console_line(fragment) {
+                            if let Some(msg) = torrent_console_line(id, fragment) {
                                 match msg {
                                     Msg::TorrentStatus(..) => latest = Some(msg),
                                     other => {
-                                        if matches!(other, Msg::TorrentMeta(_)) { latest = None; }
+                                        if matches!(other, Msg::TorrentMeta(..)) { latest = None; }
                                         let _ = tx_out.send(other);
                                     }
                                 }
@@ -1073,10 +1247,10 @@ impl SnatchApp {
                             let due = last_progress_log
                                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(200));
                             if due {
-                                if let Msg::TorrentStatus(_, ref stat) = msg {
+                                if let Msg::TorrentStatus(_, _, ref stat) = msg {
                                     if last_torrent_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
                                         last_torrent_log = Some(Instant::now());
-                                        let _ = tx_out.send(Msg::TorrentLog(stat.clone()));
+                                        let _ = tx_out.send(Msg::TorrentLog(id, stat.clone()));
                                     }
                                 }
                                 last_progress_log = Some(Instant::now());
@@ -1088,17 +1262,17 @@ impl SnatchApp {
                     }
                     match parse_progress(&line) {
                         Some(p) => {
-                            let _ = tx_out.send(Msg::Progress(p));
+                            let _ = tx_out.send(Msg::Progress(id, p));
                             let due = last_progress_log
                                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(500));
                             if due {
                                 last_progress_log = Some(Instant::now());
-                                let _ = tx_out.send(Msg::Log(line));
+                                let _ = tx_out.send(Msg::Log(id, line));
                                 ctx_out.request_repaint();
                             }
                         }
                         None => {
-                            let _ = tx_out.send(Msg::Log(line));
+                            let _ = tx_out.send(Msg::Log(id, line));
                             ctx_out.request_repaint();
                         }
                     }
@@ -1117,7 +1291,7 @@ impl SnatchApp {
                         Ok(_) => {}
                     }
                     let line = engines::sanitize_child_output(&engines::decode_child_bytes(&buf));
-                    let _ = tx_err.send(Msg::ErrLine(line));
+                    let _ = tx_err.send(Msg::ErrLine(id, line));
                     // Running already schedules repaint every 150ms in drain;
                     // per-line requests here would redraw the entire window
                     // for every noisy warning from aria2c.
@@ -1132,7 +1306,7 @@ impl SnatchApp {
             // closes the handle for us - same effect, no orphaned seeders.
             let proc_job = proc_job;
             let status = loop {
-                if cancel.load(Ordering::SeqCst) {
+                if cancel_flag.load(Ordering::SeqCst) {
                     let mut c = child.lock().unwrap();
                     if let Some(j) = &proc_job {
                         j.terminate();
@@ -1149,7 +1323,7 @@ impl SnatchApp {
             let _ = h_out.join();
             let _ = h_err.join();
             let code = status.map(|s| s.code().unwrap_or(130)).unwrap_or(127);
-            let _ = tx.send(Msg::Done(code));
+            let _ = tx.send(Msg::Done(id, code));
             ctx_w.request_repaint();
         });
     }
@@ -1160,9 +1334,7 @@ impl SnatchApp {
         // A stale cookies-retry offer must not stay clickable through Setup
         // (it used to spawn a download on top of the installer, and the
         // SetupDone handler then flipped the phase out from under it).
-        self.offer_retry = false;
-        // Preflight warnings belong to the previous job, not to the installer.
-        self.warns.clear();
+        self.retry_offer = None;
         self.clear_log();
         self.set_status(StatusKind::None, "Устанавливаю загрузчики…");
         let tx = self.tx.clone();
@@ -1206,9 +1378,39 @@ impl SnatchApp {
         });
     }
 
-    fn cancel(&mut self) {
-        self.cancelled = true;
-        self.cancel_flag.store(true, Ordering::SeqCst);
+    /// Cancels exactly one active job - picking the wrong one among several
+    /// running at once was the whole point of moving this off a single
+    /// shared flag.
+    fn cancel_job(&mut self, id: u64) {
+        if let Some(j) = self.job_mut(id) {
+            j.cancelled = true;
+            j.cancel_flag.store(true, Ordering::SeqCst);
+            let label = j.label.clone();
+            self.set_status(StatusKind::Warn, format!("«{}»: останавливаю…", clip(&label, 60)));
+        }
+    }
+
+    /// Pauses exactly one active job: kills its process the same way cancel
+    /// does, but finish_job() sees `pausing` and keeps the job around in
+    /// `self.paused` (with a "продолжить" button) instead of dropping it -
+    /// see the field doc on ActiveJob::pausing for why no extra IPC to the
+    /// child is needed.
+    fn pause_job(&mut self, id: u64) {
+        if let Some(j) = self.job_mut(id) {
+            j.pausing = true;
+            j.cancel_flag.store(true, Ordering::SeqCst);
+            let label = j.label.clone();
+            self.set_status(StatusKind::None, format!("«{}»: ставлю на паузу…", clip(&label, 60)));
+        }
+    }
+
+    /// Cancels every active job - used when the whole app is closing, not
+    /// from the per-job cancel button.
+    fn cancel_all(&mut self) {
+        for j in &mut self.jobs {
+            j.cancelled = true;
+            j.cancel_flag.store(true, Ordering::SeqCst);
+        }
         self.set_status(StatusKind::Warn, "Останавливаю…");
     }
 
@@ -1294,16 +1496,14 @@ impl SnatchApp {
                         .on_hover_text("Закрыть")
                         .clicked()
                     {
-                        match self.phase {
-                            Phase::Running => {
-                                self.close_requested = true;
-                                self.cancel();
-                            }
-                            Phase::Setup => {
-                                self.close_requested = true;
-                                self.set_status(StatusKind::Warn, "Завершаю установку перед закрытием…");
-                            }
-                            Phase::Idle => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                        if !self.jobs.is_empty() {
+                            self.close_requested = true;
+                            self.cancel_all();
+                        } else if self.phase == Phase::Setup {
+                            self.close_requested = true;
+                            self.set_status(StatusKind::Warn, "Завершаю установку перед закрытием…");
+                        } else {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
                 });
@@ -1351,7 +1551,7 @@ impl SnatchApp {
                 // enabled one, so an empty history read as "the button is
                 // broken". The window opens anyway and explains itself.
                 if ui
-                    .add_enabled(self.phase == Phase::Idle, egui::Button::new("▾"))
+                    .add_enabled(self.phase != Phase::Setup, egui::Button::new("▾"))
                     .on_hover_text("Последние ссылки")
                     .clicked()
                 {
@@ -1359,7 +1559,7 @@ impl SnatchApp {
                 }
                 #[cfg(windows)]
                 if ui
-                    .add_enabled(self.phase == Phase::Idle, egui::Button::new("файл"))
+                    .add_enabled(self.phase != Phase::Setup, egui::Button::new("файл"))
                     .on_hover_text("Выбрать локальный .torrent-файл")
                     .clicked()
                 {
@@ -1371,7 +1571,10 @@ impl SnatchApp {
                     // use `padding: 9px 11px`, noticeably roomier.
                     .margin(egui::Margin::symmetric(11.0, 9.0))
                     .hint_text("https://… magnet:… или путь к .torrent");
-                ui.add_enabled(self.phase == Phase::Idle, edit);
+                // Stays enabled while a job is Running (not just Idle): a
+                // queue means the next link can be typed/pasted without
+                // waiting for the active download to finish.
+                ui.add_enabled(self.phase != Phase::Setup, edit);
             });
         });
         #[cfg(windows)]
@@ -1416,12 +1619,14 @@ impl SnatchApp {
     }
 
     fn ui_engine_row(&mut self, ui: &mut egui::Ui) -> bool {
-        let enabled = self.phase == Phase::Idle;
+        // Not gated on Idle: a Running job doesn't own these fields, the next
+        // queued link does, so движок/формат/папка must stay editable.
+        let enabled = self.phase != Phase::Setup;
         let mut dir_history_opened = false;
         ui.add_space(6.0);
         tag_label(ui, "движок");
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(enabled, |ui| {
+            let buttons = ui.add_enabled_ui(enabled, |ui| {
                 // Flat "● label" / "○ label" - see engine_choice's doc comment
                 // for why this replaced both radio_value and selectable_value.
                 if engine_choice(ui, "авто", self.engine_mode == EngineMode::Auto).clicked() {
@@ -1437,7 +1642,25 @@ impl SnatchApp {
             if self.engine_mode == EngineMode::Auto {
                 let guess = self.effective_engine();
                 if !self.url.trim().is_empty() {
-                    ui.weak(egui::RichText::new(format!("→ {guess}")).size(12.0));
+                    // Two guesses at a font-tweak fix (the default label font,
+                    // then the "button" family) each moved this the wrong way
+                    // or overshot - the buttons' own vertical centering isn't
+                    // something a font offset on a *different* widget can
+                    // reliably match. Instead, read back the actual rendered
+                    // rect of the button row and paint this text at that
+                    // exact center - no font-metric guessing involved.
+                    let color = ui.visuals().weak_text_color();
+                    let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
+                    let galley = ui.painter().layout_no_wrap(format!("→ {guess}"), font, color);
+                    // Exact rect-center math landed a hair high - likely the
+                    // "→" glyph's own ink sits above its box's true center,
+                    // not a layout issue. Small fixed nudge down.
+                    let pos = egui::pos2(
+                        ui.cursor().left(),
+                        buttons.response.rect.center().y - galley.size().y / 2.0 + 2.0,
+                    );
+                    ui.painter().galley(pos, galley.clone(), color);
+                    ui.allocate_exact_size(galley.size(), egui::Sense::hover());
                 }
             }
         });
@@ -1468,7 +1691,7 @@ impl SnatchApp {
                 // Same as the url-history ▾: an empty history must not look
                 // like a dead button.
                 if ui
-                    .add_enabled(self.phase == Phase::Idle, egui::Button::new("▾"))
+                    .add_enabled(enabled, egui::Button::new("▾"))
                     .on_hover_text("Последние папки")
                     .clicked()
                 {
@@ -1476,7 +1699,7 @@ impl SnatchApp {
                 }
                 if ui
                     .add_enabled(
-                        self.phase == Phase::Idle,
+                        enabled,
                         egui::Button::new("обзор"),
                     )
                     .on_hover_text("Выбрать папку для скачивания")
@@ -1485,7 +1708,7 @@ impl SnatchApp {
                     open_browser = true;
                 }
                 ui.add_enabled(
-                    self.phase == Phase::Idle,
+                    enabled,
                     egui::TextEdit::singleline(&mut self.out_dir)
                         .desired_width(f32::INFINITY)
                         .margin(egui::Margin::symmetric(11.0, 9.0)),
@@ -1707,7 +1930,7 @@ impl SnatchApp {
     fn ui_cookies_row(&mut self, ui: &mut egui::Ui) {
         let yt = self.effective_engine() == "yt-dlp";
         ui.add_space(6.0);
-        ui.add_enabled_ui(self.phase == Phase::Idle && yt, |ui| {
+        ui.add_enabled_ui(self.phase != Phase::Setup && yt, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.use_cookies, "куки из браузера");
                 ui.add_enabled_ui(self.use_cookies, |ui| {
@@ -1724,88 +1947,161 @@ impl SnatchApp {
     }
 
     fn ui_run_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        match self.phase {
-            Phase::Running => {
-                if let Some(name) = &self.torrent_name {
-                    let accent = ui.visuals().hyperlink_color;
-                    ui.label(egui::RichText::new(clip(name, 72)).size(12.0).color(accent));
-                }
-                match self.progress {
+        // One block per concurrent job - up to MAX_CONCURRENT of these, each
+        // with its own name/progress/cancel, so cancelling the second
+        // download doesn't require cancelling the first one first.
+        let mut pause_id = None;
+        let mut cancel_id = None;
+        // Pause/cancel sit beside the bar itself instead of a full-width
+        // button on its own line below - the previous layout spent a whole
+        // extra row per job on one word. No pictograph glyphs on these
+        // buttons: TextStyle::Button renders through the "button" font
+        // family, which (unlike Monospace/Proportional) has no emoji
+        // fallback chain - see the day/night toggle for the same fix.
+        const JOB_BTN_W: f32 = 72.0;
+        for (i, aj) in self.jobs.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(10.0);
+            }
+            let accent = ui.visuals().hyperlink_color;
+            ui.label(egui::RichText::new(clip(&aj.label, 72)).size(12.0).color(accent));
+            ui.horizontal(|ui| {
+                let gap = ui.spacing().item_spacing.x;
+                let bar_w = (ui.available_width() - 2.0 * JOB_BTN_W - 2.0 * gap).max(40.0);
+                match aj.progress {
                     Some(p) => {
                         // ProgressBar hardcodes a pill shape (rounding =
                         // height/2) unless overridden - Rounding isn't part
                         // of Visuals for this widget, so the square-corners
                         // theme never reached it.
-                        // .text() instead of .show_percentage(): that one
-                        // truncates ((p*100) as usize), displaying "99%"
-                        // until the very end; floor() rounds the same way
-                        // but we control it (and 100% shows only at 100%).
+                        // No .text() overlay: egui hardcodes that text's
+                        // color to visuals.selection.stroke (see
+                        // ProgressBar::ui in egui's source) with no way to
+                        // override it per-widget, and that's the same accent
+                        // color as .fill() below - the percentage became
+                        // invisible wherever it sat over the filled portion.
+                        // No information lost: this job's own status line
+                        // right below already shows it as part of the raw
+                        // yt-dlp/aria2 line (aria2_stat/parse_progress).
                         ui.add(
                             egui::ProgressBar::new(p)
-                                .text(format!("{}%", (p * 100.0).floor() as u32))
                                 .rounding(egui::Rounding::ZERO)
-                                .fill(ui.visuals().hyperlink_color)
-                                .desired_height(36.0),
+                                .fill(accent)
+                                .desired_width(bar_w)
+                                .desired_height(28.0),
                         );
                     }
                     None => {
-                        ui.horizontal(|ui| {
-                            ui.spinner();
-                            ui.weak(if self.status.starts_with("Получаю метаданные") {
-                                "Метаданные торрента…"
-                            } else {
-                                "Подключение…"
+                        ui.allocate_ui(egui::vec2(bar_w, 28.0), |ui| {
+                            ui.horizontal(|ui| {
+                                ui.spinner();
+                                ui.weak(if aj.status.starts_with("Получаю метаданные") {
+                                    "Метаданные торрента…"
+                                } else {
+                                    "Подключение…"
+                                });
                             });
                         });
                     }
                 }
-                // add_sized() with f32::INFINITY as the width draws the
-                // button's border but renders no text at all (same egui quirk
-                // documented below on the "СКАЧАТЬ" button) - a concrete width
-                // doesn't have that problem.
-                let width = ui.available_width();
-                if ui.add_sized([width, 36.0], egui::Button::new("отменить")).clicked() {
-                    self.cancel();
+                if ui.add_sized([JOB_BTN_W, 28.0], egui::Button::new("пауза")).clicked() {
+                    pause_id = Some(aj.id);
                 }
-            }
-            Phase::Setup => {
-                ui.horizontal(|ui| {
-                    ui.spinner();
-                    ui.label("скачиваю yt-dlp и aria2c…");
-                });
-            }
-            Phase::Idle => {
-                let can = !self.url.trim().is_empty()
-                    && !self.out_dir.trim().is_empty()
-                    && (self.tc.yt_dlp.is_some() || self.tc.aria2c.is_some());
-                // `.cta { width: 100% }` in the mockup. add_sized() forces
-                // Layout::centered_and_justified (confirmed in egui's
-                // source), which is what actually centers the text - plain
-                // min_size() just reserves space in the *ambient* layout
-                // (Align::Min/left here), so the text stayed pinned left in
-                // a much wider button. add_sized() with f32::INFINITY as the
-                // width produced a button with a border but literally no
-                // text at all; a concrete width doesn't have that problem
-                // and still gets the forced centered layout.
-                let width = ui.available_width();
-                let accent = ui.visuals().hyperlink_color;
-                let cta = egui::Button::new(
-                    // The mockup's source text is lowercase, but its CSS has
-                    // `.cta { text-transform: uppercase }` - the *rendered*
-                    // (approved) look is "▶ СКАЧАТЬ", not "▶ скачать".
-                    // Mockup's `.cta` is `font: 600 13px` - 16.0 here was
-                    // never actually checked against it.
-                    egui::RichText::new("▶ СКАЧАТЬ").color(accent).size(13.0),
-                )
-                .stroke(egui::Stroke::new(1.0, accent))
-                .fill(egui::Color32::TRANSPARENT);
-                let clicked = ui
-                    .add_enabled_ui(can, |ui| ui.add_sized([width, 36.0], cta).clicked())
-                    .inner;
-                if clicked {
-                    self.start_download(ctx);
+                if ui.add_sized([JOB_BTN_W, 28.0], egui::Button::new("отмена")).clicked() {
+                    cancel_id = Some(aj.id);
                 }
+            });
+            if !aj.status.is_empty() {
+                ui.weak(clip(&aj.status, 90));
             }
+            for w in &aj.warns {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("! {w}"));
+            }
+        }
+        if let Some(id) = pause_id {
+            self.pause_job(id);
+        }
+        if let Some(id) = cancel_id {
+            self.cancel_job(id);
+        }
+        if !self.jobs.is_empty() {
+            ui.add_space(8.0);
+        }
+
+        let mut resume_idx = None;
+        let mut drop_idx = None;
+        for (i, pj) in self.paused.iter().enumerate() {
+            if i > 0 {
+                ui.add_space(6.0);
+            }
+            ui.horizontal(|ui| {
+                ui.weak(clip(&format!("на паузе: {}", pj.label), 60));
+                if ui.small_button("продолжить").clicked() {
+                    resume_idx = Some(i);
+                }
+                if ui.small_button("убрать").clicked() {
+                    drop_idx = Some(i);
+                }
+            });
+        }
+        if let Some(i) = resume_idx {
+            let pj = self.paused.remove(i);
+            if self.jobs.len() < MAX_CONCURRENT {
+                self.spawn_job(ctx, pj.job, false);
+            } else {
+                self.queue.push_back(pj.job);
+                self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+            }
+        }
+        if let Some(i) = drop_idx {
+            self.paused.remove(i);
+        }
+        if !self.paused.is_empty() {
+            ui.add_space(8.0);
+        }
+
+        if self.phase == Phase::Setup {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                ui.label("скачиваю yt-dlp и aria2c…");
+            });
+            return;
+        }
+
+        // Same button regardless of what's already running: start_download()
+        // starts immediately while there's a free concurrent slot, or queues
+        // behind the active jobs once MAX_CONCURRENT is reached (see its doc
+        // comment) - the label just says which one is about to happen.
+        // `.cta { width: 100% }` in the mockup. add_sized() forces
+        // Layout::centered_and_justified (confirmed in egui's source), which
+        // is what actually centers the text - plain min_size() just reserves
+        // space in the *ambient* layout (Align::Min/left here), so the text
+        // stayed pinned left in a much wider button. add_sized() with
+        // f32::INFINITY as the width produced a button with a border but
+        // literally no text at all; a concrete width doesn't have that
+        // problem and still gets the forced centered layout.
+        let can = !self.url.trim().is_empty()
+            && !self.out_dir.trim().is_empty()
+            && (self.tc.yt_dlp.is_some() || self.tc.aria2c.is_some());
+        let width = ui.available_width();
+        let accent = ui.visuals().hyperlink_color;
+        // The mockup's source text is lowercase, but its CSS has
+        // `.cta { text-transform: uppercase }` - the *rendered* (approved)
+        // look is "▶ СКАЧАТЬ", not "▶ скачать". Mockup's `.cta` is
+        // `font: 600 13px` - 16.0 here was never actually checked against it.
+        let label = if self.jobs.len() < MAX_CONCURRENT { "▶ СКАЧАТЬ" } else { "+ В ОЧЕРЕДЬ" };
+        let cta = egui::Button::new(egui::RichText::new(label).color(accent).size(13.0))
+            .stroke(egui::Stroke::new(1.0, accent))
+            .fill(egui::Color32::TRANSPARENT);
+        let clicked = ui
+            .add_enabled_ui(can, |ui| ui.add_sized([width, 36.0], cta).clicked())
+            .inner;
+        if clicked {
+            self.start_download(ctx);
+        }
+        if !self.queue.is_empty() {
+            ui.add_space(4.0);
+            ui.weak(format!("В очереди: {}", self.queue.len()));
         }
     }
 }
@@ -1817,21 +2113,22 @@ impl eframe::App for SnatchApp {
         pin_pixel_scale(ctx, false);
         self.drain(ctx);
         let log_was_open = self.show_log_window;
-        if self.phase == Phase::Idle {
+        if self.phase != Phase::Setup {
             let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
             if let Some(path) = dropped {
                 self.set_torrent_file(&path);
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && self.phase != Phase::Idle {
+        if ctx.input(|i| i.viewport().close_requested()) && (!self.jobs.is_empty() || self.phase == Phase::Setup) {
             // eframe exits the event loop in THIS frame unless the close is
             // vetoed - the old flag-only version let the process die before
             // the monitor thread (100ms poll) reached kill(), orphaning the
             // loader mid-download. Veto, cancel properly (job object kills
-            // the whole tree), and drain() re-issues Close once Idle.
+            // the whole tree), and drain() re-issues Close once everything's
+            // actually done.
             self.close_requested = true;
-            if self.phase == Phase::Running {
-                self.cancel();
+            if !self.jobs.is_empty() {
+                self.cancel_all();
             } else {
                 self.set_status(StatusKind::Warn, "Завершаю установку перед закрытием…");
             }
@@ -1856,7 +2153,7 @@ impl eframe::App for SnatchApp {
                     ui.weak(egui::RichText::new(format!("snatch {APP_VERSION}")).size(11.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.hyperlink_to(
-                            egui::RichText::new("t.me/ArtemMurzin").size(11.0),
+                            egui::RichText::new(TELEGRAM_URL.trim_start_matches("https://")).size(11.0),
                             TELEGRAM_URL,
                         );
                     });
@@ -1958,7 +2255,7 @@ impl eframe::App for SnatchApp {
                 );
                 if cfg!(windows) && ui
                     .add_enabled(
-                        self.phase == Phase::Idle,
+                        self.phase != Phase::Setup && self.jobs.is_empty(),
                         egui::Button::new("установить загрузчики"),
                     )
                     .clicked()
@@ -1977,7 +2274,7 @@ impl eframe::App for SnatchApp {
                             // mockup's .btn is 12.5px with 7px 12px padding -
                             // .small() dropped it to the Small style and made
                             // the button visibly smaller than the HTML one.
-                            .add_enabled(self.phase == Phase::Idle, egui::Button::new("обновить"))
+                            .add_enabled(self.phase != Phase::Setup && self.jobs.is_empty(), egui::Button::new("обновить"))
                             .on_hover_text("Перескачать свежие yt-dlp и aria2c")
                             .clicked()
                         {
@@ -1997,33 +2294,27 @@ impl eframe::App for SnatchApp {
             self.ui_dir_history(ctx, dir_history_opened);
             self.ui_dir_browser(ctx);
 
-            if !self.warns.is_empty() && self.phase != Phase::Idle {
-                let warn = ui.visuals().warn_fg_color;
-                for w in &self.warns {
-                    ui.colored_label(warn, format!("! {w}"));
-                }
-            }
-
-            // Gated on Idle: during Setup/Running this block used to stay
-            // clickable and could spawn a second concurrent job sharing one
-            // cancel flag and one message channel.
-            if self.offer_retry && self.phase == Phase::Idle {
+            // retry_offer only ever comes from a job's own just-finished
+            // failure, so it doesn't need a phase/slot gate to *show* - only
+            // the click below needs to decide start-now vs queue.
+            if let Some(job) = self.retry_offer.clone() {
                 ui.add_space(6.0);
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
                     "Похоже, сайту нужна авторизация (бот-детект или возрастные ограничения).",
                 );
                 if ui.button("Повторить с куками из браузера").clicked() {
-                    // One-shot: retry the PREVIOUS job with cookies, without
-                    // flipping the persistent checkbox. A single (possibly
-                    // provoked) 403 shouldn't silently opt every future
-                    // download into reading the browser's cookie store.
-                    if let Some(mut job) = self.last_job.clone() {
-                        job.cookies_browser = Some(self.cookies_browser.clone());
-                        self.offer_retry = false;
-                        self.auth_seen = false;
-                        self.clear_log();
-                        self.start_job(ctx, job, false);
+                    // One-shot: retry with cookies without flipping the
+                    // persistent checkbox. A single (possibly provoked) 403
+                    // shouldn't silently opt every future download into
+                    // reading the browser's cookie store.
+                    let mut job = job;
+                    job.cookies_browser = Some(self.cookies_browser.clone());
+                    self.retry_offer = None;
+                    if self.jobs.len() < MAX_CONCURRENT {
+                        self.spawn_job(ctx, job, false);
+                    } else {
+                        self.queue.push_front(job);
                     }
                 }
             }
@@ -2112,14 +2403,14 @@ mod tests {
 
     #[test]
     fn torrent_console_summary_cannot_replace_gui_status_with_separator() {
-        assert!(torrent_console_line("*** Download Progress Summary as of now ***").is_none());
-        assert!(torrent_console_line("============================").is_none());
-        assert!(matches!(torrent_console_line("[#25017a 361MiB/6.8GiB(5%) CN:30 SD:5 DL:4.1MiB]"),
-            Some(Msg::TorrentStatus(p, status)) if (p - 0.05).abs() < 0.001 && status.contains("361MiB/6.8GiB")));
-        assert!(matches!(torrent_console_line("FILE: [MEMORY][METADATA][DL] Cuphead"),
-            Some(Msg::TorrentMeta(name)) if name == "Cuphead"));
-        assert!(matches!(torrent_console_line("Exception: errorCode=13 File x exists, but a control file(*.aria2) does not exist."),
-            Some(Msg::ErrLine(line)) if engines::aria2_missing_control(&line)));
+        assert!(torrent_console_line(1, "*** Download Progress Summary as of now ***").is_none());
+        assert!(torrent_console_line(1, "============================").is_none());
+        assert!(matches!(torrent_console_line(1, "[#25017a 361MiB/6.8GiB(5%) CN:30 SD:5 DL:4.1MiB]"),
+            Some(Msg::TorrentStatus(1, p, status)) if (p - 0.05).abs() < 0.001 && status.contains("361MiB/6.8GiB")));
+        assert!(matches!(torrent_console_line(1, "FILE: [MEMORY][METADATA][DL] Cuphead"),
+            Some(Msg::TorrentMeta(1, name)) if name == "Cuphead"));
+        assert!(matches!(torrent_console_line(1, "Exception: errorCode=13 File x exists, but a control file(*.aria2) does not exist."),
+            Some(Msg::ErrLine(1, line)) if engines::aria2_missing_control(&line)));
     }
 
     #[test]
