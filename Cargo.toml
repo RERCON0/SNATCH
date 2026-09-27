@@ -28,7 +28,10 @@ fs4 = "1.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 indicatif = "0.17"
 inquire = "0.9"
-reqwest = { version = "0.12", features = ["blocking", "json"] }
+# default-features off: drops the HTTP/2 stack (h2) the app never uses; charset
+# keeps today's .text() semantics (charset header + BOM sniffing), default-tls
+# uses schannel on Windows, system-proxy keeps corporate-proxy support.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "charset", "default-tls", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -52,4 +55,9 @@ panic = "abort"
 # lines whenever its text changes) is float-heavy and measurably stutters
 # when size-optimized. Speed up just that crate; everything else stays "z".
 [profile.release.package.epaint]
+opt-level = 2
+
+# Same story one layer up: egui's per-frame widget layout, interaction and id
+# hashing run on the very same frame path as epaint's tessellation.
+[profile.release.package.egui]
 opt-level = 2
