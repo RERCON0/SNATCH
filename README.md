@@ -12,7 +12,7 @@
    /\ \L\ \ \ \`\ \ \ \/\ \ \ \ \ \ \ \L\ \\ \ \ \ \
    \ `\____\ \_\ \_\ \_\ \_\ \ \_\ \ \____/ \ \_\ \_\
     \/_____/\/_/\/_/\/_/\/_/  \/_/  \/___/   \/_/\/_/
-                       yt-dlp + aria2c mini-combine
+                     yt-dlp + aria2c ultimate combine
                              by rercon prod. | https://t.me/rercon
 ```
 
@@ -39,8 +39,8 @@
 
 ## Требования
 
-- Хотя бы один из загрузчиков: **yt-dlp** и/или **aria2c** (можно поставить вручную или через встроенную автоустановку)
-- **ffmpeg** — только если хотите извлекать mp3 (`-f audio`)
+- Для YouTube/сайтов/torrent: хотя бы один из загрузчиков **yt-dlp** и/или **aria2c** (можно поставить вручную или через встроенную автоустановку)
+- **ffmpeg** — только если хотите извлекать mp3 из видео (`-f audio`)
 - Для сборки из исходников: **Rust** (stable, `cargo build --release`)
 
 ## Установка
@@ -103,7 +103,7 @@ snatch "magnet:?xt=urn:btih:..." "https://host/file.zip" -y -o "D:\Downloads" -j
 | `-j, --jobs <1..16>` | Одновременных загрузок при нескольких ссылках (по умолчанию 3) |
 | `-e, --engine {yt-dlp,aria2}` | Движок (по умолчанию — авто-определение) |
 | `-f, --format {best,1080p,audio}` | Формат для yt-dlp |
-| `--cookies-from-browser <браузер[:профиль]>` | Взять куки из браузера (chrome, firefox, edge, brave, opera, vivaldi, safari, chromium, whale), например `chrome:Profile 1` |
+| `--cookies-from-browser <браузер[:профиль]>` | Взять куки из браузера для yt-dlp (chrome, firefox, edge, brave, opera, vivaldi, safari, chromium, whale), например `chrome:Profile 1` |
 | `-y, --yes` | Не задавать вопросов (требует url и `-o`) |
 | `--clear-history` | Забыть последние ссылки и папки |
 | `--install-tools` | Скачать yt-dlp и aria2c в собственную папку SNATCH (Windows) |
@@ -125,7 +125,7 @@ GUI (`snatch-app.exe`) — двойной клик: вставил ссылку 
 
 ## Где хранятся настройки
 
-`%LOCALAPPDATA%\snatch\config.json` (Windows) или `~/.config/snatch/config.json` (Linux/macOS). Там живут папка по умолчанию и история ссылок/папок (до 15 записей), общие для CLI и GUI. Очистка — флагом `--clear-history` (CLI) или удалением файла.
+`%LOCALAPPDATA%\snatch\config.json` (Windows) или `~/.config/snatch/config.json` (Linux/macOS). Там живут папка по умолчанию, история ссылок/папок (до 15 записей) и тёмная/светлая тема GUI, общие для CLI и GUI. Очистка истории — флагом `--clear-history` (CLI) или удалением файла.
 
 ## Свои пути к загрузчикам
 
@@ -158,7 +158,7 @@ snatch "https://youtube.com/watch?v=..." -y -o "D:\Music" -f audio --cookies-fro
 - Конфиги самих загрузчиков игнорируются (`--no-conf`, `--ignore-config`) — подложенный `aria2.conf`/`yt-dlp.conf` в текущей папке не сработает
 - Поддерживаются только схемы `http`, `https`, `ftp` и `magnet:`
 - Бинарники ищутся через собственную автоустановленную папку, `PATH` и папки WinGet (`%LOCALAPPDATA%`): на общей машине это доверие к данным папкам — подменённый `yt-dlp.exe`/`aria2c.exe` будет запущен. При сомнениях задайте точные пути через `SNATCH_YT_DLP`/`SNATCH_ARIA2C`
-- Автоустановка yt-dlp проверяет официальную контрольную сумму SHA-512 релиза перед использованием
+- Автоустановка проверяет контрольные суммы релизов: SHA-512 для yt-dlp и SHA-256 для архива aria2 — файлы без успешной проверки не устанавливаются
 - История ссылок и папок хранится в `config.json` открытым текстом; URL с учётными данными (`https://user:token@…`) попадают туда как есть. На Linux/macOS файл создаётся с правами `0600`. Очистка — `--clear-history`
 - Докачка (`-c`): если в папке уже лежит файл с таким же именем от *другой* ссылки, aria2c продолжит писать в него — перед повтором проверяйте имена
 

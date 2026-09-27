@@ -18,8 +18,8 @@ use inquire::{Confirm, Select, Text};
 
 use snatch_rs::config::Config;
 use snatch_rs::engines::{
-    self, batch_name, build, detect_engine, is_unc_path, preflight_warning, validate_cookies_browser, validate_url, Job, RunResult,
-    COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
+    self, batch_name, build, detect_engine, is_unc_path, preflight_warning,
+    validate_cookies_browser, validate_url, Job, RunResult, COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
 };
 #[cfg(windows)]
 use snatch_rs::setup::{install_aria2, install_yt_dlp};
@@ -101,7 +101,7 @@ fn plan_from_args(args: &Args) -> Option<Plan> {
         errln("Для режима -y нужны хотя бы одна ссылка и --output.");
         return None;
     };
-    let engine = args.engine.clone().unwrap_or_else(|| detect_engine(&url).to_string());
+    let engine = args.engine.clone().unwrap_or_else(|| detect_engine(url).to_string());
     let fmt = args.format.clone().unwrap_or_else(|| "best".to_string());
     Some(Plan {
         url: url.clone(),
@@ -295,7 +295,10 @@ impl BatchDisplay {
     }
 
     fn diagnostic(&self, id: usize, text: &str) {
-        let line = format!("[{} / {}] {}: {text}", id + 1, self.views.len(), clip(&self.views[id].name, 38));
+        // YM metadata comes directly from the network rather than a sanitized
+        // child pipe. Never let track titles inject terminal ESC/OSC sequences.
+        let safe = engines::sanitize_child_output(text);
+        let line = format!("[{} / {}] {}: {safe}", id + 1, self.views.len(), clip(&self.views[id].name, 38));
         if let Some(multi) = &self.multi {
             let _ = multi.println(line);
         } else {
@@ -631,29 +634,38 @@ fn ask_links(cfg: &Config) -> Option<Vec<String>> {
     }
 }
 
-/// Which engine is offered first (the guess) vs second, when both tools are
-/// available and the user actually has to choose. Pulled out of `ask_engine`
-/// so the ordering is directly testable without going through `Select`.
-fn engine_guess_pair(url: &str) -> (&'static str, &'static str) {
+/// Engines offered for a URL: every toolchain-backed engine (yt-dlp/aria2),
+/// with the auto-detected guess moved to front.
+fn engine_offer(tc: &Toolchain, url: &str) -> Vec<&'static str> {
+    let mut list: Vec<&'static str> = Vec::new();
+    if tc.yt_dlp.is_some() {
+        list.push("yt-dlp");
+    }
+    if tc.aria2c.is_some() {
+        list.push("aria2");
+    }
     let guess = detect_engine(url);
-    let other = if guess == "yt-dlp" { "aria2" } else { "yt-dlp" };
-    (guess, other)
+    if let Some(pos) = list.iter().position(|e| *e == guess) {
+        list.remove(pos);
+        list.insert(0, guess);
+    }
+    list
 }
 
 fn ask_engine(url: &str, tc: &Toolchain) -> Option<String> {
-    let available: Vec<&str> = [("yt-dlp", tc.yt_dlp.is_some()), ("aria2", tc.aria2c.is_some())]
-        .into_iter()
-        .filter_map(|(name, has)| has.then_some(name))
-        .collect();
-    if available.is_empty() {
+    let list = engine_offer(tc, url);
+    if list.is_empty() {
         return None;
     }
-    if available.len() == 1 {
-        return Some(available[0].to_string());
+    if list.len() == 1 {
+        return Some(list[0].to_string());
     }
-    let (guess, other) = engine_guess_pair(url);
-    let label_of = |e: &'static str| -> &'static str {
-        ENGINE_LABELS.iter().find(|(k, _)| *k == e).map(|(_, l)| *l).unwrap_or(e)
+    let label_of = |e: &str| -> String {
+        ENGINE_LABELS
+            .iter()
+            .find(|(k, _)| *k == e)
+            .map(|(_, l)| l.to_string())
+            .unwrap_or_else(|| e.to_string())
     };
     struct EngineOpt(&'static str, String);
     impl fmt::Display for EngineOpt {
@@ -661,10 +673,18 @@ fn ask_engine(url: &str, tc: &Toolchain) -> Option<String> {
             write!(f, "{}", self.1)
         }
     }
-    let choices = vec![
-        EngineOpt(guess, format!("{}  (рекомендуется)", label_of(guess))),
-        EngineOpt(other, label_of(other).to_string()),
-    ];
+    let choices: Vec<EngineOpt> = list
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let label = if i == 0 {
+                format!("{}  (рекомендуется)", label_of(e))
+            } else {
+                label_of(e)
+            };
+            EngineOpt(e, label)
+        })
+        .collect();
     Select::new("Чем скачивать:", choices).with_help_message(SELECT_HELP).prompt().ok().map(|c| c.0.to_string())
 }
 
@@ -778,15 +798,16 @@ fn ask_dir(cfg: &Config) -> Option<String> {
 
 /// The plan summary line shown before starting the whole queue.
 fn confirm_message(engine: &str, fmt: &str, out_dir: &str, cookies_browser: Option<&str>) -> String {
-    if engine == "yt-dlp" {
-        let label = FORMATS.iter().find(|(k, _)| *k == fmt).map(|(_, l)| *l).unwrap_or(fmt);
-        let mut m = format!(" yt-dlp · {label} · → {}", clip(out_dir, 40));
-        if let Some(b) = cookies_browser {
-            m.push_str(&format!(" · 🍪 куки: {b}"));
+    match engine {
+        "yt-dlp" => {
+            let label = FORMATS.iter().find(|(k, _)| *k == fmt).map(|(_, l)| *l).unwrap_or(fmt);
+            let mut m = format!(" yt-dlp · {label} · → {}", clip(out_dir, 40));
+            if let Some(b) = cookies_browser {
+                m.push_str(&format!(" · 🍪 куки: {b}"));
+            }
+            m
         }
-        m
-    } else {
-        format!(" aria2c → {}", clip(out_dir, 40))
+        _ => format!(" aria2c → {}", clip(out_dir, 40)),
     }
 }
 
@@ -894,7 +915,9 @@ fn main() -> std::process::ExitCode {
     // height. Keep the "https://" scheme here (unlike the GUI's shortened
     // hyperlink label): most terminals only auto-linkify a bare URL when it
     // has a scheme, so a trimmed "t.me/rercon" wouldn't be clickable.
-    let banner = BANNER.trim();
+    // trim_matches только переносы, не trim(): trim() съел бы ведущий пробел первой
+    // строки ASCII-арта (" ____ …") и весь баннер уезжал бы на символ влево.
+    let banner = BANNER.trim_matches(['\r', '\n']);
     let (art, tagline) = banner.rsplit_once('\n').unwrap_or(("", banner));
     outln(art);
     outln(format!("{tagline} | {TELEGRAM_URL}"));
@@ -936,7 +959,12 @@ fn main() -> std::process::ExitCode {
             let mut results = run_batch(&plans, &mut cfg, &tc, usize::from(args.jobs));
             for (plan, result) in plans.into_iter().zip(&mut results) {
                 if should_offer_cookies(&plan, result.code, result.auth_hint) {
-                    *result = retry_with_cookies(plan, RunResult { code: result.code, auth_hint: result.auth_hint }, &mut cfg, &tc);
+                    *result = retry_with_cookies(
+                        plan,
+                        RunResult { code: result.code, auth_hint: result.auth_hint },
+                        &mut cfg,
+                        &tc,
+                    );
                 }
             }
             batch_exit_code(&results)
@@ -1004,6 +1032,13 @@ fn exit_code(code: i32) -> std::process::ExitCode {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn banner_preserves_ascii_art_indent() {
+        let first = BANNER.trim_matches(['\r', '\n']).lines().next().unwrap();
+        assert!(first.starts_with(" ____"), "{first:?}");
+        assert!(BANNER.contains("ultimate combine"));
+    }
 
     fn base_plan() -> Plan {
         Plan {
@@ -1322,30 +1357,25 @@ mod tests {
         assert_eq!(calls, 1);
     }
 
-    // -- ask_engine (test_ask_engine_auto_returns_single_available, test_ask_engine_no_engines_returns_none) --
-    // Both cases return before ever reaching Select::new(), so ask_engine
-    // itself is directly callable here without a terminal.
+    // -- engine_offer / ask_engine --
 
     #[test]
-    fn ask_engine_auto_returns_single_available() {
-        let tc = Toolchain { yt_dlp: Some(PathBuf::from("yt-dlp")), aria2c: None };
-        assert_eq!(ask_engine("https://youtube.com/watch?v=1", &tc).as_deref(), Some("yt-dlp"));
-        let tc = Toolchain { yt_dlp: None, aria2c: Some(PathBuf::from("aria2c")) };
-        assert_eq!(ask_engine("https://youtube.com/watch?v=1", &tc).as_deref(), Some("aria2"));
+    fn engine_offer_puts_guess_first() {
+        let tc = Toolchain { yt_dlp: Some(PathBuf::from("y")), aria2c: Some(PathBuf::from("a")) };
+        assert_eq!(engine_offer(&tc, "https://youtube.com/watch?v=1"), ["yt-dlp", "aria2"]);
+        assert_eq!(engine_offer(&tc, "https://host/f.zip"), ["aria2", "yt-dlp"]);
+        let none = Toolchain { yt_dlp: None, aria2c: None };
+        assert!(engine_offer(&none, "https://x").is_empty());
+        let one = Toolchain { yt_dlp: Some(PathBuf::from("y")), aria2c: None };
+        assert_eq!(engine_offer(&one, "https://youtube.com/watch?v=1"), ["yt-dlp"]);
     }
 
     #[test]
-    fn ask_engine_no_engines_returns_none() {
+    fn ask_engine_single_available_needs_no_terminal() {
+        let tc = Toolchain { yt_dlp: Some(PathBuf::from("y")), aria2c: None };
+        assert_eq!(ask_engine("https://youtube.com/watch?v=1", &tc).as_deref(), Some("yt-dlp"));
         let tc = Toolchain { yt_dlp: None, aria2c: None };
         assert_eq!(ask_engine("https://x", &tc), None);
-    }
-
-    // -- engine_guess_pair (test_ask_engine_offers_guess_first) --
-
-    #[test]
-    fn ask_engine_offers_guess_first() {
-        assert_eq!(engine_guess_pair("https://host/f.zip"), ("aria2", "yt-dlp"));
-        assert_eq!(engine_guess_pair("https://youtube.com/watch?v=1"), ("yt-dlp", "aria2"));
     }
 
     // -- confirm_message (test_confirm_mentions_cookies, test_confirm_aria2_has_no_cookies_line) --

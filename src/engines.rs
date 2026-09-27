@@ -557,6 +557,11 @@ fn format_flags(fmt: &str) -> Vec<&'static str> {
 }
 
 pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
+    // Защита от неизвестного движка: иначе он молча ушёл бы по yt-dlp-ветке
+    // (else ниже) и получил бы чужие флаги.
+    if job.engine != "yt-dlp" && job.engine != "aria2" {
+        return Err(format!("Неизвестный движок: {:?}", job.engine));
+    }
     if job.engine == "yt-dlp" {
         if let Some(cb) = &job.cookies_browser {
             validate_cookies_browser(cb)?;
@@ -1029,6 +1034,15 @@ mod tests {
         let job = Job { engine: "yt-dlp".into(), url: "https://x".into(), out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
         assert!(build(&job, &tc_aria2()).is_err());
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn unknown_engine_is_not_dispatched_to_ytdlp() {
+        let out = tmp_out();
+        let job = Job { engine: "native".into(), url: "https://example.com/1".into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        assert!(build(&job, &tc_ytdlp()).is_err());
+        assert!(!out.exists());
     }
 
     #[test]

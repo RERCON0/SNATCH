@@ -244,6 +244,8 @@ impl ActiveJob {
 struct PausedJob {
     job: Job,
     label: String,
+    progress: Option<f32>,
+    status: String,
 }
 
 struct DirBrowser {
@@ -560,6 +562,55 @@ fn accent_button(accent: egui::Color32, text: impl Into<String>) -> egui::Button
         .fill(egui::Color32::TRANSPARENT)
 }
 
+/// A fixed-width bar slot and two fixed-height buttons. `allocate_ui` cannot
+/// reserve the empty/spinner slot here: it advances by the *used* child width,
+/// shifting both buttons left when progress is not known yet. The usual 10px
+/// vertical button padding also makes an add_sized([…, 28]) button 35px tall;
+/// the second button then drifts down relative to the first and to the bar.
+fn job_controls(
+    ui: &mut egui::Ui,
+    progress: Option<f32>,
+    fill: egui::Color32,
+    paused: bool,
+    waiting_text: &str,
+    first: (&str, f32),
+    second: (&str, f32),
+) -> (bool, bool) {
+    const HEIGHT: f32 = 28.0;
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding.y = 5.0;
+        ui.horizontal(|ui| {
+            let gap = ui.spacing().item_spacing.x;
+            let bar_w = (ui.available_width() - first.1 - second.1 - 2.0 * gap).max(40.0);
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, HEIGHT), egui::Sense::hover());
+            let mut bar_ui = ui.new_child(egui::UiBuilder::new()
+                .max_rect(rect)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)));
+            if let Some(p) = progress {
+                bar_ui.add(egui::ProgressBar::new(p)
+                    .rounding(egui::Rounding::ZERO).fill(fill)
+                    .desired_width(bar_w).desired_height(HEIGHT));
+            } else if paused {
+                bar_ui.add(egui::ProgressBar::new(0.0)
+                    .rounding(egui::Rounding::ZERO).fill(fill)
+                    .desired_width(bar_w).desired_height(HEIGHT));
+            } else {
+                bar_ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak(waiting_text);
+                });
+            }
+            if paused {
+                ui.painter().rect_stroke(rect, egui::Rounding::ZERO, egui::Stroke::new(1.0, fill));
+            }
+            (
+                ui.add_sized([first.1, HEIGHT], egui::Button::new(first.0)).clicked(),
+                ui.add_sized([second.1, HEIGHT], egui::Button::new(second.0)).clicked(),
+            )
+        }).inner
+    }).inner
+}
+
 /// Flat "● label" / "○ label" choice, no box at all (not radio_value's
 /// circle-in-a-different-style-from-everything-else, not selectable_value's
 /// filled pill) - this is what mockups/b-terminal.html's `.choices` is.
@@ -672,12 +723,12 @@ fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     ctx.set_pixels_per_point(UI_SCALE);
     if resize_viewport {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            660.0 * UI_SCALE / native,
+            460.0 * UI_SCALE / native,
             640.0 * UI_SCALE / native,
         )));
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-        560.0 * UI_SCALE / native,
+        460.0 * UI_SCALE / native,
         520.0 * UI_SCALE / native,
     )));
 }
@@ -982,7 +1033,9 @@ impl SnatchApp {
         // code 0 right as pause was requested, treat it as done, not paused.
         if aj.pausing && code != 0 {
             self.set_status(StatusKind::None, format!("«{label}» на паузе"));
-            self.paused.push(PausedJob { job: aj.job.clone(), label });
+            self.paused.push(PausedJob {
+                job: aj.job.clone(), label, progress: aj.progress, status: aj.status,
+            });
             self.fill_free_slots(ctx);
             return;
         }
@@ -1086,6 +1139,12 @@ impl SnatchApp {
             fmt,
             cookies_browser: cookies,
         };
+        // A failed-job offer is not an active job. If the user starts that
+        // link manually, retire the stale offer; otherwise clicking its retry
+        // button afterward could start a second writer on the same file.
+        if self.retry_offer.as_ref().is_some_and(|old| old.url == job.url) {
+            self.retry_offer = None;
+        }
         // Cleared once the job is valid and either starting or queued - not
         // on a validation error above, so a typo doesn't lose what's typed.
         self.url.clear();
@@ -1105,6 +1164,7 @@ impl SnatchApp {
     fn spawn_job(&mut self, ctx: &egui::Context, job: Job, no_continue: bool) {
         let label = engines::batch_name(&job.url);
         let warns = preflight_warning(&job);
+
         let mut cmd = match engines::build(&job, &self.tc) {
             Ok(c) => c,
             Err(e) => {
@@ -1499,10 +1559,11 @@ impl SnatchApp {
                         if !self.jobs.is_empty() {
                             self.close_requested = true;
                             self.cancel_all();
-                        } else if self.phase == Phase::Setup {
-                            self.close_requested = true;
-                            self.set_status(StatusKind::Warn, "Завершаю установку перед закрытием…");
                         } else {
+                            // Setup is an in-process worker. Closing the app
+                            // stops it immediately; the next install replaces
+                            // any incomplete .part files. No child process
+                            // needs to be reaped here.
                             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                         }
                     }
@@ -1835,7 +1896,7 @@ impl SnatchApp {
             .default_size([480.0, 440.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Дом").clicked() {
                         navigate = Some(home.clone());
                     }
@@ -1847,7 +1908,7 @@ impl SnatchApp {
                     }
                     for d in &drives {
                         let label = d.to_string_lossy();
-                        if ui.small_button(label.trim_end_matches('\\').to_string()).clicked() {
+                        if ui.button(label.trim_end_matches('\\').to_string()).clicked() {
                             navigate = Some(d.clone());
                         }
                     }
@@ -1952,65 +2013,24 @@ impl SnatchApp {
         // download doesn't require cancelling the first one first.
         let mut pause_id = None;
         let mut cancel_id = None;
-        // Pause/cancel sit beside the bar itself instead of a full-width
-        // button on its own line below - the previous layout spent a whole
-        // extra row per job on one word. No pictograph glyphs on these
-        // buttons: TextStyle::Button renders through the "button" font
-        // family, which (unlike Monospace/Proportional) has no emoji
-        // fallback chain - see the day/night toggle for the same fix.
-        const JOB_BTN_W: f32 = 72.0;
+        // Both sets reserve 172px for controls so active and paused bars align.
+        // The resume label needs more room than pause/cancel.
+        const ACTIVE_BTN_W: f32 = 86.0;
+        const RESUME_BTN_W: f32 = 100.0;
+        const REMOVE_BTN_W: f32 = 72.0;
         for (i, aj) in self.jobs.iter().enumerate() {
             if i > 0 {
                 ui.add_space(10.0);
             }
             let accent = ui.visuals().hyperlink_color;
             ui.label(egui::RichText::new(clip(&aj.label, 72)).size(12.0).color(accent));
-            ui.horizontal(|ui| {
-                let gap = ui.spacing().item_spacing.x;
-                let bar_w = (ui.available_width() - 2.0 * JOB_BTN_W - 2.0 * gap).max(40.0);
-                match aj.progress {
-                    Some(p) => {
-                        // ProgressBar hardcodes a pill shape (rounding =
-                        // height/2) unless overridden - Rounding isn't part
-                        // of Visuals for this widget, so the square-corners
-                        // theme never reached it.
-                        // No .text() overlay: egui hardcodes that text's
-                        // color to visuals.selection.stroke (see
-                        // ProgressBar::ui in egui's source) with no way to
-                        // override it per-widget, and that's the same accent
-                        // color as .fill() below - the percentage became
-                        // invisible wherever it sat over the filled portion.
-                        // No information lost: this job's own status line
-                        // right below already shows it as part of the raw
-                        // yt-dlp/aria2 line (aria2_stat/parse_progress).
-                        ui.add(
-                            egui::ProgressBar::new(p)
-                                .rounding(egui::Rounding::ZERO)
-                                .fill(accent)
-                                .desired_width(bar_w)
-                                .desired_height(28.0),
-                        );
-                    }
-                    None => {
-                        ui.allocate_ui(egui::vec2(bar_w, 28.0), |ui| {
-                            ui.horizontal(|ui| {
-                                ui.spinner();
-                                ui.weak(if aj.status.starts_with("Получаю метаданные") {
-                                    "Метаданные торрента…"
-                                } else {
-                                    "Подключение…"
-                                });
-                            });
-                        });
-                    }
-                }
-                if ui.add_sized([JOB_BTN_W, 28.0], egui::Button::new("пауза")).clicked() {
-                    pause_id = Some(aj.id);
-                }
-                if ui.add_sized([JOB_BTN_W, 28.0], egui::Button::new("отмена")).clicked() {
-                    cancel_id = Some(aj.id);
-                }
-            });
+            let waiting = if aj.status.starts_with("Получаю метаданные") {
+                "Метаданные торрента…"
+            } else { "Подключение…" };
+            let (pause, cancel) = job_controls(ui, aj.progress, accent, false, waiting,
+                ("пауза", ACTIVE_BTN_W), ("отмена", ACTIVE_BTN_W));
+            if pause { pause_id = Some(aj.id); }
+            if cancel { cancel_id = Some(aj.id); }
             if !aj.status.is_empty() {
                 ui.weak(clip(&aj.status, 90));
             }
@@ -2032,29 +2052,37 @@ impl SnatchApp {
         let mut drop_idx = None;
         for (i, pj) in self.paused.iter().enumerate() {
             if i > 0 {
-                ui.add_space(6.0);
+                ui.add_space(10.0);
             }
-            ui.horizontal(|ui| {
-                ui.weak(clip(&format!("на паузе: {}", pj.label), 60));
-                if ui.small_button("продолжить").clicked() {
-                    resume_idx = Some(i);
-                }
-                if ui.small_button("убрать").clicked() {
-                    drop_idx = Some(i);
-                }
-            });
+            let accent = ui.visuals().hyperlink_color;
+            let warn = ui.visuals().warn_fg_color;
+            ui.label(egui::RichText::new(clip(&pj.label, 72)).size(12.0).color(accent));
+            let (resume, remove) = job_controls(ui, pj.progress, warn, true, "",
+                ("продолжить", RESUME_BTN_W), ("убрать", REMOVE_BTN_W));
+            if resume { resume_idx = Some(i); }
+            if remove { drop_idx = Some(i); }
+            if !pj.status.is_empty() { ui.weak(clip(&pj.status, 90)); }
         }
         if let Some(i) = resume_idx {
             let pj = self.paused.remove(i);
             if self.jobs.len() < MAX_CONCURRENT {
                 self.spawn_job(ctx, pj.job, false);
+                self.set_status(StatusKind::None, format!("«{}»: продолжаю…", pj.label));
             } else {
                 self.queue.push_back(pj.job);
                 self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
             }
         }
         if let Some(i) = drop_idx {
-            self.paused.remove(i);
+            // If resume and remove were clicked in the same frame, the first
+            // removal shifted indices. The clicked row is now elsewhere.
+            let idx = if resume_idx.is_some_and(|r| r < i) { i - 1 } else { i };
+            if resume_idx != Some(i) && idx < self.paused.len() {
+                let pj = self.paused.remove(idx);
+                if self.status == format!("«{}» на паузе", pj.label) {
+                    self.set_status(StatusKind::None, "");
+                }
+            }
         }
         if !self.paused.is_empty() {
             ui.add_space(8.0);
@@ -2119,7 +2147,7 @@ impl eframe::App for SnatchApp {
                 self.set_torrent_file(&path);
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && (!self.jobs.is_empty() || self.phase == Phase::Setup) {
+        if ctx.input(|i| i.viewport().close_requested()) && !self.jobs.is_empty() {
             // eframe exits the event loop in THIS frame unless the close is
             // vetoed - the old flag-only version let the process die before
             // the monitor thread (100ms poll) reached kill(), orphaning the
@@ -2127,11 +2155,7 @@ impl eframe::App for SnatchApp {
             // the whole tree), and drain() re-issues Close once everything's
             // actually done.
             self.close_requested = true;
-            if !self.jobs.is_empty() {
-                self.cancel_all();
-            } else {
-                self.set_status(StatusKind::Warn, "Завершаю установку перед закрытием…");
-            }
+            self.cancel_all();
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
@@ -2179,7 +2203,9 @@ impl eframe::App for SnatchApp {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
-                let lines: Vec<&str> = BANNER.trim().lines().collect();
+                // Убираем только переносы: trim() съедает ведущий пробел
+                // первой строки ASCII-арта, и она встаёт на символ левее остальных.
+                let lines: Vec<&str> = BANNER.trim_matches(['\r', '\n']).lines().collect();
                 let line_width = |ui: &egui::Ui, text: &str, size: f32| -> f32 {
                     ui.fonts(|f| {
                         let job = egui::text::LayoutJob::single_section(
@@ -2274,7 +2300,8 @@ impl eframe::App for SnatchApp {
                             // mockup's .btn is 12.5px with 7px 12px padding -
                             // .small() dropped it to the Small style and made
                             // the button visibly smaller than the HTML one.
-                            .add_enabled(self.phase != Phase::Setup && self.jobs.is_empty(), egui::Button::new("обновить"))
+                            .add_enabled(self.phase != Phase::Setup && self.jobs.is_empty(),
+                                egui::Button::new("обновить").wrap_mode(egui::TextWrapMode::Extend))
                             .on_hover_text("Перескачать свежие yt-dlp и aria2c")
                             .clicked()
                         {
@@ -2311,7 +2338,12 @@ impl eframe::App for SnatchApp {
                     let mut job = job;
                     job.cookies_browser = Some(self.cookies_browser.clone());
                     self.retry_offer = None;
-                    if self.jobs.len() < MAX_CONCURRENT {
+                    if self.jobs.iter().any(|j| j.job.url == job.url)
+                        || self.queue.iter().any(|j| j.url == job.url)
+                        || self.paused.iter().any(|j| j.job.url == job.url)
+                    {
+                        self.set_status(StatusKind::Warn, "Эта ссылка уже скачивается или ждёт в очереди");
+                    } else if self.jobs.len() < MAX_CONCURRENT {
                         self.spawn_job(ctx, job, false);
                     } else {
                         self.queue.push_front(job);
@@ -2352,10 +2384,9 @@ impl eframe::App for SnatchApp {
     }
 }
 
-// icons/icon-256.png is icons/icon.png (1278x1230) pre-shrunk offline with
-// the exact same center-crop + Lanczos3 pipeline this function used to run
-// AT EVERY STARTUP - decoding the 1.5MB source and resampling it ~5x cost
-// a visible chunk of launch time under opt-level="z" and bloated the exe.
+// icons/icon-256.png is pre-shrunk from the same artwork as icon-app.ico
+// with a center-crop + Lanczos3 resize. Decoding and resizing the source at
+// every startup would slow launch and bloat the executable.
 // egui::IconData wants a square with a side that's a multiple of 4; 256x256
 // is its documented recommendation. The crop/resize branch stays as a
 // fallback if the asset is ever replaced by a non-256 one again. Decode
@@ -2381,8 +2412,8 @@ fn app_icon() -> Option<egui::IconData> {
 
 fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([660.0, 640.0])
-        .with_min_inner_size([560.0, 520.0])
+        .with_inner_size([460.0, 640.0])
+        .with_min_inner_size([460.0, 520.0])
         .with_title("SNATCH — by rercon prod.");
     #[cfg(windows)]
     { viewport = viewport.with_decorations(false); }
@@ -2432,6 +2463,35 @@ mod tests {
         assert_eq!(cmd.last().unwrap(), file.as_os_str());
         assert!(local_torrent_path(&dir.join("not-a-torrent.txt")).is_err());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn job_controls_keep_same_height_with_and_without_progress() {
+        let ctx = egui::Context::default();
+        setup_theme(&ctx, true);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(460.0, 600.0))),
+            ..Default::default()
+        };
+        let mut heights = Vec::new();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let green = ui.visuals().hyperlink_color;
+                let yellow = ui.visuals().warn_fg_color;
+                for (progress, paused, fill, labels) in [
+                    (Some(0.3), false, green, (("пауза", 86.0), ("отмена", 86.0))),
+                    (None, false, green, (("пауза", 86.0), ("отмена", 86.0))),
+                    (Some(0.3), true, yellow, (("продолжить", 100.0), ("убрать", 72.0))),
+                ] {
+                    let top = ui.cursor().top();
+                    let _ = job_controls(ui, progress, fill, paused, "Подключение…", labels.0, labels.1);
+                    heights.push(ui.cursor().top() - top);
+                }
+            });
+        });
+        for height in heights {
+            assert!((height - 34.0).abs() < 1.0, "row + spacing must be 28 + 6, got {height}");
+        }
     }
 
     #[test]

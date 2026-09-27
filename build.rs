@@ -11,10 +11,10 @@ fn main() {
         // Alt-Tab-before-launch actually read, so it still needs embedding
         // here too. snatch and snatch-app get their own distinct icon each
         // (blade+cursor for the CLI, plain blade for the GUI).
-        embed_resource::compile_for("icons/icon-cli.rc", &["snatch"], embed_resource::NONE)
+        embed_resource::compile_for("icons/icon-cli.rc", ["snatch"], embed_resource::NONE)
             .manifest_optional()
             .unwrap();
-        embed_resource::compile_for("icons/icon-app.rc", &["snatch-app"], embed_resource::NONE)
+        embed_resource::compile_for("icons/icon-app.rc", ["snatch-app"], embed_resource::NONE)
             .manifest_optional()
             .unwrap();
     }

@@ -12,7 +12,7 @@ pub const BANNER: &str = r#"
    /\ \L\ \ \ \`\ \ \ \/\ \ \ \ \ \ \ \L\ \\ \ \ \ \
    \ `\____\ \_\ \_\ \_\ \_\ \ \_\ \ \____/ \ \_\ \_\
     \/_____/\/_/\/_/\/_/\/_/  \/_/  \/___/   \/_/\/_/
-                       yt-dlp + aria2c mini-combine
+                     yt-dlp + aria2c ultimate combine
                              by rercon prod.
 "#;
 

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -33,7 +34,13 @@ pub struct Config {
     /// GUI theme, persisted so it doesn't reset to dark every launch.
     pub dark_mode: bool,
     #[serde(skip)]
-    history_cleared: bool,
+    history_cleared: Cell<bool>,
+    /// A stale GUI may save its theme after another process cleared history.
+    /// Only remember_* calls since the last save may introduce new entries.
+    #[serde(skip)]
+    url_dirty: Cell<bool>,
+    #[serde(skip)]
+    dir_dirty: Cell<bool>,
 }
 
 fn str_field(obj: Option<&serde_json::Map<String, Value>>, key: &str) -> String {
@@ -64,7 +71,9 @@ pub fn sanitize(data: &Value) -> Config {
         history_epoch: obj.and_then(|o| o.get("history_epoch"))
             .and_then(Value::as_u64).unwrap_or(0),
         dark_mode: bool_field(obj, "dark_mode", true),
-        history_cleared: false,
+        history_cleared: Cell::new(false),
+        url_dirty: Cell::new(false),
+        dir_dirty: Cell::new(false),
     }
 }
 fn dedup_front(list: Vec<String>, value: String) -> Vec<String> {
@@ -75,7 +84,10 @@ fn dedup_front(list: Vec<String>, value: String) -> Vec<String> {
     out
 }
 
-fn merge_history(local: &[String], disk: &[String], same_epoch: bool) -> Vec<String> {
+fn merge_history(local: &[String], disk: &[String], same_epoch: bool, dirty: bool) -> Vec<String> {
+    if !dirty {
+        return disk.to_vec();
+    }
     // The first local entry is the just-completed download. Then take other
     // processes' recent entries before the rest of this process's stale list.
     let mut merged = Vec::new();
@@ -127,27 +139,29 @@ impl Config {
             // released on process exit, unlike create_new marker files.
             let lock_path = p.with_extension("lock");
             let lock = std::fs::OpenOptions::new()
-                .create(true).read(true).write(true).open(lock_path)?;
+                .create(true).truncate(false).read(true).write(true).open(lock_path)?;
             FileExt::lock(&lock)?;
             let disk = Self::load_from(p);
-            let merged = if self.history_cleared {
+            let merged = if self.history_cleared.get() {
                 Config {
                     default_dir: self.default_dir.clone(), last_dir: self.last_dir.clone(),
                     urls: self.urls.clone(), dirs: self.dirs.clone(),
                     history_epoch: disk.history_epoch.saturating_add(1),
                     dark_mode: self.dark_mode,
-                    history_cleared: false,
+                    history_cleared: Cell::new(false),
+                    url_dirty: Cell::new(false), dir_dirty: Cell::new(false),
                 }
             } else {
                 let same_epoch = self.history_epoch == disk.history_epoch;
                 Config {
                     default_dir: self.default_dir.clone(),
                     last_dir: self.last_dir.clone(),
-                    urls: merge_history(&self.urls, &disk.urls, same_epoch),
-                    dirs: merge_history(&self.dirs, &disk.dirs, same_epoch),
+                    urls: merge_history(&self.urls, &disk.urls, same_epoch, self.url_dirty.get()),
+                    dirs: merge_history(&self.dirs, &disk.dirs, same_epoch, self.dir_dirty.get()),
                     history_epoch: disk.history_epoch,
                     dark_mode: self.dark_mode,
-                    history_cleared: false,
+                    history_cleared: Cell::new(false),
+                    url_dirty: Cell::new(false), dir_dirty: Cell::new(false),
                 }
             };
             // Unique tmp name (pid + nanos): with the old fixed "config.tmp",
@@ -183,11 +197,16 @@ impl Config {
         })();
         if let Err(e) = result {
             crate::errln(format!("⚠ Не удалось сохранить настройки: {e}"));
+        } else {
+            self.history_cleared.set(false);
+            self.url_dirty.set(false);
+            self.dir_dirty.set(false);
         }
     }
 
     pub fn remember_url(&mut self, url: &str) {
         self.urls = dedup_front(std::mem::take(&mut self.urls), url.to_string());
+        self.url_dirty.set(true);
     }
 
     pub fn remember_dir(&mut self, directory: &str) {
@@ -196,10 +215,13 @@ impl Config {
             .into_owned();
         self.last_dir = d.clone();
         self.dirs = dedup_front(std::mem::take(&mut self.dirs), d);
+        self.dir_dirty.set(true);
     }
 
     pub fn clear_history(&mut self) {
-        self.history_cleared = true;
+        self.history_cleared.set(true);
+        self.url_dirty.set(false);
+        self.dir_dirty.set(false);
         self.urls = Vec::new();
         self.dirs = Vec::new();
         self.last_dir = String::new();
@@ -308,6 +330,31 @@ mod tests {
         a.remember_url("https://example.com/new.zip");
         a.save_to(&p);
         assert_eq!(Config::load_from(&p).urls, ["https://example.com/new.zip"]);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stale_gui_theme_save_cannot_resurrect_cleared_history() {
+        let dir = std::env::temp_dir().join(format!("snatch-rs-clear-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut old_gui = Config::load_from(&p);
+        old_gui.remember_url("https://host/old.mp3");
+        old_gui.remember_dir("old-dir");
+        old_gui.save_to(&p);
+        let mut clearer = Config::load_from(&p);
+        clearer.clear_history();
+        clearer.save_to(&p);
+        old_gui.dark_mode = false;
+        old_gui.save_to(&p);
+        let after_theme_save = Config::load_from(&p);
+        assert!(after_theme_save.urls.is_empty());
+        assert!(after_theme_save.dirs.is_empty());
+        old_gui.remember_url("https://host/new.mp3");
+        old_gui.save_to(&p);
+        let after_new_download = Config::load_from(&p);
+        assert_eq!(after_new_download.urls, ["https://host/new.mp3"]);
+        assert!(after_new_download.dirs.is_empty());
         std::fs::remove_dir_all(dir).ok();
     }
 
