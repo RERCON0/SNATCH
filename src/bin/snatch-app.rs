@@ -1461,17 +1461,24 @@ impl SnatchApp {
                 }
             };
             let code = status.map(|s| s.code().unwrap_or(130)).unwrap_or(127);
-            // aria2 has exited, so release its basename before Done starts
-            // the next GUI queue entry for the same destination.
-            drop(output_lock);
-            // Done goes first: if the direct child died abnormally while a
+            // F4 (audit 4): reap whatever is left of the tree BEFORE waiting
+            // on the pipes. If the direct child died abnormally while a
             // grandchild (ffmpeg / external aria2c) still holds the inherited
-            // pipe handles, the joins below can block indefinitely and the
-            // job would never report completion.
-            let _ = tx.send(Msg::Done(id, code));
-            ctx_w.request_repaint();
+            // handles, the joins below would block unbounded - and Done
+            // already sent would have freed the GUI slot for a duplicate of
+            // the same job. A normal exit leaves an empty tree, so this
+            // terminate is a no-op there.
+            if let Some(j) = &proc_job {
+                j.terminate();
+            }
+            // aria2 has exited (and its tree is now stopped), so release its
+            // basename before Done starts the next GUI queue entry for the
+            // same destination.
+            drop(output_lock);
             let _ = h_out.join();
             let _ = h_err.join();
+            let _ = tx.send(Msg::Done(id, code));
+            ctx_w.request_repaint();
         });
     }
 
