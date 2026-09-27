@@ -592,6 +592,60 @@ fn format_flags(fmt: &str) -> Vec<&'static str> {
     }
 }
 
+/// Absolute output directory without touching the filesystem (build() also
+/// mkdirs it; preflight must not): shared by both for collision decisions.
+fn absolute_out_dir(out_dir: &Path) -> PathBuf {
+    let expanded = expanduser(out_dir);
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        std::env::current_dir().unwrap_or_default().join(expanded)
+    }
+}
+
+/// File name aria2 would derive from a URL path. No percent-decoding: aria2
+/// keeps sequences like %2F literal (its own traversal probe saved
+/// `..%2F..%2Fpwned.bin`), so the raw basename is what to compare against.
+fn url_basename(url: &str) -> String {
+    path_from_url(url)
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+/// E-1 (offensive audit 2026-09-27): an HTTP/FTP target whose same-name file
+/// already exists WITHOUT its own `.aria2` control file is somebody else's
+/// file; `-c` would silently resume/overwrite it. Detecting this lets
+/// build() drop `-c` and let aria2 save alongside under a fresh name.
+fn aria2_foreign_target(url: &str, out: &Path) -> bool {
+    if !ALLOWED_SCHEMES.contains(&scheme_of(url).as_str()) {
+        return false;
+    }
+    let name = url_basename(url);
+    if name.is_empty() {
+        return false;
+    }
+    out.join(&name).is_file() && !out.join(format!("{name}.aria2")).is_file()
+}
+
+/// ARIA2_RESUME with resume-safety adjusted for a foreign same-name file:
+/// no `-c` (never touch the existing bytes) and auto-renaming on (save as
+/// `name.1` alongside instead of failing "file already exists").
+fn aria2_flags(foreign_target: bool) -> Vec<&'static str> {
+    if foreign_target {
+        ARIA2_RESUME
+            .iter()
+            .copied()
+            .filter(|f| *f != "-c" && *f != "--auto-file-renaming=false")
+            .chain(std::iter::once("--auto-file-renaming=true"))
+            .collect()
+    } else {
+        ARIA2_RESUME.to_vec()
+    }
+}
+
 pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     // Защита от неизвестного движка: иначе он молча ушёл бы по yt-dlp-ветке
     // (else ниже) и получил бы чужие флаги.
@@ -604,24 +658,19 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
         }
     }
 
-    let expanded = expanduser(&job.out_dir);
+    let out = absolute_out_dir(&job.out_dir);
     // Before create_dir_all: even a failed mkdir on a UNC path performs SMB
     // authentication against the remote host (NetNTLMv2 leak), and a
     // *successful* one would silently write the user's downloads to a
     // stranger's share (poisoned config/history or a pasted path).
-    if is_unc_path(&expanded) {
+    if is_unc_path(&out) {
         return Err(format!(
             "Папка сохранения {} — сетевой UNC-путь. Выберите локальную папку \
              (UNC отклоняется, чтобы Windows не отправляла учётные данные на \
              чужой сервер).",
-            expanded.display()
+            out.display()
         ));
     }
-    let out = if expanded.is_absolute() {
-        expanded
-    } else {
-        std::env::current_dir().unwrap_or_default().join(expanded)
-    };
     std::fs::create_dir_all(&out)
         .map_err(|e| format!("Не удалось создать папку {}: {e}", out.display()))?;
 
@@ -630,8 +679,9 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
         cmd.push(tc.require("aria2c")?.into_os_string());
         cmd.push("--no-conf".into());
         cmd.push("-d".into());
-        cmd.push(out.into_os_string());
-        for a in ARIA2_RESUME.iter().chain(ARIA2_WORKERS) {
+        cmd.push(out.clone().into_os_string());
+        let foreign = aria2_foreign_target(&job.url, &out);
+        for a in aria2_flags(foreign).iter().chain(ARIA2_WORKERS) {
             cmd.push((*a).into());
         }
         if is_bittorrent_input(&job.url) {
@@ -650,7 +700,7 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     cmd.push(tc.require("yt-dlp")?.into_os_string());
     cmd.push("--ignore-config".into());
     cmd.push("-P".into());
-    cmd.push(out.into_os_string());
+    cmd.push(out.clone().into_os_string());
     cmd.push("--no-playlist".into());
     if let Some(cb) = &job.cookies_browser {
         cmd.push("--cookies-from-browser".into());
@@ -661,11 +711,14 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     }
     if let Some(aria2c) = &tc.aria2c {
         if is_direct_download(&job.url) {
+            // Same E-1 guard as the aria2 engine branch: yt-dlp hands the
+            // direct link to aria2c as an external downloader.
+            let foreign = aria2_foreign_target(&job.url, &out);
             cmd.push("--external-downloader".into());
             cmd.push(aria2c.as_os_str().to_os_string());
             cmd.push("--external-downloader-args".into());
             cmd.push(
-                format!("{} {} --no-conf", ARIA2_RESUME.join(" "), ARIA2_WORKERS.join(" "))
+                format!("{} {} --no-conf", aria2_flags(foreign).join(" "), ARIA2_WORKERS.join(" "))
                     .into(),
             );
         }
@@ -700,10 +753,21 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool) -> Vec<String> {
         } else {
             warns.push(
                 "Не найден ffmpeg — склейка видео и аудио недоступна, yt-dlp выберет \
-                 однодорожечный формат (качество может быть ниже)."
+                  однодорожный формат (качество может быть ниже)."
                     .to_string(),
             );
         }
+    }
+    // E-1: warn before the collision-driven rename so "the file landed as
+    // name.1" is expected, not a surprise.
+    if (job.engine == "aria2" || (job.engine == "yt-dlp" && is_direct_download(&job.url)))
+        && aria2_foreign_target(&job.url, &absolute_out_dir(&job.out_dir))
+    {
+        warns.push(
+            "В папке уже есть файл с таким же именем, но без данных докачки — он не будет \
+             перезаписан: новая загрузка сохранится рядом под другим именем."
+                .to_string(),
+        );
     }
     warns
 }
@@ -909,6 +973,64 @@ mod tests {
         assert_eq!(detect_engine("S01 #2.torrent"), "aria2");
         assert_eq!(detect_engine("movie.meta4"), "aria2");
         assert_eq!(detect_engine(r"C:\Torrents\[DL] Cuphead #1.torrent"), "aria2");
+    }
+
+    fn args_of(cmd: &[OsString]) -> Vec<String> {
+        cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn aria2_never_resumes_a_foreign_same_name_file() {
+        // E-1 (offensive audit): `-c` must not run on a same-name file that
+        // has no `.aria2` control data of its own - that would silently
+        // overwrite somebody else's file.
+        let out = tmp_out();
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("file.bin"), b"old data").unwrap();
+        let job = Job {
+            engine: "aria2".into(),
+            url: "https://host/file.bin".into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+        };
+        let s = args_of(&build(&job, &tc_aria2()).unwrap());
+        assert!(!s.contains(&"-c".to_string()), "{s:?}");
+        assert!(s.contains(&"--auto-file-renaming=true".to_string()), "{s:?}");
+        assert!(s.contains(&"--max-tries=10".to_string()), "{s:?}");
+        assert!(s.contains(&"--seed-time=0".to_string()), "{s:?}");
+        assert_eq!(std::fs::read(out.join("file.bin")).unwrap(), b"old data");
+        assert!(preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+
+        // Our own partial download (control file present) keeps normal resume.
+        std::fs::write(out.join("file.bin.aria2"), b"ctl").unwrap();
+        let s = args_of(&build(&job, &tc_aria2()).unwrap());
+        assert!(s.contains(&"-c".to_string()), "{s:?}");
+        assert!(s.contains(&"--auto-file-renaming=false".to_string()), "{s:?}");
+        assert!(!preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+        std::fs::remove_file(out.join("file.bin.aria2")).unwrap();
+
+        // yt-dlp's external-downloader branch gets the collision-safe args too.
+        let job = Job { engine: "yt-dlp".into(), ..job };
+        let s = args_of(&build(&job, &tc_both()).unwrap());
+        let i = s.iter().position(|a| a == "--external-downloader-args").unwrap();
+        let args = &s[i + 1];
+        assert!(args.contains("--auto-file-renaming=true"), "{args}");
+        assert!(!args.contains("-c "), "{args}");
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn aria2_no_collision_keeps_the_normal_resume_flags() {
+        let out = tmp_out();
+        let job = Job {
+            engine: "aria2".into(),
+            url: "https://host/fresh.bin".into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+        };
+        let s = args_of(&build(&job, &tc_aria2()).unwrap());
+        assert!(s.contains(&"-c".to_string()), "{s:?}");
+        assert!(s.contains(&"--auto-file-renaming=false".to_string()), "{s:?}");
+        assert!(!preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+        std::fs::remove_dir_all(&out).ok();
     }
 
     #[test]
