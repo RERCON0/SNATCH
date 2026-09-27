@@ -28,10 +28,12 @@ fs4 = "1.1"
 image = { version = "0.25", default-features = false, features = ["png"] }
 indicatif = "0.17"
 inquire = "0.9"
-# default-features off: drops the HTTP/2 stack (h2) the app never uses; charset
-# keeps today's .text() semantics (charset header + BOM sniffing), default-tls
-# uses schannel on Windows, system-proxy keeps corporate-proxy support.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "charset", "default-tls", "system-proxy"] }
+# default-features off: drops the HTTP/2 stack (h2); charset/encoding_rs is not
+# needed either - every endpoint we call is UTF-8 (JSON API, XML with
+# encoding="utf-8", ASCII sums), and .text() keeps decoding UTF-8 via
+# from_utf8_lossy. default-tls uses schannel on Windows; system-proxy keeps
+# corporate-proxy support.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "default-tls", "system-proxy"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
