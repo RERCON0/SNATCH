@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,13 +34,126 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .map_err(|e| e.to_string())
 }
 
-fn download(c: &reqwest::blocking::Client, url: &str, dest: &Path, label: &str, max: u64) -> Result<(), String> {
+/// Why a download/install attempt failed, from the partial file's point of
+/// view. `Transient` = transport-level trouble (connect/read errors, timeouts,
+/// HTTP 408/429/5xx): the `.part` is kept so the next attempt can resume it
+/// with a `Range` request. `Permanent` = the request itself is bad (4xx, size
+/// caps) or the downloaded bytes failed validation (checksum mismatch, bad
+/// release metadata): the `.part` cannot be resumed and is removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Transient,
+    Permanent,
+}
+
+impl FailureKind {
+    /// Whether a `.part` file may still be useful after this failure.
+    fn keeps_part(self) -> bool {
+        matches!(self, Self::Transient)
+    }
+
+    /// HTTP status classification: 408/429 and 5xx are "try again later"
+    /// answers; every other non-success status is treated as permanent.
+    fn from_http_status(status: u16) -> Self {
+        match status {
+            408 | 429 => Self::Transient,
+            s if (500..=599).contains(&s) => Self::Transient,
+            _ => Self::Permanent,
+        }
+    }
+}
+
+/// A failed download/install attempt: the user-facing message plus whether the
+/// `.part` file should survive for a later Range-resume.
+#[derive(Debug)]
+struct DownloadFailure {
+    kind: FailureKind,
+    message: String,
+}
+
+impl DownloadFailure {
+    fn transient(message: impl Into<String>) -> Self {
+        Self { kind: FailureKind::Transient, message: message.into() }
+    }
+
+    fn permanent(message: impl Into<String>) -> Self {
+        Self { kind: FailureKind::Permanent, message: message.into() }
+    }
+
+    fn from_http_status(status: u16, message: impl Into<String>) -> Self {
+        Self { kind: FailureKind::from_http_status(status), message: message.into() }
+    }
+}
+
+/// What one attempt does with the destination file, derived purely from the
+/// length of an existing `.part` and the HTTP status of the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumePlan {
+    /// (Re)start from byte 0: no part at all, or the server ignored the Range
+    /// (200) and sent the full body.
+    Restart,
+    /// The server honored `Range: bytes=<offset>-`: append its body there.
+    Append { offset: u64 },
+    /// 416: the local offset is past the remote end (stale or already complete
+    /// `.part`). Truncate and issue one fresh request without Range.
+    Refetch,
+}
+
+/// Resume decision:
+/// - no part (len 0): a plain GET was sent, any 2xx body streams from 0;
+/// - part present: the request carried `Range: bytes=<len>-`, so 206 appends,
+///   200 (range ignored) restarts and 416 refetches;
+/// - any other combination is not a usable response.
+fn resume_plan(part_len: u64, status: u16) -> Option<ResumePlan> {
+    match (part_len, status) {
+        (0, s) if (200..=299).contains(&s) => Some(ResumePlan::Restart),
+        (len, 206) => Some(ResumePlan::Append { offset: len }),
+        (_, 200) => Some(ResumePlan::Restart),
+        (len, 416) if len > 0 => Some(ResumePlan::Refetch),
+        _ => None,
+    }
+}
+
+/// Byte offset a `.part` can be resumed from: 0 when the file is absent,
+/// empty, not a regular file, or larger than the sanity cap (stale junk must
+/// not defeat the size check or drive a bogus Range request).
+fn resumable_part_len(dest: &Path, max: u64) -> u64 {
+    std::fs::metadata(dest)
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|m| m.len())
+        .filter(|len| *len > 0 && *len <= max)
+        .unwrap_or(0)
+}
+
+/// GET with an optional `Range: bytes=<range_from>-` resume header.
+fn send_get(
+    c: &reqwest::blocking::Client,
+    url: &str,
+    label: &str,
+    range_from: u64,
+) -> Result<reqwest::blocking::Response, DownloadFailure> {
+    let mut req = c.get(url);
+    if range_from > 0 {
+        req = req.header(reqwest::header::RANGE, format!("bytes={range_from}-"));
+    }
+    req.send()
+        .map_err(|e| DownloadFailure::transient(format!("не удалось скачать {label}: {e}")))
+}
+
+fn download(c: &reqwest::blocking::Client, url: &str, dest: &Path, label: &str, max: u64) -> Result<(), DownloadFailure> {
     match download_inner(c, url, dest, label, max) {
         Ok(()) => Ok(()),
-        Err(e) => {
-            // Never leave a truncated .part behind on failure.
-            let _ = std::fs::remove_file(dest);
-            Err(e)
+        Err(f) => {
+            // Transient network failures keep a non-empty `.part` so the next
+            // attempt can Range-resume it. Permanent failures (4xx, size cap)
+            // and empty leftovers are removed - an empty part resumes nothing.
+            let keep = f.kind.keeps_part()
+                && std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false);
+            if !keep {
+                let _ = std::fs::remove_file(dest);
+            }
+            Err(f)
         }
     }
 }
@@ -51,16 +164,57 @@ fn download_inner(
     dest: &Path,
     label: &str,
     max: u64,
-) -> Result<(), String> {
-    let mut resp = c.get(url).send().map_err(|e| format!("не удалось скачать {label}: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("не удалось скачать {label}: HTTP {}", resp.status()));
+) -> Result<(), DownloadFailure> {
+    let part_len = resumable_part_len(dest, max);
+    let mut resp = send_get(c, url, label, part_len)?;
+    let mut plan = resume_plan(part_len, resp.status().as_u16());
+    if let Some(ResumePlan::Refetch) = plan {
+        // 416: the part is stale or already complete. Truncate it and retry
+        // once without Range - a 416 error body must never be streamed as
+        // content. Truncating first also means a failed retry cannot leave the
+        // same stale part to 416 forever.
+        File::create(dest).map_err(|e| {
+            DownloadFailure::permanent(format!("не удалось создать {}: {e}", dest.display()))
+        })?;
+        resp = send_get(c, url, label, 0)?;
+        plan = resume_plan(0, resp.status().as_u16());
     }
-    let total = resp.content_length().unwrap_or(0);
+
+    let (mut file, offset, expected) = match plan {
+        Some(ResumePlan::Append { offset }) => {
+            let file = OpenOptions::new().append(true).open(dest).map_err(|e| {
+                DownloadFailure::permanent(format!("не удалось открыть {} для дозаписи: {e}", dest.display()))
+            })?;
+            (file, offset, resp.content_length().unwrap_or(0))
+        }
+        Some(ResumePlan::Restart) => {
+            let file = File::create(dest).map_err(|e| {
+                DownloadFailure::permanent(format!("не удалось создать {}: {e}", dest.display()))
+            })?;
+            (file, 0, resp.content_length().unwrap_or(0))
+        }
+        // `Refetch` was resolved above; `None` means the response is not
+        // usable (non-success, or a resume answer we cannot follow).
+        _ => {
+            let status = resp.status();
+            return Err(DownloadFailure::from_http_status(
+                status.as_u16(),
+                format!("не удалось скачать {label}: HTTP {status}"),
+            ));
+        }
+    };
+
+    let total = offset + expected;
     if total > max {
-        return Err(format!("{label}: заявленный размер {total} байт превышает лимит {max}"));
+        return Err(DownloadFailure::permanent(format!(
+            "{label}: заявленный размер {total} байт превышает лимит {max}"
+        )));
     }
-    let bar = if total > 0 {
+    if offset > 0 && std::io::stdout().is_terminal() {
+        // Honest note: the existing part is continued, not restarted.
+        crate::outln(format!("↻ Докачиваю {label} с {offset} Б…"));
+    }
+    let bar = if expected > 0 {
         ProgressBar::new(total).with_style(
             ProgressStyle::with_template("{spinner} {wide_bar} {bytes}/{total_bytes} (осталось {eta})")
                 .unwrap_or_else(|_| ProgressStyle::default_bar()),
@@ -69,18 +223,20 @@ fn download_inner(
         // No Content-Length: a determinate bar would read "N/0".
         ProgressBar::new_spinner()
     };
-    let mut file = File::create(dest).map_err(|e| format!("не удалось создать {}: {e}", dest.display()))?;
+    if offset > 0 {
+        bar.set_position(offset);
+    }
     let mut buf = [0u8; 65536];
-    let mut written = 0;
+    let mut written = offset;
     loop {
-        let n = resp.read(&mut buf).map_err(|e| format!("сбой чтения {label}: {e}"))?;
+        let n = resp.read(&mut buf).map_err(|e| DownloadFailure::transient(format!("сбой чтения {label}: {e}")))?;
         if n == 0 {
             break;
         }
         if n as u64 > max - written {
-            return Err(format!("{label} больше {max} байт — загрузка остановлена"));
+            return Err(DownloadFailure::permanent(format!("{label} больше {max} байт — загрузка остановлена")));
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("сбой записи {label}: {e}"))?;
+        file.write_all(&buf[..n]).map_err(|e| DownloadFailure::permanent(format!("сбой записи {label}: {e}")))?;
         written += n as u64;
         bar.inc(n as u64);
     }
@@ -171,15 +327,19 @@ pub fn install_yt_dlp(bin: &Path) -> Result<PathBuf, String> {
     }
     match install_yt_dlp_inner(bin) {
         Ok(p) => Ok(p),
-        Err(e) => {
-            let _ = std::fs::remove_file(bin.join("yt-dlp.exe.part"));
-            Err(e)
+        Err(f) => {
+            // Transient failures keep `yt-dlp.exe.part` for the next attempt's
+            // Range-resume; only permanent ones clean it up.
+            if !f.kind.keeps_part() {
+                let _ = std::fs::remove_file(bin.join("yt-dlp.exe.part"));
+            }
+            Err(f.message)
         }
     }
 }
 
-fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, String> {
-    let c = client()?;
+fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
+    let c = client().map_err(DownloadFailure::permanent)?;
     let dest = bin.join("yt-dlp.exe");
     let tmp = bin.join("yt-dlp.exe.part");
     if std::io::stdout().is_terminal() {
@@ -190,22 +350,29 @@ fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, String> {
     let sums = c
         .get(YT_DLP_SUMS_URL)
         .send()
-        .map_err(|e| format!("не удалось скачать SHA2-512SUMS: {e}"))?;
+        .map_err(|e| DownloadFailure::transient(format!("не удалось скачать SHA2-512SUMS: {e}")))?;
     if !sums.status().is_success() {
         // Without this check a 403/404 body gets parsed as the sums file and
         // surfaces as the misleading "no entry for yt-dlp.exe" error.
-        return Err(format!("не удалось скачать SHA2-512SUMS: HTTP {}", sums.status()));
+        return Err(DownloadFailure::from_http_status(
+            sums.status().as_u16(),
+            format!("не удалось скачать SHA2-512SUMS: HTTP {}", sums.status()),
+        ));
     }
-    let sums_text = sums.text().map_err(|e| format!("не удалось прочитать SHA2-512SUMS: {e}"))?;
-    let expected = yt_dlp_checksum(&sums_text).ok_or("в SHA2-512SUMS нет записи для yt-dlp.exe")?;
+    let sums_text = sums
+        .text()
+        .map_err(|e| DownloadFailure::transient(format!("не удалось прочитать SHA2-512SUMS: {e}")))?;
+    let expected = yt_dlp_checksum(&sums_text)
+        .ok_or_else(|| DownloadFailure::permanent("в SHA2-512SUMS нет записи для yt-dlp.exe"))?;
 
-    let got = sha512_hex(&tmp)?;
+    let got = sha512_hex(&tmp).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(expected) {
         let _ = std::fs::remove_file(&tmp);
-        return Err("контрольная сумма SHA-512 не совпала — файл не сохранён".to_string());
+        return Err(DownloadFailure::permanent("контрольная сумма SHA-512 не совпала — файл не сохранён"));
     }
 
-    std::fs::rename(&tmp, &dest).map_err(|e| format!("не удалось установить yt-dlp.exe: {e}"))?;
+    std::fs::rename(&tmp, &dest)
+        .map_err(|e| DownloadFailure::permanent(format!("не удалось установить yt-dlp.exe: {e}")))?;
     Ok(dest)
 }
 
@@ -215,36 +382,45 @@ pub fn install_aria2(bin: &Path) -> Result<PathBuf, String> {
     }
     match install_aria2_inner(bin) {
         Ok(p) => Ok(p),
-        Err(e) => {
-            let _ = std::fs::remove_file(bin.join("aria2c.exe.part"));
-            let _ = std::fs::remove_file(bin.join("aria2.zip.part"));
-            Err(e)
+        Err(f) => {
+            // Transient failures keep both `.part` files for the next attempt's
+            // Range-resume; only permanent ones clean them up.
+            if !f.kind.keeps_part() {
+                let _ = std::fs::remove_file(bin.join("aria2c.exe.part"));
+                let _ = std::fs::remove_file(bin.join("aria2.zip.part"));
+            }
+            Err(f.message)
         }
     }
 }
 
-fn install_aria2_inner(bin: &Path) -> Result<PathBuf, String> {
-    let c = client()?;
+fn install_aria2_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
+    let c = client().map_err(DownloadFailure::permanent)?;
     if std::io::stdout().is_terminal() {
         crate::outln("⬇ Ищу свежий релиз aria2…");
     }
     let api = c
         .get(ARIA2_API)
         .send()
-        .map_err(|e| format!("не удалось получить список релизов aria2: {e}"))?;
+        .map_err(|e| DownloadFailure::transient(format!("не удалось получить список релизов aria2: {e}")))?;
     if !api.status().is_success() {
-        return Err(format!("не удалось получить список релизов aria2: HTTP {}", api.status()));
+        return Err(DownloadFailure::from_http_status(
+            api.status().as_u16(),
+            format!("не удалось получить список релизов aria2: HTTP {}", api.status()),
+        ));
     }
     let release: serde_json::Value = api
         .json()
-        .map_err(|e| format!("не удалось разобрать ответ API релизов aria2: {e}"))?;
-    let (url, expected_sha256) = aria2_asset(&release)?;
+        .map_err(|e| DownloadFailure::permanent(format!("не удалось разобрать ответ API релизов aria2: {e}")))?;
+    let (url, expected_sha256) = aria2_asset(&release).map_err(DownloadFailure::permanent)?;
 
     let zip_path = bin.join("aria2.zip.part");
     download(&c, &url, &zip_path, "aria2 (zip)", MAX_ARIA2_ZIP_BYTES)?;
-    let got = sha256_hex(&zip_path)?;
+    let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(&expected_sha256) {
-        return Err("SHA-256 архива aria2 не совпала — установка остановлена".into());
+        // The archive is unusable and must not be resumed later.
+        let _ = std::fs::remove_file(&zip_path);
+        return Err(DownloadFailure::permanent("SHA-256 архива aria2 не совпала — установка остановлена"));
     }
 
     let dest = bin.join("aria2c.exe");
@@ -280,7 +456,7 @@ fn install_aria2_inner(bin: &Path) -> Result<PathBuf, String> {
     // it, so cleanup happens after the extraction block regardless of outcome
     // (previously the zip leaked in bin\ on every failure path).
     let _ = std::fs::remove_file(&zip_path);
-    extracted?;
+    extracted.map_err(DownloadFailure::permanent)?;
     Ok(dest)
 }
 
@@ -337,5 +513,51 @@ mod tests {
         let mut out = Vec::new();
         copy_limited(&b"1234"[..], &mut out, 4).unwrap();
         assert_eq!(out, b"1234");
+    }
+
+    #[test]
+    fn resume_plan_maps_part_length_and_status() {
+        // No part: a plain GET was sent; any 2xx body streams from byte 0.
+        assert_eq!(resume_plan(0, 200), Some(ResumePlan::Restart));
+        // Part present + 206: append at the current part length.
+        assert_eq!(resume_plan(1234, 206), Some(ResumePlan::Append { offset: 1234 }));
+        // Part present + 200: Range was ignored, overwrite from scratch.
+        assert_eq!(resume_plan(1234, 200), Some(ResumePlan::Restart));
+        // Part present + 416: stale or already complete part, truncate + refetch.
+        assert_eq!(resume_plan(1234, 416), Some(ResumePlan::Refetch));
+        // Unusable answers must not produce a plan.
+        assert_eq!(resume_plan(1234, 404), None);
+        assert_eq!(resume_plan(1234, 500), None);
+        assert_eq!(resume_plan(0, 416), None);
+        assert_eq!(resume_plan(0, 500), None);
+    }
+
+    #[test]
+    fn only_transient_failures_keep_the_part() {
+        assert!(FailureKind::Transient.keeps_part());
+        assert!(!FailureKind::Permanent.keeps_part());
+        // 5xx/408/429 are "try again later" answers -> keep the part.
+        for status in [408, 429, 500, 502, 503] {
+            assert_eq!(FailureKind::from_http_status(status), FailureKind::Transient, "HTTP {status}");
+        }
+        // Other non-success statuses (4xx) -> delete the part.
+        for status in [400, 403, 404, 410, 416] {
+            assert_eq!(FailureKind::from_http_status(status), FailureKind::Permanent, "HTTP {status}");
+        }
+    }
+
+    #[test]
+    fn resumable_part_len_ignores_absent_empty_and_oversized_parts() {
+        let dir = std::env::temp_dir().join(format!("snatch-resume-part-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("tool.part");
+        assert_eq!(resumable_part_len(&p, 100), 0, "absent file");
+        std::fs::write(&p, b"").unwrap();
+        assert_eq!(resumable_part_len(&p, 100), 0, "empty file");
+        std::fs::write(&p, b"abc").unwrap();
+        assert_eq!(resumable_part_len(&p, 100), 3, "partial file");
+        assert_eq!(resumable_part_len(&p, 3), 3, "exactly at the cap");
+        assert_eq!(resumable_part_len(&p, 2), 0, "larger than the cap");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
