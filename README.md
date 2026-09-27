@@ -61,6 +61,8 @@ SNATCH находит binaries в таком порядке: своя автоу
 
 ### 2. Сам SNATCH
 
+Готовые сборки (Windows x64): страница **[Releases](https://github.com/RERCON0/SNATCH/releases)** — скачайте ZIP, распакуйте и запускайте, установка не нужна.
+
 Соберите из исходников:
 
 ```bash
