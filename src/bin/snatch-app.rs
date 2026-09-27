@@ -2444,7 +2444,35 @@ fn app_icon() -> Option<egui::IconData> {
     Some(egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() })
 }
 
+/// A windows-subsystem exe has no console to print to, so a startup failure
+/// (most often "no OpenGL 2.1+" in a bare VM or an RDP session) used to kill
+/// the process with no window and no error at all. Show it in a MessageBox.
+#[cfg(windows)]
+fn fatal_dialog(title: &str, text: &str) {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    extern "system" {
+        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, mb_type: u32) -> i32;
+    }
+    const MB_ICONERROR: u32 = 0x10;
+    let wide = |s: &str| -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
+    };
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide(title).as_ptr(), MB_ICONERROR);
+    }
+}
+
+#[cfg(not(windows))]
+fn fatal_dialog(_title: &str, _text: &str) {}
+
 fn main() -> eframe::Result {
+    // panic="abort" still runs the hook before aborting: surface internal
+    // panics instead of dying silently without a console.
+    std::panic::set_hook(Box::new(|info| {
+        fatal_dialog("SNATCH — внутренняя ошибка", &format!("SNATCH не смог продолжить работу.\n\n{info}"));
+    }));
+
     let mut viewport = egui::ViewportBuilder::default()
         .with_inner_size([460.0, 640.0])
         .with_min_inner_size([460.0, 520.0])
@@ -2455,11 +2483,23 @@ fn main() -> eframe::Result {
         viewport = viewport.with_icon(icon);
     }
     let options = eframe::NativeOptions { viewport, ..Default::default() };
-    eframe::run_native(
+    let result = eframe::run_native(
         "SNATCH",
         options,
         Box::new(|cc| Ok(Box::new(SnatchApp::new(cc)))),
-    )
+    );
+    if let Err(e) = &result {
+        fatal_dialog(
+            "SNATCH — не удалось открыть окно",
+            &format!(
+                "Причина: {e}\n\nНа виртуальной машине или в RDP-сеансе это обычно означает, \
+                 что недоступен OpenGL 2.1+. Включите 3D-ускорение в настройках ВМ либо \
+                 запустите программу на обычном рабочем столе.\n\n\
+                 CLI-версия (snatch.exe) от графики не зависит и работает всегда."
+            ),
+        );
+    }
+    result
 }
 
 #[cfg(test)]
