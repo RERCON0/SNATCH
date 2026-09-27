@@ -4,7 +4,10 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use crate::config::home_dir;
+use fs4::{FileExt, TryLockError};
+use sha2::{Digest, Sha256};
+
+use crate::config::{config_dir, home_dir};
 use crate::tools::{which, Toolchain};
 use crate::ui::clip;
 
@@ -615,34 +618,116 @@ fn url_basename(url: &str) -> String {
         .to_string()
 }
 
-/// E-1 (offensive audit 2026-09-27): an HTTP/FTP target whose same-name file
-/// already exists WITHOUT its own `.aria2` control file is somebody else's
-/// file; `-c` would silently resume/overwrite it. Detecting this lets
-/// build() drop `-c` and let aria2 save alongside under a fresh name.
-fn aria2_foreign_target(url: &str, out: &Path) -> bool {
-    if !ALLOWED_SCHEMES.contains(&scheme_of(url).as_str()) {
-        return false;
-    }
-    let name = url_basename(url);
-    if name.is_empty() {
-        return false;
-    }
-    out.join(&name).is_file() && !out.join(format!("{name}.aria2")).is_file()
+/// Lock and ownership records live outside Downloads, shared by CLI/GUI and
+/// both editions of SNATCH. A bare .aria2 file does NOT establish that its
+/// source URL matches this job; aria2 -c can overwrite an unrelated partial.
+fn aria2_state_dir() -> PathBuf {
+    config_dir().join("aria2-locks")
 }
 
-/// ARIA2_RESUME with resume-safety adjusted for a foreign same-name file:
-/// no `-c` (never touch the existing bytes) and auto-renaming on (save as
-/// `name.1` alongside instead of failing "file already exists").
-fn aria2_flags(foreign_target: bool) -> Vec<&'static str> {
-    if foreign_target {
+fn aria2_target_key(out: &Path, name: &str) -> String {
+    let canonical = std::fs::canonicalize(out).unwrap_or_else(|_| out.to_path_buf());
+    let path = canonical.to_string_lossy();
+    let key = if cfg!(windows) { path.to_lowercase() } else { path.into_owned() };
+    let mut hash = Sha256::new();
+    hash.update(key.as_bytes());
+    hash.update([0]);
+    hash.update(if cfg!(windows) { name.to_lowercase() } else { name.to_string() }.as_bytes());
+    format!("{:x}", hash.finalize())
+}
+
+fn aria2_origin_path(out: &Path, name: &str, state_dir: &Path) -> PathBuf {
+    state_dir.join(format!("{}.origin", aria2_target_key(out, name)))
+}
+
+fn aria2_url_hash(url: &str) -> String {
+    format!("{:x}", Sha256::digest(url.as_bytes()))
+}
+
+fn canonical_is_unc(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+    matches!(path.components().next(), Some(Component::Prefix(p))
+        if matches!(p.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)))
+}
+
+fn aria2_owned_partial_in(url: &str, out: &Path, state_dir: &Path) -> bool {
+    let name = url_basename(url);
+    !name.is_empty()
+        && out.join(&name).is_file()
+        && out.join(format!("{name}.aria2")).is_file()
+        && std::fs::read_to_string(aria2_origin_path(out, &name, state_dir))
+            .is_ok_and(|fingerprint| fingerprint == aria2_url_hash(url))
+}
+
+fn aria2_owned_partial(url: &str, out: &Path) -> bool {
+    aria2_owned_partial_in(url, out, &aria2_state_dir())
+}
+
+fn aria2_foreign_target(url: &str, out: &Path) -> bool {
+    let name = url_basename(url);
+    ALLOWED_SCHEMES.contains(&scheme_of(url).as_str())
+        && !name.is_empty() && out.join(name).exists() && !aria2_owned_partial(url, out)
+}
+
+/// Hold the OS lock from before build() until the child process exits. The
+/// GUI tries once (never block its render thread); CLI jobs wait their turn.
+/// Stable lock files are never deleted, or another process could lock a new
+/// inode while an earlier download still holds the old one.
+pub fn lock_aria2_target(job: &Job, wait: bool) -> Result<Option<std::fs::File>, String> {
+    lock_aria2_target_in(job, wait, &aria2_state_dir())
+}
+
+fn lock_aria2_target_in(job: &Job, wait: bool, state_dir: &Path) -> Result<Option<std::fs::File>, String> {
+    if job.engine != "aria2" || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) {
+        return Ok(None);
+    }
+    let name = url_basename(&job.url);
+    if name.is_empty() { return Ok(None); }
+    let out = absolute_out_dir(&job.out_dir);
+    if is_unc_path(&out) || is_unc_path(state_dir) {
+        return Err("Сетевая UNC-папка не подходит для загрузки или блокировок aria2".into());
+    }
+    std::fs::create_dir_all(&out).map_err(|e| format!("папка загрузки aria2: {e}"))?;
+    if canonical_is_unc(&std::fs::canonicalize(&out).map_err(|e| format!("папка загрузки aria2: {e}"))?) {
+        return Err("Папка загрузки aria2 ведёт на сетевой UNC-путь".into());
+    }
+    std::fs::create_dir_all(state_dir).map_err(|e| format!("папка блокировок aria2: {e}"))?;
+    let key = aria2_target_key(&out, &name);
+    let lock = std::fs::OpenOptions::new().create(true).read(true).write(true)
+        .truncate(false).open(state_dir.join(format!("{key}.lock")))
+        .map_err(|e| format!("блокировка aria2: {e}"))?;
+    if wait {
+        FileExt::lock(&lock).map_err(|e| format!("блокировка aria2: {e}"))?;
+    } else {
+        match FileExt::try_lock(&lock) {
+            Ok(()) => {},
+            Err(TryLockError::WouldBlock) => return Err(format!(
+                "Файл «{name}» уже скачивается в эту папку — повторите после завершения"
+            )),
+            Err(TryLockError::Error(e)) => return Err(format!("блокировка aria2: {e}")),
+        }
+    }
+    // Claim only an empty slot. Never certify an existing file or .aria2 as
+    // ours just because the URL currently points at the same basename.
+    if !out.join(&name).exists() && !out.join(format!("{name}.aria2")).exists() {
+        std::fs::write(aria2_origin_path(&out, &name, state_dir), aria2_url_hash(&job.url))
+            .map_err(|e| format!("метка докачки aria2: {e}"))?;
+    }
+    Ok(Some(lock))
+}
+
+/// A fresh run never needs `-c`: auto-renaming stays on even when the file
+/// did not exist at build time, closing the build→spawn collision race.
+/// Resume is allowed only for a partial this app recorded for the SAME URL.
+fn aria2_flags(owned_partial: bool) -> Vec<&'static str> {
+    if owned_partial {
+        ARIA2_RESUME.to_vec()
+    } else {
         ARIA2_RESUME
-            .iter()
-            .copied()
+            .iter().copied()
             .filter(|f| *f != "-c" && *f != "--auto-file-renaming=false")
             .chain(std::iter::once("--auto-file-renaming=true"))
             .collect()
-    } else {
-        ARIA2_RESUME.to_vec()
     }
 }
 
@@ -680,8 +765,10 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
         cmd.push("--no-conf".into());
         cmd.push("-d".into());
         cmd.push(out.clone().into_os_string());
-        let foreign = aria2_foreign_target(&job.url, &out);
-        for a in aria2_flags(foreign).iter().chain(ARIA2_WORKERS) {
+        // -c only affects HTTP/FTP; keep torrent/magnet options as before.
+        let resume = !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str())
+            || aria2_owned_partial(&job.url, &out);
+        for a in aria2_flags(resume).iter().chain(ARIA2_WORKERS) {
             cmd.push((*a).into());
         }
         if is_bittorrent_input(&job.url) {
@@ -711,14 +798,13 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     }
     if let Some(aria2c) = &tc.aria2c {
         if is_direct_download(&job.url) {
-            // Same E-1 guard as the aria2 engine branch: yt-dlp hands the
-            // direct link to aria2c as an external downloader.
-            let foreign = aria2_foreign_target(&job.url, &out);
+            // yt-dlp decides the actual destination name, which may differ
+            // from the URL basename. Never enable -c on that unknown target.
             cmd.push("--external-downloader".into());
             cmd.push(aria2c.as_os_str().to_os_string());
             cmd.push("--external-downloader-args".into());
             cmd.push(
-                format!("{} {} --no-conf", aria2_flags(foreign).join(" "), ARIA2_WORKERS.join(" "))
+                format!("{} {} --no-conf", aria2_flags(false).join(" "), ARIA2_WORKERS.join(" "))
                     .into(),
             );
         }
@@ -1000,12 +1086,11 @@ mod tests {
         assert_eq!(std::fs::read(out.join("file.bin")).unwrap(), b"old data");
         assert!(preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
 
-        // Our own partial download (control file present) keeps normal resume.
+        // A stray .aria2 is not proof of ownership: it could be another URL's.
         std::fs::write(out.join("file.bin.aria2"), b"ctl").unwrap();
         let s = args_of(&build(&job, &tc_aria2()).unwrap());
-        assert!(s.contains(&"-c".to_string()), "{s:?}");
-        assert!(s.contains(&"--auto-file-renaming=false".to_string()), "{s:?}");
-        assert!(!preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+        assert!(!s.contains(&"-c".to_string()), "{s:?}");
+        assert!(preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
         std::fs::remove_file(out.join("file.bin.aria2")).unwrap();
 
         // yt-dlp's external-downloader branch gets the collision-safe args too.
@@ -1019,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn aria2_no_collision_keeps_the_normal_resume_flags() {
+    fn aria2_no_collision_starts_without_continue_even_if_file_appears_after_build() {
         let out = tmp_out();
         let job = Job {
             engine: "aria2".into(),
@@ -1027,9 +1112,33 @@ mod tests {
             out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
         };
         let s = args_of(&build(&job, &tc_aria2()).unwrap());
-        assert!(s.contains(&"-c".to_string()), "{s:?}");
-        assert!(s.contains(&"--auto-file-renaming=false".to_string()), "{s:?}");
+        assert!(!s.contains(&"-c".to_string()), "{s:?}");
+        assert!(s.contains(&"--auto-file-renaming=true".to_string()), "{s:?}");
         assert!(!preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn aria2_lock_claims_only_an_empty_target_and_requires_the_same_source_to_resume() {
+        let out = tmp_out();
+        let state = out.join("state");
+        let job = Job { engine: "aria2".into(), url: "https://one.example/file.bin".into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        let lock = lock_aria2_target_in(&job, false, &state).unwrap().unwrap();
+        assert!(lock_aria2_target_in(&job, false, &state).is_err(), "concurrent jobs must not share a basename");
+        std::fs::write(out.join("file.bin"), b"partial").unwrap();
+        std::fs::write(out.join("file.bin.aria2"), b"control").unwrap();
+        assert!(aria2_owned_partial_in(&job.url, &out, &state));
+        assert!(aria2_flags(true).contains(&"-c"));
+        drop(lock);
+
+        let other = Job { url: "https://other.example/file.bin".into(), ..job };
+        let lock = lock_aria2_target_in(&other, false, &state).unwrap().unwrap();
+        assert!(!aria2_owned_partial_in(&other.url, &out, &state));
+        assert!(!aria2_flags(false).contains(&"-c"));
+        drop(lock);
+        assert!(aria2_owned_partial_in("https://one.example/file.bin", &out, &state),
+            "a foreign URL must not re-claim the existing partial");
         std::fs::remove_dir_all(&out).ok();
     }
 

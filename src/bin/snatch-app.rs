@@ -1237,6 +1237,13 @@ impl SnatchApp {
         let label = engines::batch_name(&job.url);
         let warns = preflight_warning(&job);
 
+        let output_lock = match engines::lock_aria2_target(&job, false) {
+            Ok(lock) => lock,
+            Err(e) => {
+                self.set_status(StatusKind::Err, format!("«{label}»: {e}"));
+                return;
+            }
+        };
         let mut cmd = match engines::build(&job, &self.tc) {
             Ok(c) => c,
             Err(e) => {
@@ -1454,6 +1461,9 @@ impl SnatchApp {
                 }
             };
             let code = status.map(|s| s.code().unwrap_or(130)).unwrap_or(127);
+            // aria2 has exited, so release its basename before Done starts
+            // the next GUI queue entry for the same destination.
+            drop(output_lock);
             // Done goes first: if the direct child died abnormally while a
             // grandchild (ffmpeg / external aria2c) still holds the inherited
             // pipe handles, the joins below can block indefinitely and the

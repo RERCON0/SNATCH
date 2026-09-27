@@ -408,6 +408,15 @@ fn run_batch_job(
     for warn in preflight_warning(&job) {
         let _ = tx.send(BatchEvent::Line(id, format!("⚠ {warn}")));
     }
+    // Hold the same-name OS lock through child.wait(): both this process and
+    // the GUI/private edition must decide ownership before building -c flags.
+    let _output_lock = match engines::lock_aria2_target(&job, true) {
+        Ok(lock) => lock,
+        Err(e) => {
+            let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
+            return RunResult { code: 2, auth_hint: false };
+        }
+    };
     let cmd = match cli_command(&job, tc, plan.no_continue, true) {
         Ok(cmd) => cmd,
         Err(e) => {
