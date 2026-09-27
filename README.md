@@ -68,7 +68,7 @@ SNATCH находит binaries в таком порядке: своя автоу
 ```bash
 cargo build --release
 # -> target/release/snatch.exe     (CLI)
-# -> target/release/snatch-app.exe (GUI, ~4 МБ, без терминала)
+# -> target/release/snatch-app.exe (GUI, ~4.6 МБ, без терминала)
 ```
 
 Готовые exe можно положить куда угодно и добавить в `PATH` — установка не нужна.
