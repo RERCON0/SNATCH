@@ -1,6 +1,6 @@
 [package]
 name = "snatch-rs"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 build = "build.rs"
 description = "SNATCH — native GUI download app (yt-dlp + aria2c) for the terminal-shy"
