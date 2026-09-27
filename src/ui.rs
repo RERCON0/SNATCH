@@ -50,7 +50,7 @@ pub fn safe_read_dirs(path: &Path) -> Vec<PathBuf> {
             .collect(),
         Err(_) => Vec::new(),
     };
-    out.sort_by_key(|p| {
+    out.sort_by_cached_key(|p| {
         p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
     });
     out

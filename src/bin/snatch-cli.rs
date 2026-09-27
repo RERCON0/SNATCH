@@ -218,7 +218,11 @@ fn highlight_progress(status: &str) -> String {
             out.insert_str(start, CYAN);
         }
         if let Some(end) = out.find('%') {
-            let start = out[..end].rfind(char::is_whitespace).map_or(0, |i| i + 1);
+            // Advance past the WHOLE whitespace char: for a multi-byte
+            // whitespace (e.g. NNBSP) `i + 1` is not a char boundary and
+            // insert_str would panic.
+            let start = out[..end].rfind(char::is_whitespace)
+                .map_or(0, |i| i + out[i..].chars().next().map_or(1, char::len_utf8));
             out.insert_str(end + 1, RESET);
             out.insert_str(start, GREEN);
         }
@@ -499,6 +503,7 @@ fn run_batch_with(
                         cfg.remember_url(&url);
                         cfg.remember_dir(&dir);
                         cfg.save();
+                        let dir = clip(&engines::sanitize_child_output(&dir), 90);
                         display.finished(id, format!("✔ Готово: {dir}"));
                     } else if missing_control[id] {
                         display.finished(id, "✘ Файлы уже есть, но нет .aria2 — выберите пустую папку".into());
@@ -618,7 +623,10 @@ fn ask_links(cfg: &Config) -> Option<Vec<String>> {
         let text = Text::new("Ссылки через пробел (Enter — история):").prompt().ok()?;
         if !text.trim().is_empty() {
             match split_links(&text) {
-                Ok(urls) => return Some(urls),
+                Ok(urls) if !urls.is_empty() => return Some(urls),
+                // Quotes/whitespace only: nothing to download - ask again
+                // instead of "succeeding" with a zero-URL queue.
+                Ok(_) => continue,
                 Err(e) => { errln(format!("✘ {e}")); continue; }
             }
         }
@@ -709,7 +717,11 @@ enum DirEntryChoice {
 impl fmt::Display for DirEntryChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DirEntryChoice::Select(p) => write!(f, "✓ Выбрать эту папку ({})", p.display()),
+            // File names are remote-controlled (archive contents!): never let
+            // them inject raw escape sequences into the terminal menu.
+            DirEntryChoice::Select(p) => {
+                write!(f, "✓ Выбрать эту папку ({})", clip(&p.display().to_string(), 90))
+            }
             DirEntryChoice::Up => write!(f, "↑ Наверх"),
             // Honest wording: the list is alphabetical and the tail is never
             // rendered - "поднимитесь выше" could not reveal it.
@@ -718,7 +730,8 @@ impl fmt::Display for DirEntryChoice {
                 "… показаны первые {MAX_BROWSE_ENTRIES} папок по алфавиту (всего {n})"
             ),
             DirEntryChoice::Down(p) => {
-                write!(f, "📁 {}", p.file_name().map(|n| n.to_string_lossy()).unwrap_or_default())
+                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                write!(f, "📁 {}", clip(&name, 60))
             }
         }
     }
@@ -932,9 +945,15 @@ fn main() -> std::process::ExitCode {
         } else {
             std::mem::take(&mut preset_urls)
         };
-        let Some(out_dir) = ask_dir(&cfg) else {
-            outln("Отменено.");
-            return exit_code(130);
+        let out_dir = match &args.output {
+            Some(o) => o.clone(),
+            None => match ask_dir(&cfg) {
+                Some(d) => d,
+                None => {
+                    outln("Отменено.");
+                    return exit_code(130);
+                }
+            },
         };
         let total = urls.len();
         let mut plans = Vec::with_capacity(total);
@@ -1274,7 +1293,7 @@ mod tests {
             || panic!("bad URL must not discover tools")).code, 2);
     }
 
-    // -- retry_with_cookies_inner (test_retry_with_cookies_*, test_no_retry_without_auth_hint, test_retry_gives_up_after_second_failure) --
+    // -- retry_with_cookies_inner (test_retry_with_cookies_*, test_no_retry_without_auth_hint, retry_second_decline_returns_failure) --
 
     #[test]
     fn retry_with_cookies_retries_and_succeeds() {
@@ -1338,7 +1357,10 @@ mod tests {
     }
 
     #[test]
-    fn retry_gives_up_after_second_failure() {
+    fn retry_second_decline_returns_failure() {
+        // The loop is user-driven (no retry cap): the first offer is accepted
+        // (login) and the retried download fails again; declining the second
+        // offer must return that failure as-is.
         let mut cfg = empty_cfg();
         let mut confirms = vec![false, true]; // .pop() yields true first, then false
         let mut calls = 0;

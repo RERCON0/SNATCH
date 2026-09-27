@@ -155,7 +155,11 @@ impl Config {
                 let same_epoch = self.history_epoch == disk.history_epoch;
                 Config {
                     default_dir: self.default_dir.clone(),
-                    last_dir: self.last_dir.clone(),
+                    // Like urls/dirs: only a remember_dir() since the last
+                    // save may overwrite last_dir. A stale window saving an
+                    // unrelated setting must not resurrect a directory that
+                    // --clear-history (or a newer download) replaced.
+                    last_dir: if self.dir_dirty.get() { self.last_dir.clone() } else { disk.last_dir.clone() },
                     urls: merge_history(&self.urls, &disk.urls, same_epoch, self.url_dirty.get()),
                     dirs: merge_history(&self.dirs, &disk.dirs, same_epoch, self.dir_dirty.get()),
                     history_epoch: disk.history_epoch,
@@ -350,6 +354,7 @@ mod tests {
         let after_theme_save = Config::load_from(&p);
         assert!(after_theme_save.urls.is_empty());
         assert!(after_theme_save.dirs.is_empty());
+        assert!(after_theme_save.last_dir.is_empty(), "stale last_dir restored");
         old_gui.remember_url("https://host/new.mp3");
         old_gui.save_to(&p);
         let after_new_download = Config::load_from(&p);

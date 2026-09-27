@@ -16,6 +16,8 @@
                              by rercon prod. | https://t.me/rercon
 ```
 
+![SNATCH — окно GUI](docs/screenshot.png)
+
 ## Возможности
 
 - **Авто-выбор движка**: magnet/torrent/прямые ссылки на файлы → aria2c, всё остальное (YouTube и ещё тысячи сайтов) → yt-dlp

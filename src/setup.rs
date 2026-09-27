@@ -88,23 +88,32 @@ fn download_inner(
     Ok(())
 }
 
-fn sha512_hex(path: &Path) -> Result<String, String> {
-    let data = std::fs::read(path).map_err(|e| format!("не удалось прочитать {}: {e}", path.display()))?;
-    let mut hasher = Sha512::new();
-    hasher.update(&data);
-    Ok(format!("{:x}", hasher.finalize()))
-}
-
-fn sha256_hex(path: &Path) -> Result<String, String> {
+/// Stream a file through a hasher in 64 KiB chunks: yt-dlp.exe can be up to
+/// MAX_YT_DLP_BYTES, and reading it whole would spike memory for no reason.
+fn file_hash_hex<D: Digest>(path: &Path, what: &str) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = D::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = file.read(&mut buf).map_err(|e| format!("сбой чтения {}: {e}", path.display()))?;
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("сбой чтения {what} {}: {e}", path.display()))?;
         if n == 0 { break; }
         hasher.update(&buf[..n]);
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    let mut hex = String::with_capacity(128);
+    for b in hasher.finalize() {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
+}
+
+fn sha512_hex(path: &Path) -> Result<String, String> {
+    file_hash_hex::<Sha512>(path, "файла")
+}
+
+fn sha256_hex(path: &Path) -> Result<String, String> {
+    file_hash_hex::<Sha256>(path, "архива")
 }
 
 fn aria2_asset(release: &serde_json::Value) -> Result<(String, String), String> {
@@ -320,9 +329,11 @@ mod tests {
 
     #[test]
     fn bounded_extraction_rejects_more_than_the_limit() {
+        // Exactly max+1 bytes must be written before the cap trips: if the
+        // `take(max + 1)` bound regressed, all 5 input bytes would land.
         let mut out = Vec::new();
         assert!(copy_limited(&b"12345"[..], &mut out, 4).is_err());
-        assert!(out.len() <= 5);
+        assert_eq!(out.len(), 5);
         let mut out = Vec::new();
         copy_limited(&b"1234"[..], &mut out, 4).unwrap();
         assert_eq!(out, b"1234");

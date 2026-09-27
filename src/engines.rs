@@ -284,7 +284,13 @@ fn cp1251_to_utf8(bytes: &[u8]) -> String {
             0xB8 => '\u{0451}', // ё
             // 0xC0-0xFF: the Cyrillic block, contiguous from U+0410.
             0xC0..=0xFF => char::from_u32(0x0410 + b as u32 - 0xC0).unwrap_or('\u{FFFD}'),
-            // 0xA0-0xBF (minus the two above) match Latin-1 exactly.
+            // The rest of 0xA0-0xBF mostly matches Latin-1, but cp1251
+            // differs on these bytes (e.g. 0xB3 is Ukrainian "і", not "³").
+            0xA1 => '\u{040E}', 0xA2 => '\u{045E}', 0xA3 => '\u{0408}',
+            0xA5 => '\u{0490}', 0xAA => '\u{0404}', 0xAF => '\u{0407}',
+            0xB2 => '\u{0406}', 0xB3 => '\u{0456}', 0xB4 => '\u{0491}',
+            0xB9 => '\u{2116}', 0xBA => '\u{0454}', 0xBC => '\u{0458}',
+            0xBD => '\u{0405}', 0xBE => '\u{0455}', 0xBF => '\u{0457}',
             _ => char::from(b),
         };
         out.push(c);
@@ -484,9 +490,15 @@ pub fn detect_engine(url: &str) -> &'static str {
     if scheme_of(&u) == "magnet" {
         return "aria2";
     }
-    // Percent-decode first: https://host/file%2Ezip is a .zip just like the
-    // literal spelling and belongs to aria2.
-    let suffix = suffix_of(&percent_decode(&path_from_url(&u)));
+    // A scheme-less local path may legally contain '#', so suffix checks for
+    // it must use the whole string (path_from_url would truncate at '#').
+    let suffix = if scheme_of(&u).is_empty() {
+        suffix_of(&u)
+    } else {
+        // Percent-decode first: https://host/file%2Ezip is a .zip just like
+        // the literal spelling and belongs to aria2.
+        suffix_of(&percent_decode(&path_from_url(&u)))
+    };
     if TORRENT_FILES.contains(&suffix.as_str()) || FILE_EXT.contains(&suffix.as_str()) {
         "aria2"
     } else {
@@ -509,7 +521,10 @@ fn is_bittorrent_input(url: &str) -> bool {
     } else {
         suffix_of(&percent_decode(&path_from_url(url)))
     };
-    suffix == ".torrent"
+    // metalink/meta4 files get the same no-preallocation + frequent
+    // control-file saves as .torrent: both fill big files that would leak
+    // preallocated bytes if the app dies mid-run.
+    TORRENT_FILES.contains(&suffix.as_str())
 }
 
 pub fn validate_cookies_browser(value: &str) -> Result<(), String> {
@@ -640,7 +655,10 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
 }
 
 pub fn preflight_warning(job: &Job) -> Vec<String> {
-    preflight_warning_with_ffmpeg(job, job.engine == "yt-dlp" && which("ffmpeg").is_some())
+    // ffmpeg presence does not change mid-process; probe PATH once per run.
+    static HAS_FFMPEG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let has_ffmpeg = *HAS_FFMPEG.get_or_init(|| which("ffmpeg").is_some());
+    preflight_warning_with_ffmpeg(job, job.engine == "yt-dlp" && has_ffmpeg)
 }
 
 fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool) -> Vec<String> {
@@ -831,7 +849,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_unc_paths() {
-        // stat'ing these would leak the user's NetNTLMv2 hash to "evil.com"
+        // stat'ing these would leak the user's NetNTLMv2 hash to "evil.com".
+        // Assert the *guard's* message, not just is_err(): a missing guard
+        // also fails via the unreachable host, so is_err() alone could pass
+        // while the SMB stat this test exists to prevent actually happened.
         for bad in [
             r"\\evil.com\share\movie.torrent",
             "//evil.com/share/movie.torrent",
@@ -840,7 +861,8 @@ mod tests {
             r"\\?\UNC\evil.com\share\movie.torrent",
         ] {
             assert!(is_unc_path(Path::new(bad)), "{bad}");
-            assert!(validate_url(bad).is_err(), "{bad}");
+            let err = validate_url(bad).unwrap_err();
+            assert!(err.contains("UNC"), "{bad}: {err}");
         }
     }
 
@@ -853,9 +875,19 @@ mod tests {
             fmt: "best".into(),
             cookies_browser: None,
         };
-        assert!(build(&job, &tc_ytdlp()).is_err());
+        let err = build(&job, &tc_ytdlp()).unwrap_err();
+        assert!(err.contains("UNC"), "{err}");
         let job = Job { out_dir: PathBuf::from("//evil.com/share"), ..job };
-        assert!(build(&job, &tc_ytdlp()).is_err());
+        let err = build(&job, &tc_ytdlp()).unwrap_err();
+        assert!(err.contains("UNC"), "{err}");
+    }
+
+    #[test]
+    fn local_path_engine_detection_ignores_hash_and_supports_metalink() {
+        // '#' is legal in local filenames; it must not truncate the suffix.
+        assert_eq!(detect_engine("S01 #2.torrent"), "aria2");
+        assert_eq!(detect_engine("movie.meta4"), "aria2");
+        assert_eq!(detect_engine(r"C:\Torrents\[DL] Cuphead #1.torrent"), "aria2");
     }
 
     #[test]
@@ -1269,6 +1301,11 @@ mod tests {
         assert_eq!(decode_child_bytes(b"\xa8\xb8").as_ref(), "\u{0401}\u{0451}");
         // undefined 0x98 decodes to the replacement char, not a panic
         assert_eq!(decode_child_bytes(b"\x98").as_ref(), "\u{FFFD}");
+        // 0xA0-0xBF is not Latin-1 in cp1251: 0xB3="і", 0xBF="ї", 0xB9="№".
+        // These byte runs are invalid UTF-8, so the cp1251 path is taken.
+        assert_eq!(decode_child_bytes(b"\xb3\xc0").as_ref(), "\u{0456}\u{0410}");
+        assert_eq!(decode_child_bytes(b"\xb9").as_ref(), "\u{2116}");
+        assert_eq!(decode_child_bytes(b"\xbf").as_ref(), "\u{0457}");
     }
 
     #[test]

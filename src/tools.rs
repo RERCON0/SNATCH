@@ -44,6 +44,11 @@ pub fn which(name: &str) -> Option<PathBuf> {
         if dir.as_os_str().is_empty() {
             continue;
         }
+        // A UNC PATH entry would SMB-authenticate on the is_executable()
+        // probe below; skip it before touching the filesystem.
+        if crate::engines::is_unc_path(&dir) {
+            continue;
+        }
         let cand = dir.join(exe_name(name));
         if is_executable(&cand) {
             return Some(cand);
@@ -132,12 +137,19 @@ pub fn find(name: &str) -> Option<PathBuf> {
     if let Some(key) = env_override(name) {
         if let Some(candidate) = std::env::var_os(key).filter(|s| !s.is_empty()) {
             let p = expanduser(Path::new(&candidate));
-            if p.is_file() {
+            // A UNC candidate would SMB-authenticate to the remote host on
+            // the is_file() probe below (NetNTLMv2 leak) - refuse it first.
+            if crate::engines::is_unc_path(&p) {
+                crate::errln(format!(
+                    "⚠ {key} указывает на сетевой UNC-путь: {candidate:?} — пропускаю."
+                ));
+            } else if p.is_file() {
                 return Some(p);
+            } else {
+                crate::errln(format!(
+                    "⚠ {key} указывает на несуществующий файл: {candidate:?} — продолжаю обычный поиск."
+                ));
             }
-            crate::errln(format!(
-                "⚠ {key} указывает на несуществующий файл: {candidate:?} — продолжаю обычный поиск."
-            ));
         }
     }
 
@@ -242,6 +254,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let real_exe = dir.join(exe_name("yt-dlp"));
         std::fs::write(&real_exe, b"").unwrap();
+        #[cfg(unix)]
+        {
+            // `which` requires the executable bit on Unix; fs::write's 0o644
+            // would make this test Windows-only despite the cfg(unix) branches.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&real_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::env::set_var("PATH", &dir);
         // find() checks a self-installed %LOCALAPPDATA%\snatch\bin copy
         // before PATH (setup.rs's bootstrap install) - point it at the same

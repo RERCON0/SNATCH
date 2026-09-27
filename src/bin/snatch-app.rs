@@ -416,7 +416,13 @@ fn setup_theme(ctx: &egui::Context, dark: bool) {
         .families
         .insert(egui::FontFamily::Name("title".into()), vec!["mono-title".to_owned()]);
     ctx.set_fonts(fonts);
-    ctx.set_visuals(terminal_visuals(dark));
+    // Visuals must go into BOTH style buckets too (see the all_styles_mut
+    // comment below): ctx.set_visuals writes only the currently active
+    // bucket, which at startup is egui's Dark fallback, while the first
+    // rendered frame may already use the Light bucket on a light-themed OS.
+    ctx.all_styles_mut(|style| {
+        style.visuals = terminal_visuals(dark);
+    });
     // item_spacing.y is the *tight* rhythm (label to its own field, mockup's
     // ~6-7px); the *loose* rhythm between field groups (mockup's ~16-18px)
     // is added explicitly via ui.add_space() between groups - one uniform
@@ -827,7 +833,11 @@ impl SnatchApp {
     /// doesn't reset to dark on the next launch.
     fn toggle_theme(&mut self, ctx: &egui::Context) {
         self.dark_mode = !self.dark_mode;
-        ctx.set_visuals(terminal_visuals(self.dark_mode));
+        // Both buckets: whichever one egui's theme() resolves to later must
+        // carry the chosen palette, not just the active one right now.
+        ctx.all_styles_mut(|style| {
+            style.visuals = terminal_visuals(self.dark_mode);
+        });
         self.cfg.dark_mode = self.dark_mode;
         self.cfg.save();
     }
@@ -1162,6 +1172,13 @@ impl SnatchApp {
     /// poisons the run (Errno 22 mid-download or a merger "Invalid data"
     /// afterwards), so one clean retry heals it.
     fn spawn_job(&mut self, ctx: &egui::Context, job: Job, no_continue: bool) {
+        // The close flow vetoes the window close until `jobs` is empty. A
+        // spawn racing in from a still-clickable button right after × would
+        // add an uncancelled process past cancel_all() and defer closing
+        // until that download finishes.
+        if self.close_requested {
+            return;
+        }
         let label = engines::batch_name(&job.url);
         let warns = preflight_warning(&job);
 
@@ -1380,11 +1397,15 @@ impl SnatchApp {
                     Err(e) => break Err(e),
                 }
             };
-            let _ = h_out.join();
-            let _ = h_err.join();
             let code = status.map(|s| s.code().unwrap_or(130)).unwrap_or(127);
+            // Done goes first: if the direct child died abnormally while a
+            // grandchild (ffmpeg / external aria2c) still holds the inherited
+            // pipe handles, the joins below can block indefinitely and the
+            // job would never report completion.
             let _ = tx.send(Msg::Done(id, code));
             ctx_w.request_repaint();
+            let _ = h_out.join();
+            let _ = h_err.join();
         });
     }
 
@@ -2064,13 +2085,20 @@ impl SnatchApp {
             if !pj.status.is_empty() { ui.weak(clip(&pj.status, 90)); }
         }
         if let Some(i) = resume_idx {
-            let pj = self.paused.remove(i);
-            if self.jobs.len() < MAX_CONCURRENT {
-                self.spawn_job(ctx, pj.job, false);
-                self.set_status(StatusKind::None, format!("«{}»: продолжаю…", pj.label));
+            if self.phase == Phase::Setup {
+                // Resuming during setup would start a loader while the
+                // installer is replacing the same binaries (start_setup
+                // clears retry_offer for this exact hazard).
+                self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
             } else {
-                self.queue.push_back(pj.job);
-                self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+                let pj = self.paused.remove(i);
+                if self.jobs.len() < MAX_CONCURRENT {
+                    self.spawn_job(ctx, pj.job, false);
+                    self.set_status(StatusKind::None, format!("«{}»: продолжаю…", pj.label));
+                } else {
+                    self.queue.push_back(pj.job);
+                    self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+                }
             }
         }
         if let Some(i) = drop_idx {
@@ -2110,7 +2138,13 @@ impl SnatchApp {
         // problem and still gets the forced centered layout.
         let can = !self.url.trim().is_empty()
             && !self.out_dir.trim().is_empty()
-            && (self.tc.yt_dlp.is_some() || self.tc.aria2c.is_some());
+            && match self.effective_engine() {
+                // Enabling the CTA while only the *other* engine is installed
+                // would build a command that fails and silently drops the link.
+                "yt-dlp" => self.tc.yt_dlp.is_some(),
+                "aria2" => self.tc.aria2c.is_some(),
+                _ => false,
+            };
         let width = ui.available_width();
         let accent = ui.visuals().hyperlink_color;
         // The mockup's source text is lowercase, but its CSS has

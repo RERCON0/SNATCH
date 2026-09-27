@@ -1,0 +1,4 @@
+# Статическая линковка MSVC CRT: собранные exe запускаются на чистой Windows
+# без установленного Visual C++ Redistributable (VCRUNTIME140.dll, MSVCP140.dll).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
