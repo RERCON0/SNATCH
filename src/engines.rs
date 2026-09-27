@@ -669,6 +669,25 @@ fn aria2_foreign_target(url: &str, out: &Path) -> bool {
         && !name.is_empty() && out.join(name).exists() && !aria2_owned_partial(url, out)
 }
 
+/// F1 (audit 4): a foreign pair - same-name file plus a `.aria2` control file
+/// that our origin records cannot claim. aria2 auto-continues such a partial
+/// even without `-c`, mixing another URL's bytes into the result, so the pair
+/// must not be touched: refuse before the loader runs (delete is the user's
+/// call, not ours). Returns the file name for messages.
+fn aria2_foreign_pair(url: &str, out: &Path) -> Option<String> {
+    if !ALLOWED_SCHEMES.contains(&scheme_of(url).as_str()) {
+        return None;
+    }
+    let name = url_basename(url);
+    if name.is_empty() {
+        return None;
+    }
+    (out.join(&name).is_file()
+        && out.join(format!("{name}.aria2")).is_file()
+        && !aria2_owned_partial(url, out))
+        .then_some(name)
+}
+
 /// Hold the OS lock from before build() until the child process exits. The
 /// GUI tries once (never block its render thread); CLI jobs wait their turn.
 /// Stable lock files are never deleted, or another process could lock a new
@@ -765,6 +784,16 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
         cmd.push("--no-conf".into());
         cmd.push("-d".into());
         cmd.push(out.clone().into_os_string());
+        // F1: a same-name file WITH a .aria2 control file is auto-continued by
+        // aria2 even without -c, silently mixing two sources' bytes. Our own
+        // partials carry an origin fingerprint; anything else must stop here.
+        if let Some(name) = aria2_foreign_pair(&job.url, &out) {
+            return Err(format!(
+                "«{name}» и его файл докачки .aria2 оставлены прерванной загрузкой другого URL — \
+                 aria2 продолжил бы чужой файл. Проверьте и удалите их (или выберите другую \
+                 папку), после чего повторите."
+            ));
+        }
         // -c only affects HTTP/FTP; keep torrent/magnet options as before.
         let resume = !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str())
             || aria2_owned_partial(&job.url, &out);
@@ -798,6 +827,15 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     }
     if let Some(aria2c) = &tc.aria2c {
         if is_direct_download(&job.url) {
+            // F1: aria2 auto-continues a same-name foreign partial even
+            // without -c; refuse instead of mixing two sources' bytes.
+            if let Some(name) = aria2_foreign_pair(&job.url, &out) {
+                return Err(format!(
+                    "«{name}» и его файл докачки .aria2 оставлены прерванной загрузкой другого \
+                     URL — внешний загрузчик aria2 продолжил бы чужой файл. Проверьте и удалите \
+                     их (или выберите другую папку), после чего повторите."
+                ));
+            }
             // yt-dlp decides the actual destination name, which may differ
             // from the URL basename. Never enable -c on that unknown target.
             cmd.push("--external-downloader".into());
@@ -844,16 +882,23 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool) -> Vec<String> {
             );
         }
     }
-    // E-1: warn before the collision-driven rename so "the file landed as
-    // name.1" is expected, not a surprise.
-    if (job.engine == "aria2" || (job.engine == "yt-dlp" && is_direct_download(&job.url)))
-        && aria2_foreign_target(&job.url, &absolute_out_dir(&job.out_dir))
-    {
-        warns.push(
-            "В папке уже есть файл с таким же именем, но без данных докачки — он не будет \
-             перезаписан: новая загрузка сохранится рядом под другим именем."
-                .to_string(),
-        );
+    // E-1/F1: collision feedback. A bare file is renamed around; a foreign
+    // file+control pair stops the job (aria2 would auto-continue it).
+    let out = absolute_out_dir(&job.out_dir);
+    if job.engine == "aria2" || (job.engine == "yt-dlp" && is_direct_download(&job.url)) {
+        if let Some(name) = aria2_foreign_pair(&job.url, &out) {
+            warns.push(format!(
+                "В папке есть «{name}» с данными докачки от другой загрузки — загрузка будет \
+                 остановлена, чтобы aria2 не продолжил чужой файл. Проверьте и удалите их \
+                 (или выберите другую папку)."
+            ));
+        } else if aria2_foreign_target(&job.url, &out) {
+            warns.push(
+                "В папке уже есть файл с таким же именем, но без данных докачки — он не будет \
+                 перезаписан: новая загрузка сохранится рядом под другим именем."
+                    .to_string(),
+            );
+        }
     }
     warns
 }
@@ -1087,15 +1132,19 @@ mod tests {
         assert!(preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
 
         // A stray .aria2 is not proof of ownership: it could be another URL's.
+        // aria2 auto-continues such a file+control pair EVEN WITHOUT -c
+        // (audit F1), so the build must refuse rather than let two sources'
+        // bytes mix - for the aria2 engine and the external-downloader branch.
         std::fs::write(out.join("file.bin.aria2"), b"ctl").unwrap();
-        let s = args_of(&build(&job, &tc_aria2()).unwrap());
-        assert!(!s.contains(&"-c".to_string()), "{s:?}");
-        assert!(preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+        let err = build(&job, &tc_aria2()).unwrap_err();
+        assert!(err.contains("докачки"), "{err}");
+        assert!(preflight_warning(&job).iter().any(|w| w.contains("будет остановлена")));
+        let as_ytdlp = Job { engine: "yt-dlp".into(), ..job.clone() };
+        assert!(build(&as_ytdlp, &tc_both()).is_err());
         std::fs::remove_file(out.join("file.bin.aria2")).unwrap();
 
         // yt-dlp's external-downloader branch gets the collision-safe args too.
-        let job = Job { engine: "yt-dlp".into(), ..job };
-        let s = args_of(&build(&job, &tc_both()).unwrap());
+        let s = args_of(&build(&as_ytdlp, &tc_both()).unwrap());
         let i = s.iter().position(|a| a == "--external-downloader-args").unwrap();
         let args = &s[i + 1];
         assert!(args.contains("--auto-file-renaming=true"), "{args}");
