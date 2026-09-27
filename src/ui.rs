@@ -18,42 +18,68 @@ pub fn clip(text: &str, width: usize) -> String {
 /// shouldn't show them either - picking one only produces a confusing
 /// access-denied deep inside the download.
 #[cfg(windows)]
-fn hidden_or_system(p: &Path) -> bool {
+fn meta_hidden_or_system(m: &std::fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
     const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
-    std::fs::metadata(p)
-        .map(|m| m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0)
-        .unwrap_or(false)
+    m.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
 }
 
 #[cfg(not(windows))]
-fn hidden_or_system(_p: &Path) -> bool {
+fn meta_hidden_or_system(_m: &std::fs::Metadata) -> bool {
     false
 }
 
+/// Full directory listing. The CLI's `More(n)` pagination depends on the
+/// real total, so this must never cap the scan.
 pub fn safe_read_dirs(path: &Path) -> Vec<PathBuf> {
+    safe_read_dirs_limited(path, usize::MAX).0
+}
+
+/// `safe_read_dirs` with a bounded scan: enumeration stops once
+/// `examine_limit` directory entries have been examined, and the bool
+/// reports whether more entries remained. The cap counts raw directory
+/// entries, before filtering; filters and sorting are otherwise identical
+/// to `safe_read_dirs`. The GUI uses this so a huge or slow directory can't
+/// stall the UI thread for an unbounded time.
+pub fn safe_read_dirs_limited(path: &Path, examine_limit: usize) -> (Vec<PathBuf>, bool) {
     if crate::engines::is_unc_path(path) {
-        return Vec::new();
+        return (Vec::new(), false);
     }
-    let mut out: Vec<PathBuf> = match std::fs::read_dir(path) {
-        Ok(entries) => entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.is_dir()
-                    && !p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with('.') || n.starts_with('$'))
-                    && !hidden_or_system(p)
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let mut truncated = false;
+    let mut out: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for (examined, entry) in entries.flatten().enumerate() {
+            if examined >= examine_limit {
+                truncated = true;
+                break;
+            }
+            // Name check first: `.hidden`/`$SYS` reject without any attribute
+            // work. A non-UTF-8 name keeps the old behaviour (not filtered).
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with('.') || n.starts_with('$'))
+            {
+                continue;
+            }
+            // One DirEntry serves both remaining checks: on Windows
+            // file_type() and metadata() come from the data cached by the
+            // directory enumeration, so unlike the old Path::is_dir() +
+            // fs::metadata() pair these add no extra path-based queries.
+            let Ok(ft) = entry.file_type() else { continue };
+            if !ft.is_dir() {
+                continue;
+            }
+            if !entry.metadata().map(|m| meta_hidden_or_system(&m)).unwrap_or(false) {
+                out.push(entry.path());
+            }
+        }
+    }
     out.sort_by_cached_key(|p| {
         p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
     });
-    out
+    (out, truncated)
 }
 
 #[cfg(test)]
@@ -81,6 +107,39 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["visible".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn safe_read_dirs_limited_caps_and_reports_truncation() {
+        let dir = std::env::temp_dir().join(format!("snatch-rs-dirs-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for i in 0..10 {
+            std::fs::create_dir_all(dir.join(format!("dir-{i:02}"))).unwrap();
+        }
+
+        // Below the cap: full list, same as the unbounded variant, no flag.
+        let (all, truncated) = safe_read_dirs_limited(&dir, 100);
+        assert_eq!(all.len(), 10);
+        assert!(!truncated);
+        assert_eq!(all, safe_read_dirs(&dir));
+
+        // Exactly the entry count: everything was examined, nothing remained.
+        let (exact, truncated) = safe_read_dirs_limited(&dir, 10);
+        assert_eq!(exact.len(), 10);
+        assert!(!truncated);
+
+        // Past the cap: enumeration stops at the limit and the flag is set.
+        let (capped, truncated) = safe_read_dirs_limited(&dir, 4);
+        assert!(truncated);
+        assert_eq!(capped.len(), 4);
+        assert!(capped.iter().all(|p| all.contains(p)));
+
+        // Zero limit on a non-empty directory lists nothing but reports it.
+        let (none, truncated) = safe_read_dirs_limited(&dir, 0);
+        assert!(none.is_empty());
+        assert!(truncated);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

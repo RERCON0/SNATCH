@@ -18,11 +18,16 @@ use snatch_rs::engines::{
 };
 use snatch_rs::setup::{install_aria2, install_yt_dlp};
 use snatch_rs::tools::{bootstrap_dir, Toolchain};
-use snatch_rs::ui::{clip, safe_read_dirs};
+use snatch_rs::ui::{clip, safe_read_dirs_limited};
 use snatch_rs::{BANNER, TELEGRAM_URL};
 
 const APP_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " — by rercon prod.");
 const MAX_LOG_LINES: usize = 500;
+/// Folder browser: examine at most this many directory entries per listing
+/// (the rendered list is separately capped at 500 rows). Bounds navigation
+/// on huge or slow directories; `safe_read_dirs_limited` reports truncation
+/// so the UI can say so honestly.
+const DIR_BROWSER_SCAN_CAP: usize = 4000;
 // Wider than the 40px window-control buttons (─/□/×): "день"/"ночь" at the
 // title bar's 12.5pt Cascadia Mono need more room than a single glyph.
 #[cfg(windows)]
@@ -252,6 +257,8 @@ struct DirBrowser {
     open: bool,
     current: PathBuf,
     entries: Vec<PathBuf>,
+    /// The last listing hit `DIR_BROWSER_SCAN_CAP`: more entries may exist.
+    truncated: bool,
     listed_for: Option<PathBuf>,
 }
 
@@ -568,6 +575,37 @@ fn accent_button(accent: egui::Color32, text: impl Into<String>) -> egui::Button
         .fill(egui::Color32::TRANSPARENT)
 }
 
+/// `egui::Spinner` with a bounded repaint cadence. The stock widget calls
+/// `Context::request_repaint()` ("because it is animated") on every paint,
+/// which pins eframe/winit to the full refresh rate for as long as the
+/// spinner is visible - minutes during torrent metadata resolution or the
+/// Device Flow login wait. This draws the same arc (same size, color, 20
+/// points, 240° sweep) but asks for the next frame ~66 ms out (~15 fps);
+/// status updates and input still repaint immediately.
+fn slow_spinner(ui: &mut egui::Ui) {
+    let size = ui.style().spacing.interact_size.y;
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    response.widget_info(|| egui::WidgetInfo::new(egui::WidgetType::ProgressIndicator));
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.ctx().request_repaint_after(Duration::from_millis(66));
+    let radius = (rect.height() / 2.0) - 2.0;
+    let n_points = 20;
+    let time = ui.input(|i| i.time);
+    let start_angle = time * std::f64::consts::TAU;
+    let end_angle = start_angle + 240f64.to_radians() * time.sin();
+    let points: Vec<egui::Pos2> = (0..n_points)
+        .map(|i| {
+            let angle = egui::lerp(start_angle..=end_angle, i as f64 / n_points as f64);
+            let (sin, cos) = angle.sin_cos();
+            rect.center() + radius * egui::vec2(cos as f32, sin as f32)
+        })
+        .collect();
+    let color = ui.visuals().strong_text_color();
+    ui.painter().add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
+}
+
 /// A fixed-width bar slot and two fixed-height buttons. `allocate_ui` cannot
 /// reserve the empty/spinner slot here: it advances by the *used* child width,
 /// shifting both buttons left when progress is not known yet. The usual 10px
@@ -602,7 +640,7 @@ fn job_controls(
                     .desired_width(bar_w).desired_height(HEIGHT));
             } else {
                 bar_ui.horizontal(|ui| {
-                    ui.spinner();
+                    slow_spinner(ui);
                     ui.weak(waiting_text);
                 });
             }
@@ -760,6 +798,22 @@ fn list_drives() -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Drive letter (`C` etc.) of a rooted local path, uppercased for
+/// comparison. `None` for UNC/device/relative paths - those aren't letters
+/// `list_drives()` can ever report, so callers treat them as unknown roots.
+#[cfg(windows)]
+fn path_drive_letter(p: &Path) -> Option<u8> {
+    match p.components().next()? {
+        std::path::Component::Prefix(pre) => match pre.kind() {
+            std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+                Some(letter.to_ascii_uppercase())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl SnatchApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let cfg = Config::load();
@@ -813,6 +867,7 @@ impl SnatchApp {
                 open: false,
                 current: PathBuf::new(),
                 entries: Vec::new(),
+                truncated: false,
                 listed_for: None,
             },
             drives,
@@ -1880,7 +1935,19 @@ impl SnatchApp {
             self.set_status(StatusKind::Err, "Сетевую UNC-папку нельзя открывать. Выберите локальную папку.");
             return;
         }
-        let start = if typed.is_dir() {
+        // Probe only volumes the OS currently reports as logical drives. A
+        // stale out_dir on a removed USB stick / disconnected mapping would
+        // otherwise block the UI thread inside GetFileAttributes until the
+        // device times out - the same stall class list_drives() avoids at
+        // startup (see its comment above). Unknown roots open at home.
+        #[cfg(windows)]
+        let root_known = path_drive_letter(&typed)
+            .is_some_and(|letter| self.drives.iter().any(|d| path_drive_letter(d) == Some(letter)));
+        #[cfg(not(windows))]
+        let root_known = true;
+        let start = if !root_known {
+            home_dir().unwrap_or_else(|| PathBuf::from("."))
+        } else if typed.is_dir() {
             typed
         } else if let Some(parent) = typed.parent().filter(|p| !is_unc_path(p) && p.is_dir()) {
             parent.to_path_buf()
@@ -1898,7 +1965,13 @@ impl SnatchApp {
         }
         let opened_this_frame = self.browser.listed_for.is_none();
         if self.browser.listed_for.as_ref() != Some(&self.browser.current) {
-            self.browser.entries = safe_read_dirs(&self.browser.current);
+            // Capped scan: a huge or slow directory lists up to
+            // DIR_BROWSER_SCAN_CAP entries instead of freezing the UI thread
+            // for the whole traversal.
+            let (entries, truncated) =
+                safe_read_dirs_limited(&self.browser.current, DIR_BROWSER_SCAN_CAP);
+            self.browser.entries = entries;
+            self.browser.truncated = truncated;
             self.browser.listed_for = Some(self.browser.current.clone());
         }
 
@@ -1908,6 +1981,7 @@ impl SnatchApp {
         let mut navigate: Option<PathBuf> = None;
         let cur = self.browser.current.clone();
         let entries = &self.browser.entries;
+        let truncated = self.browser.truncated;
         let home = home_dir().unwrap_or_default();
         let drives = self.drives.clone();
 
@@ -1959,7 +2033,23 @@ impl SnatchApp {
                             }
                         }
                         if entries.is_empty() {
-                            ui.weak("(нет вложенных папок)");
+                            if truncated {
+                                ui.weak(format!(
+                                    "… среди первых {DIR_BROWSER_SCAN_CAP} записей вложенных папок нет"
+                                ));
+                            } else {
+                                ui.weak("(нет вложенных папок)");
+                            }
+                        } else if truncated {
+                            // The scan stopped at DIR_BROWSER_SCAN_CAP: the
+                            // tail is simply not listed, no navigation
+                            // reveals it - say so instead of pretending the
+                            // list is complete.
+                            ui.weak(format!(
+                                "… каталог очень большой: из первых {DIR_BROWSER_SCAN_CAP} записей \
+                                 показаны первые {shown} папок — выберите подпапку или откройте \
+                                 папку заново"
+                            ));
                         } else if entries.len() > shown {
                             // The old "поднимитесь выше" advice was a lie:
                             // the list is alphabetical and the tail is simply
@@ -2118,7 +2208,7 @@ impl SnatchApp {
 
         if self.phase == Phase::Setup {
             ui.horizontal(|ui| {
-                ui.spinner();
+                slow_spinner(ui);
                 ui.label("скачиваю yt-dlp и aria2c…");
             });
             return;
