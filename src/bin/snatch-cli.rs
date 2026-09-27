@@ -176,37 +176,9 @@ fn download_with_discovery(
         }
     };
 
-    let job = Job {
-        engine: plan.engine.clone(),
-        url: url.clone(),
-        out_dir: PathBuf::from(&plan.out_dir),
-        fmt: plan.fmt.clone(),
-        cookies_browser: plan.cookies_browser.clone(),
-    };
-    for warn in preflight_warning(&job) {
-        errln(format!("⚠ {warn}"));
-    }
-
-    let cmd = match cli_command(&job, tc, plan.no_continue, false) {
-        Ok(c) => c,
-        Err(e) => {
-            errln(format!("✘ {e}"));
-            return RunResult { code: 2, auth_hint: false };
-        }
-    };
-    let result = engines::run(&cmd, plan.engine == "yt-dlp");
-    match result.code {
-        0 => {
-            cfg.remember_url(&url);
-            cfg.remember_dir(&plan.out_dir);
-            cfg.save();
-            outln(format!("✔ Готово: {}", plan.out_dir));
-        }
-        130 => outln("Прервано пользователем (файл можно докачать той же командой)."),
-        127 => errln("✘ Не удалось запустить загрузчик (бинарник пропал или не исполняем)."),
-        c => errln(format!("✘ Ошибка (код {c}).")),
-    }
-    result
+    let clean_plan = Plan { url, ..plan.clone() };
+    run_batch(std::slice::from_ref(&clean_plan), cfg, tc, 1)
+        .into_iter().next().expect("one queued job has one result")
 }
 
 enum BatchEvent {
@@ -218,41 +190,6 @@ enum BatchEvent {
 
 fn clean_loader_text(text: &str) -> String {
     engines::sanitize_child_output(text).replace('\r', "\n")
-}
-
-fn aria2_stat(line: &str) -> Option<String> {
-    let start = line.find("[#")?;
-    let end = start + line[start..].find(']')?;
-    let summary = &line[start..=end];
-    let percent = (engines::parse_progress(summary)? * 100.0).round() as u32;
-    let amount = summary.split_whitespace().nth(1)?.split('(').next()?;
-    if let Some(start) = line.find("[FileAlloc:") {
-        let alloc = line[start..].split(']').next()?.split_whitespace().nth(1)?;
-        if !alloc.ends_with("(100%)") {
-            return Some(format!("{percent}% · {amount} · выделение места {}", alloc.replace('(', " (")));
-        }
-    }
-    let field = |key: &str| {
-        summary
-            .split_whitespace()
-            .find_map(|part| part.strip_prefix(key))
-            .unwrap_or("–")
-            .trim_end_matches(']')
-    };
-    let dl = field("DL:");
-    let peers = field("CN:");
-    let seeds = field("SD:");
-    Some(format!("{percent}% · {amount} · ↓{dl}/с · сиды {seeds} · соединения {peers}"))
-}
-
-fn name_from_file(line: &str) -> Option<String> {
-    let file = line.strip_prefix("FILE:")?.trim();
-    let multi_file = file.ends_with("more)");
-    let path = if multi_file { file.rsplit_once(" (")?.0 } else { file };
-    let mut parts = path.rsplit(['/', '\\']);
-    let file = parts.next()?.trim();
-    let name = if multi_file { parts.next().unwrap_or(file) } else { file };
-    (!name.is_empty()).then(|| name.to_string())
 }
 
 fn batch_name(url: &str) -> String {
@@ -410,12 +347,14 @@ fn read_batch_pipe(
             if line.contains("Download Progress Summary as of")
                 || line.chars().all(|c| c == '-' || c == '=')
             { continue; }
-            if let Some(name) = name_from_file(line) {
+            if line.starts_with("FILE:") && line.contains("[MEMORY][METADATA]") {
+                latest = Some("получение метаданных торрента…".into());
+            } else if let Some(name) = engines::aria2_name_from_file(line) {
                 if last_file.as_deref() != Some(&name) {
                     last_file = Some(name.clone());
                     let _ = tx.send(BatchEvent::Name(id, name));
                 }
-            } else if let Some(stat) = aria2_stat(line) {
+            } else if let Some(stat) = engines::aria2_stat(line) {
                 latest = Some(stat);
             } else if engines::parse_progress(line).is_some() {
                 latest = Some(clip(line, 90));
@@ -522,6 +461,7 @@ fn run_batch_with(
     let queue = Arc::new(Mutex::new((0..plans.len()).collect::<VecDeque<_>>()));
     let (tx, rx) = mpsc::channel();
     let mut results: Vec<Option<RunResult>> = (0..plans.len()).map(|_| None).collect();
+    let mut missing_control = vec![false; plans.len()];
     let mut display = BatchDisplay::new(plans);
     std::thread::scope(|scope| {
         let run = &run;
@@ -546,7 +486,18 @@ fn run_batch_with(
         drop(tx);
         for event in rx {
             match event {
-                BatchEvent::Line(id, line) => display.diagnostic(id, &line),
+                BatchEvent::Line(id, line) => {
+                    if plans[id].engine == "aria2" && engines::aria2_missing_control(&line) {
+                        if !missing_control[id] {
+                            missing_control[id] = true;
+                            display.diagnostic(id, engines::ARIA2_MISSING_CONTROL_HINT);
+                        }
+                    } else if plans[id].engine != "aria2"
+                        || !(line.contains("Exception caught") || line.starts_with("(OK):")
+                            || line.starts_with("If there are any errors")) {
+                        display.diagnostic(id, &line);
+                    }
+                }
                 BatchEvent::Name(id, name) => display.update(id, None, Some(name)),
                 BatchEvent::Progress(id, line) => display.update(id, Some(line), None),
                 BatchEvent::Finished(id, url, dir, result) => {
@@ -555,6 +506,8 @@ fn run_batch_with(
                         cfg.remember_dir(&dir);
                         cfg.save();
                         display.finished(id, format!("✔ Готово: {dir}"));
+                    } else if missing_control[id] {
+                        display.finished(id, "✘ Файлы уже есть, но нет .aria2 — выберите пустую папку".into());
                     } else {
                         display.finished(id, format!("✘ Ошибка (код {}). См. сообщения выше.", result.code));
                     }
@@ -1214,7 +1167,7 @@ mod tests {
         assert!(matches!(&events[2], BatchEvent::Progress(0, line) if line.contains("выделение места 1.1GiB/3.3GiB (33%)")));
         assert!(!events.iter().any(|e| matches!(e, BatchEvent::Line(..))));
         assert!(!clean_loader_text("\x1b[1;32mNOTICE\x1b[0m").contains("[1;32m"));
-        let stat = aria2_stat("[#50e13e 880KiB/0.9MiB(88%) CN:1 SD:4 DL:812KiB UL:14KiB]").unwrap();
+        let stat = engines::aria2_stat("[#50e13e 880KiB/0.9MiB(88%) CN:1 SD:4 DL:812KiB UL:14KiB]").unwrap();
         assert!(stat.contains("88% · 880KiB/0.9MiB · ↓812KiB/с · сиды 4 · соединения 1"), "{stat}");
     }
 

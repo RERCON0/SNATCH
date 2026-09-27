@@ -30,6 +30,8 @@ pub struct Config {
     pub dirs: Vec<String>,
     /// Incremented by clear-history so a stale GUI can't resurrect old links.
     pub history_epoch: u64,
+    /// GUI theme, persisted so it doesn't reset to dark every launch.
+    pub dark_mode: bool,
     #[serde(skip)]
     history_cleared: bool,
 }
@@ -48,6 +50,10 @@ fn list_field(obj: Option<&serde_json::Map<String, Value>>, key: &str) -> Vec<St
         .unwrap_or_default()
 }
 
+fn bool_field(obj: Option<&serde_json::Map<String, Value>>, key: &str, default: bool) -> bool {
+    obj.and_then(|o| o.get(key)).and_then(Value::as_bool).unwrap_or(default)
+}
+
 pub fn sanitize(data: &Value) -> Config {
     let obj = data.as_object();
     Config {
@@ -57,6 +63,7 @@ pub fn sanitize(data: &Value) -> Config {
         dirs: list_field(obj, "dirs"),
         history_epoch: obj.and_then(|o| o.get("history_epoch"))
             .and_then(Value::as_u64).unwrap_or(0),
+        dark_mode: bool_field(obj, "dark_mode", true),
         history_cleared: false,
     }
 }
@@ -128,6 +135,7 @@ impl Config {
                     default_dir: self.default_dir.clone(), last_dir: self.last_dir.clone(),
                     urls: self.urls.clone(), dirs: self.dirs.clone(),
                     history_epoch: disk.history_epoch.saturating_add(1),
+                    dark_mode: self.dark_mode,
                     history_cleared: false,
                 }
             } else {
@@ -138,6 +146,7 @@ impl Config {
                     urls: merge_history(&self.urls, &disk.urls, same_epoch),
                     dirs: merge_history(&self.dirs, &disk.dirs, same_epoch),
                     history_epoch: disk.history_epoch,
+                    dark_mode: self.dark_mode,
                     history_cleared: false,
                 }
             };
@@ -329,5 +338,22 @@ mod tests {
         let p = std::env::temp_dir().join("snatch-rs-nope").join("config.json");
         let cfg = Config::load_from(&p);
         assert!(!cfg.default_dir.is_empty());
+    }
+
+    #[test]
+    fn dark_mode_defaults_true_and_persists() {
+        let cfg = sanitize(&Value::Null);
+        assert!(cfg.dark_mode);
+        let cfg = sanitize(&json!({"dark_mode": false}));
+        assert!(!cfg.dark_mode);
+
+        let dir = std::env::temp_dir().join(format!("snatch-rs-config-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut cfg = Config::load_from(&p);
+        cfg.dark_mode = false;
+        cfg.save_to(&p);
+        assert!(!Config::load_from(&p).dark_mode);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

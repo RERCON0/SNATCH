@@ -26,6 +26,14 @@ pub const FILE_EXT: &[&str] = &[
 pub const ALLOWED_SCHEMES: &[&str] = &["http", "https", "ftp"];
 pub const TORRENT_FILES: &[&str] = &[".torrent", ".metalink", ".meta4"];
 
+pub const ARIA2_MISSING_CONTROL_HINT: &str = "Файлы этой раздачи уже есть, но файл докачки .aria2 отсутствует. Чтобы не стереть данные, загрузка остановлена. Выберите новую пустую папку; не включайте перезапись существующих файлов.";
+
+pub fn aria2_missing_control(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("errorcode=13") && lower.contains("control file")
+        && lower.contains(".aria2") && lower.contains("does not exist")
+}
+
 pub const COOKIES_BROWSERS: &[&str] = &[
     "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale",
 ];
@@ -98,6 +106,41 @@ pub fn parse_progress(line: &str) -> Option<f32> {
         }
     }
     None
+}
+
+/// Concise status for aria2's live summary. The leading [#gid] group holds
+/// download progress; [FileAlloc:...] is a separate allocation stage, not a
+/// second file's percentage. Used by both terminal and GUI frontends.
+pub fn aria2_stat(line: &str) -> Option<String> {
+    let start = line.find("[#")?;
+    let end = start + line[start..].find(']')?;
+    let summary = &line[start..=end];
+    let percent = (parse_progress(summary)? * 100.0).round() as u32;
+    let amount = summary.split_whitespace().nth(1)?.split('(').next()?;
+    if let Some(start) = line.find("[FileAlloc:") {
+        let alloc = line[start..].split(']').next()?.split_whitespace().nth(1)?;
+        if !alloc.ends_with("(100%)") {
+            return Some(format!("{percent}% · {amount} · выделение места {}", alloc.replace('(', " (")));
+        }
+    }
+    let field = |key: &str| {
+        summary.split_whitespace().find_map(|part| part.strip_prefix(key))
+            .unwrap_or("–").trim_end_matches(']')
+    };
+    let dl = field("DL:");
+    let peers = field("CN:");
+    let seeds = field("SD:");
+    Some(format!("{percent}% · {amount} · ↓{dl}/с · сиды {seeds} · соединения {peers}"))
+}
+
+pub fn aria2_name_from_file(line: &str) -> Option<String> {
+    let file = line.strip_prefix("FILE:")?.trim();
+    let multi_file = file.ends_with("more)");
+    let path = if multi_file { file.rsplit_once(" (")?.0 } else { file };
+    let mut parts = path.rsplit(['/', '\\']);
+    let file = parts.next()?.trim();
+    let name = if multi_file { parts.next().unwrap_or(file) } else { file };
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 pub struct RunResult {
@@ -408,6 +451,18 @@ pub fn is_direct_download(url: &str) -> bool {
         && FILE_EXT.contains(&suffix_of(&percent_decode(&path_from_url(url))).as_str())
 }
 
+fn is_bittorrent_input(url: &str) -> bool {
+    if scheme_of(url) == "magnet" {
+        return true;
+    }
+    let suffix = if scheme_of(url).is_empty() {
+        suffix_of(url)
+    } else {
+        suffix_of(&percent_decode(&path_from_url(url)))
+    };
+    suffix == ".torrent"
+}
+
 pub fn validate_cookies_browser(value: &str) -> Result<(), String> {
     if has_control_chars(value) {
         return Err(format!(
@@ -488,6 +543,14 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
         cmd.push(out.into_os_string());
         for a in ARIA2_RESUME.iter().chain(ARIA2_WORKERS) {
             cmd.push((*a).into());
+        }
+        if is_bittorrent_input(&job.url) {
+            // aria2 normally preallocates every file and saves its .aria2
+            // control file only once a minute. If the GUI is killed during
+            // preallocation (e.g. by an AV), it leaves huge files without
+            // control data; the next run safely refuses them with code 13.
+            cmd.push("--file-allocation=none".into());
+            cmd.push("--auto-save-interval=1".into());
         }
         cmd.push("--".into());
         cmd.push(OsString::from(&job.url));
@@ -805,7 +868,27 @@ mod tests {
         assert!(s.contains(&"--max-tries=10".to_string()));
         // without it aria2c seeds until ratio 1.0 and never exits
         assert!(s.contains(&"--seed-time=0".to_string()));
+        assert!(s.contains(&"--file-allocation=none".to_string()));
+        assert!(s.contains(&"--auto-save-interval=1".to_string()));
+        assert!(!s.iter().any(|a| a.starts_with("--allow-overwrite")));
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn bittorrent_flags_apply_to_local_file_but_not_direct_http() {
+        let out = tmp_out();
+        let job = Job {
+            engine: "aria2".into(),
+            url: r"C:\Torrents\[DL] Cuphead [RUS + ENG].torrent".into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+        };
+        let bt = build(&job, &tc_aria2()).unwrap();
+        assert!(bt.iter().any(|a| a == "--auto-save-interval=1"));
+        let direct = Job { url: "https://host/file.zip".into(), ..job };
+        let http = build(&direct, &tc_aria2()).unwrap();
+        assert!(!http.iter().any(|a| a == "--auto-save-interval=1"));
+        assert!(!http.iter().any(|a| a == "--file-allocation=none"));
+        std::fs::remove_dir_all(out).ok();
     }
 
     #[test]
@@ -1073,6 +1156,26 @@ mod tests {
         // a percentage inside a title/path is not progress
         assert_eq!(parse_progress("[download] Destination: C:\\v\\Progress (100%).mp4"), None);
         assert_eq!(parse_progress("[Merger] Merging (50%) something"), None);
+    }
+
+    #[test]
+    fn aria2_status_distinguishes_allocation_from_download() {
+        let allocating = "[#bc1f6e 0B/6.8GiB(0%) CN:0 SD:0 DL:0B] [FileAlloc:#bc1f6e 1.1GiB/3.3GiB(33%)]";
+        assert_eq!(aria2_stat(allocating).as_deref(),
+            Some("0% · 0B/6.8GiB · выделение места 1.1GiB/3.3GiB (33%)"));
+        let downloading = "[#25017a 361MiB/6.8GiB(5%) CN:30 SD:5 DL:4.1MiB ETA:26m46s]";
+        assert_eq!(aria2_stat(downloading).as_deref(),
+            Some("5% · 361MiB/6.8GiB · ↓4.1MiB/с · сиды 5 · соединения 30"));
+        assert_eq!(aria2_name_from_file("FILE: C:/Downloads/Cuphead_1.3.9/setup.bin (7more)").as_deref(),
+            Some("Cuphead_1.3.9"));
+    }
+
+    #[test]
+    fn aria2_missing_control_error_is_specific_not_every_code_13() {
+        let detail = "Exception: [RequestGroup.cc:436] errorCode=13 File C:/Downloads/Cuphead exists, but a control file(*.aria2) does not exist.";
+        assert!(aria2_missing_control(detail));
+        assert!(!aria2_missing_control("errorCode=13 permission denied"));
+        assert!(!aria2_missing_control("control file(*.aria2) does not exist"));
     }
 
     #[test]
