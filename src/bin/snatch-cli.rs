@@ -18,7 +18,7 @@ use inquire::{Confirm, Select, Text};
 
 use snatch_rs::config::Config;
 use snatch_rs::engines::{
-    self, batch_name, build, detect_engine, is_unc_path, preflight_warning,
+    self, batch_name, detect_engine, is_unc_path, preflight_warning,
     validate_cookies_browser, validate_url, Job, RunResult, COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
 };
 #[cfg(windows)]
@@ -26,6 +26,7 @@ use snatch_rs::setup::{install_aria2, install_yt_dlp};
 #[cfg(windows)]
 use snatch_rs::tools::bootstrap_dir;
 use snatch_rs::tools::Toolchain;
+use snatch_rs::torrent;
 use snatch_rs::ui::{clip, safe_read_dirs};
 use snatch_rs::{errln, outln, BANNER, TELEGRAM_URL};
 
@@ -94,6 +95,9 @@ struct Plan {
     out_dir: String,
     cookies_browser: Option<String>,
     no_continue: bool,
+    /// Torrent file selection plus the metadata fetched while listing;
+    /// default = every file, aria2 fetches the metadata itself.
+    torrent: torrent::Choice,
 }
 
 fn plan_from_args(args: &Args) -> Option<Plan> {
@@ -110,6 +114,7 @@ fn plan_from_args(args: &Args) -> Option<Plan> {
         out_dir: output.clone(),
         cookies_browser: args.cookies_browser.clone(),
         no_continue: args.no_continue,
+        torrent: torrent::Choice::default(),
     })
 }
 
@@ -120,7 +125,11 @@ fn plans_from_args(args: &Args) -> Option<Vec<Plan>> {
         plans.push(Plan {
             url: url.clone(),
             engine: args.engine.clone().unwrap_or_else(|| detect_engine(url).to_string()),
-            ..plans[0].clone()
+            fmt: plans[0].fmt.clone(),
+            out_dir: plans[0].out_dir.clone(),
+            cookies_browser: plans[0].cookies_browser.clone(),
+            no_continue: plans[0].no_continue,
+            torrent: torrent::Choice::default(),
         });
     }
     Some(plans)
@@ -131,8 +140,9 @@ fn cli_command(
     tc: &Toolchain,
     no_continue: bool,
     batch: bool,
+    choice: &torrent::Choice,
 ) -> Result<Vec<std::ffi::OsString>, String> {
-    let mut cmd = build(job, tc)?;
+    let mut cmd = engines::build_for_run(job, tc, choice)?;
     let at = cmd.len().saturating_sub(2);
     if no_continue && job.engine == "yt-dlp" {
         cmd.insert(at, "--no-continue".into());
@@ -146,6 +156,150 @@ fn cli_command(
     }
     Ok(cmd)
 }
+
+/// Outcome of [`ask_torrent_files`].
+enum TorrentAsk {
+    /// Download this link with that selection.
+    Use(torrent::Choice),
+    /// Leave just this link out; the other links of the session stay.
+    Skip,
+    /// The user cancelled the whole interactive flow (Esc).
+    Cancel,
+}
+
+/// Release panics abort without Drop, so terminal cleanup also has a panic
+/// hook. During metadata/picking, console Ctrl+C cancels the active operation.
+mod picker_console {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    pub static CANCEL: AtomicBool = AtomicBool::new(false);
+    static LISTEN: AtomicBool = AtomicBool::new(false);
+    static RAW: AtomicBool = AtomicBool::new(false);
+    static ALTERNATE: AtomicBool = AtomicBool::new(false);
+
+    pub fn restore() {
+        if !RAW.swap(false, Ordering::SeqCst) { return; }
+        let _ = crossterm::terminal::disable_raw_mode();
+        let mut out = std::io::stdout();
+        if ALTERNATE.swap(false, Ordering::SeqCst) {
+            let _ = crossterm::execute!(out, crossterm::terminal::LeaveAlternateScreen);
+        }
+        let _ = crossterm::execute!(out, crossterm::cursor::Show);
+    }
+
+    #[cfg(windows)]
+    unsafe extern "system" fn control(event: u32) -> i32 {
+        if event <= 1 && LISTEN.load(Ordering::SeqCst) {
+            CANCEL.store(true, Ordering::SeqCst);
+            return 1;
+        }
+        restore();
+        0
+    }
+
+    pub struct InterruptGuard;
+    impl InterruptGuard {
+        pub fn new() -> Self {
+            static INIT: std::sync::Once = std::sync::Once::new();
+            INIT.call_once(|| {
+                let previous = std::panic::take_hook();
+                std::panic::set_hook(Box::new(move |info| { restore(); previous(info); }));
+                #[cfg(windows)]
+                unsafe {
+                    extern "system" { fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32; }
+                    SetConsoleCtrlHandler(Some(control), 1);
+                }
+            });
+            CANCEL.store(false, Ordering::SeqCst);
+            LISTEN.store(true, Ordering::SeqCst);
+            Self
+        }
+    }
+    impl Drop for InterruptGuard {
+        fn drop(&mut self) { LISTEN.store(false, Ordering::SeqCst); }
+    }
+
+    pub fn raw_started(alternate: bool) {
+        ALTERNATE.store(alternate, Ordering::SeqCst);
+        RAW.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Interactive file selection for a torrent plan (the `-y` flow never asks).
+fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
+    use TorrentAsk::{Cancel, Skip, Use};
+    if plan.engine != "aria2" || !engines::is_bittorrent_input(&plan.url) {
+        return Use(torrent::Choice::default());
+    }
+    let Some(aria2c) = &tc.aria2c else { return Use(torrent::Choice::default()) };
+    // Same gate the download itself applies, and BEFORE anything touches the
+    // input: a \\host\share path must not even be probed (SMB auth leak),
+    // and a malformed link should not cost a metadata fetch first. An invalid
+    // link skips the picker; download() reports the reason.
+    let Ok(url) = validate_url(&plan.url) else { return Use(torrent::Choice::default()) };
+    outln("⌛ получаю список файлов торрента (для magnet это может занять минуту; Ctrl+C — отмена)…");
+    let _interrupt = picker_console::InterruptGuard::new();
+    let listing = match torrent::show_files(aria2c, &url, torrent::METADATA_TIMEOUT, &picker_console::CANCEL) {
+        Ok(listing) => listing,
+        Err(_) if picker_console::CANCEL.load(Ordering::SeqCst) => return Cancel,
+        Err(e) => {
+            drop(_interrupt);
+            errln(format!("⚠ {e}"));
+            // Ask instead of silently switching to the whole torrent. "Нет"
+            // drops only this link; Esc still cancels the whole flow.
+            return match Confirm::new("Список файлов недоступен. Скачать торрент целиком?")
+                .with_default(true)
+                .with_help_message("«нет» — пропустить эту ссылку")
+                .prompt()
+            {
+                Ok(true) => Use(torrent::Choice::default()),
+                Ok(false) => Skip,
+                Err(_) => Cancel,
+            };
+        }
+    };
+    drop(_interrupt);
+    let info = &listing.info;
+    // Every outcome keeps the fetched metadata: the download then reuses it
+    // instead of asking the swarm for it a second time.
+    let all = torrent::Choice { files: None, meta: listing.meta.clone() };
+    if info.files.len() <= 1 {
+        return Use(all);
+    }
+    outln(format!(
+        "Торрент «{}»: файлов {}, всего {}",
+        clip(&info.name, 50),
+        info.files.len(),
+        torrent::human_size(info.total)
+    ));
+    // Default is the whole torrent (what the release intends); the full
+    // file picker only opens when the user explicitly asks for it - dumping
+    // hundreds of entries unprompted is unreadable.
+    match Confirm::new(&format!("Скачать все {} файлов (как в раздаче)?", info.files.len()))
+        .with_default(true)
+        .with_help_message("ответьте «нет», чтобы выбрать отдельные файлы")
+        .prompt()
+    {
+        Ok(true) => return Use(all),
+        Ok(false) => {}
+        Err(_) => return Cancel,
+    }
+    // Partial selection: interactive folders-and-files tree.
+    outln("↑↓ движение · →/← раскрыть · Space отметить · Enter подтвердить · Esc отмена");
+    match pick_torrent_files(info) {
+        Ok(Some(sel)) => {
+            outln(PARTIAL_NEIGHBOURS_NOTE);
+            Use(torrent::Choice { files: Some(sel), meta: listing.meta })
+        }
+        Ok(None) => Use(all),
+        Err(()) => Cancel,
+    }
+}
+
+/// aria2 downloads whole pieces, and a piece crossing a file boundary also
+/// writes into the unselected neighbour - which then looks full-size but is
+/// incomplete. Said once at pick time and again when the job finishes.
+const PARTIAL_NEIGHBOURS_NOTE: &str =
+    "ℹ соседние невыбранные файлы могут появиться частично скачанными — так устроены торренты";
 
 /// `tc: None` discovers lazily, AFTER `validate_url` succeeds - mirrors
 /// Python's `_download(plan, cfg, tc: Toolchain | None = None)`, which only
@@ -208,6 +362,7 @@ struct BatchDisplay {
     bars: Vec<ProgressBar>,
     views: Vec<BatchView>,
     colors: bool,
+    ticking: Vec<bool>,
 }
 
 fn highlight_progress(status: &str) -> String {
@@ -235,7 +390,9 @@ fn highlight_progress(status: &str) -> String {
     }
     let mut fields = status.split(" · ");
     let Some(percent) = fields.next() else { return status.to_string(); };
-    if !percent.ends_with('%') || !percent[..percent.len()-1].chars().all(|c| c.is_ascii_digit()) {
+    if !percent.ends_with('%')
+        || !percent[..percent.len() - 1].chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+    {
         return status.to_string();
     }
     let mut out = format!("{GREEN}{percent}{RESET}");
@@ -269,13 +426,12 @@ impl BatchDisplay {
                 let bar = multi.add(ProgressBar::new_spinner());
                 bar.set_style(ProgressStyle::with_template("{spinner:.green} {wide_msg}").expect("valid style"));
                 bar.set_message(Self::line(id, plans.len(), &views[id], colors));
-                bar.enable_steady_tick(Duration::from_millis(120));
                 bars.push(bar);
             } else {
                 outln(Self::line(id, plans.len(), &views[id], false));
             }
         }
-        Self { multi, bars, views, colors }
+        Self { multi, bars, views, colors, ticking: vec![false; plans.len()] }
     }
 
     fn line(id: usize, total: usize, view: &BatchView, colors: bool) -> String {
@@ -296,6 +452,10 @@ impl BatchDisplay {
         }
         let line = Self::line(id, total, view, self.colors);
         if self.multi.is_some() {
+            if !self.ticking[id] {
+                self.bars[id].enable_steady_tick(Duration::from_millis(120));
+                self.ticking[id] = true;
+            }
             self.bars[id].set_message(line);
         } else if view.last_printed.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
             outln(line);
@@ -304,8 +464,8 @@ impl BatchDisplay {
     }
 
     fn diagnostic(&self, id: usize, text: &str) {
-        // YM metadata comes directly from the network rather than a sanitized
-        // child pipe. Never let track titles inject terminal ESC/OSC sequences.
+        // Network-sourced metadata (torrent listings, resolved names) never
+        // goes through a child pipe. Never let it inject terminal escapes.
         let safe = engines::sanitize_child_output(text);
         let line = format!("[{} / {}] {}: {safe}", id + 1, self.views.len(), clip(&self.views[id].name, 38));
         if let Some(multi) = &self.multi {
@@ -319,6 +479,8 @@ impl BatchDisplay {
         self.views[id].status = status;
         let line = Self::line(id, self.views.len(), &self.views[id], self.colors);
         if self.multi.is_some() {
+            self.bars[id].disable_steady_tick();
+            self.ticking[id] = false;
             self.bars[id].finish_with_message(line);
         } else {
             outln(line);
@@ -409,7 +571,7 @@ fn run_batch_job(
         let _ = tx.send(BatchEvent::Line(id, format!("⚠ {warn}")));
     }
     // Hold the same-name OS lock through child.wait(): both this process and
-    // the GUI/private edition must decide ownership before building -c flags.
+    // the GUI/public edition must decide ownership before building -c flags.
     let _output_lock = match engines::lock_aria2_target(&job, true) {
         Ok(lock) => lock,
         Err(e) => {
@@ -417,22 +579,29 @@ fn run_batch_job(
             return RunResult { code: 2, auth_hint: false };
         }
     };
-    let cmd = match cli_command(&job, tc, plan.no_continue, true) {
+    let cmd = match cli_command(&job, tc, plan.no_continue, true, &plan.torrent) {
         Ok(cmd) => cmd,
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
             return RunResult { code: 2, auth_hint: false };
         }
     };
-    let child = Command::new(&cmd[0])
+    let install_guard = match snatch_rs::tools::lock_for_spawn(Path::new(&cmd[0])) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
+            return RunResult { code: 127, auth_hint: false };
+        }
+    };
+    let mut command = Command::new(&cmd[0]);
+    command
         .args(&cmd[1..])
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn();
-    let mut child = match child {
-        Ok(child) => child,
+        .stderr(Stdio::piped());
+    let (mut child, proc_job) = match snatch_rs::job_object::spawn(&mut command, false) {
+        Ok(result) => result,
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(
                 id,
@@ -441,6 +610,7 @@ fn run_batch_job(
             return RunResult { code: 127, auth_hint: false };
         }
     };
+    drop(install_guard);
     let auth = Arc::new(AtomicBool::new(false));
     let stderr = child.stderr.take().expect("stderr piped");
     let stdout = child.stdout.take().expect("stdout piped");
@@ -450,8 +620,12 @@ fn run_batch_job(
     let err_reader = std::thread::spawn(move || {
         read_batch_pipe(stderr, id, aria2, &err_tx, &err_auth)
     });
-    read_batch_pipe(stdout, id, aria2, tx, &auth);
+    let out_tx = tx.clone();
+    let out_auth = auth.clone();
+    let out_reader = std::thread::spawn(move || read_batch_pipe(stdout, id, aria2, &out_tx, &out_auth));
     let status = child.wait();
+    if let Some(job) = &proc_job { job.terminate(); }
+    let _ = out_reader.join();
     let _ = err_reader.join();
     RunResult {
         code: status.map(|s| s.code().unwrap_or(130)).unwrap_or(127),
@@ -523,6 +697,9 @@ fn run_batch_with(
                         cfg.save();
                         let dir = clip(&engines::sanitize_child_output(&dir), 90);
                         display.finished(id, format!("✔ Готово: {dir}"));
+                        if plans[id].torrent.files.is_some() {
+                            display.diagnostic(id, PARTIAL_NEIGHBOURS_NOTE);
+                        }
                     } else if missing_control[id] {
                         display.finished(id, "✘ Файлы уже есть, но нет .aria2 — выберите пустую папку".into());
                     } else {
@@ -660,8 +837,8 @@ fn ask_links(cfg: &Config) -> Option<Vec<String>> {
     }
 }
 
-/// Engines offered for a URL: every toolchain-backed engine (yt-dlp/aria2),
-/// with the auto-detected guess moved to front.
+/// Engines offered for a URL: toolchain-backed ones (yt-dlp/aria2) with the
+/// auto-detected guess moved to front.
 fn engine_offer(tc: &Toolchain, url: &str) -> Vec<&'static str> {
     let mut list: Vec<&'static str> = Vec::new();
     if tc.yt_dlp.is_some() {
@@ -680,9 +857,6 @@ fn engine_offer(tc: &Toolchain, url: &str) -> Vec<&'static str> {
 
 fn ask_engine(url: &str, tc: &Toolchain) -> Option<String> {
     let list = engine_offer(tc, url);
-    if list.is_empty() {
-        return None;
-    }
     if list.len() == 1 {
         return Some(list[0].to_string());
     }
@@ -852,13 +1026,15 @@ fn queue_summary(plans: &[Plan], jobs: u8) -> String {
     summary
 }
 
-fn collect(tc: &Toolchain, url: String, out_dir: &str, cookies_browser: Option<String>) -> Option<Plan> {
+fn collect(tc: &Toolchain, url: String, out_dir: &str, cookies_browser: Option<String>, engine_override: Option<&str>, format_override: Option<&str>) -> Option<Plan> {
     if url.is_empty() {
         return None;
     }
-    let engine = ask_engine(&url, tc)?;
-    let fmt = if engine == "yt-dlp" { ask_format()? } else { "best".to_string() };
-    Some(Plan { url, engine, fmt, out_dir: out_dir.to_string(), cookies_browser, no_continue: false })
+    let engine = match engine_override { Some(engine) => engine.to_string(), None => ask_engine(&url, tc)? };
+    let fmt = if engine == "yt-dlp" {
+        match format_override { Some(format) => format.to_string(), None => ask_format()? }
+    } else { "best".to_string() };
+    Some(Plan { url, engine, fmt, out_dir: out_dir.to_string(), cookies_browser, no_continue: false, torrent: torrent::Choice::default() })
 }
 
 fn main() -> std::process::ExitCode {
@@ -874,7 +1050,7 @@ fn main() -> std::process::ExitCode {
 
     if args.clear_history {
         cfg.clear_history();
-        cfg.save();
+        if let Err(e) = cfg.try_save() { errln(format!("✘ История не очищена: {e}")); return exit_code(1); }
         outln("История очищена.");
         return std::process::ExitCode::SUCCESS;
     }
@@ -887,7 +1063,10 @@ fn main() -> std::process::ExitCode {
         }
         #[cfg(windows)]
         {
-            let dir = bootstrap_dir();
+            let dir = match bootstrap_dir() {
+                Ok(dir) => dir,
+                Err(e) => { errln(e); return exit_code(2); }
+            };
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 errln(format!("✘ Не удалось создать {}: {e}", dir.display()));
                 return exit_code(2);
@@ -977,7 +1156,7 @@ fn main() -> std::process::ExitCode {
         let mut plans = Vec::with_capacity(total);
         for (i, url) in urls.into_iter().enumerate() {
             outln(format!("\nНастройка {}/{}: {}", i + 1, total, clip(&url, 65)));
-            let Some(mut plan) = collect(&tc, url, &out_dir, args.cookies_browser.clone()) else {
+            let Some(mut plan) = collect(&tc, url, &out_dir, args.cookies_browser.clone(), args.engine.as_deref(), args.format.as_deref()) else {
                 outln("Отменено.");
                 return exit_code(130);
             };
@@ -989,15 +1168,37 @@ fn main() -> std::process::ExitCode {
             outln("Отменено.");
             return exit_code(130);
         }
+        // Network metadata is fetched only after the whole queue is confirmed.
+        let mut picked = Vec::with_capacity(plans.len());
+        for mut plan in plans {
+            match ask_torrent_files(&tc, &plan) {
+                TorrentAsk::Use(choice) => plan.torrent = choice,
+                TorrentAsk::Skip => {
+                    outln("Ссылка пропущена.");
+                    continue;
+                }
+                TorrentAsk::Cancel => {
+                    outln("Отменено.");
+                    return exit_code(130);
+                }
+            }
+            picked.push(plan);
+        }
+        let mut plans = picked;
+        if plans.is_empty() {
+            outln("Нечего скачивать.");
+            continue;
+        }
         let code = if plans.len() == 1 {
             let result = download(&plans[0], &mut cfg, Some(&tc));
-            retry_with_cookies(plans.remove(0), result, &mut cfg, &tc).code
+            let plan = plans.remove(0);
+            retry_with_cookies(plan.clone(), result, &mut cfg, &tc).code
         } else {
             let mut results = run_batch(&plans, &mut cfg, &tc, usize::from(args.jobs));
             for (plan, result) in plans.into_iter().zip(&mut results) {
                 if should_offer_cookies(&plan, result.code, result.auth_hint) {
                     *result = retry_with_cookies(
-                        plan,
+                        plan.clone(),
                         RunResult { code: result.code, auth_hint: result.auth_hint },
                         &mut cfg,
                         &tc,
@@ -1060,6 +1261,223 @@ fn exit_code(code: i32) -> std::process::ExitCode {
     std::process::ExitCode::from(exit_code_u8(code))
 }
 
+/// Interactive tree picker for torrent files (qbittorrent-style: folders
+/// collapse, Space toggles a whole subtree). Returns the chosen aria2 file
+/// indices; Err on cancel.
+fn picker_view_rows(height: u16) -> usize { height.saturating_sub(5) as usize }
+
+fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>, ()> {
+    use crossterm::event::{self, Event, KeyCode};
+    use crossterm::{cursor, execute, queue, terminal};
+    use std::io::Write;
+
+    struct RawGuard;
+    impl Drop for RawGuard {
+        fn drop(&mut self) {
+            picker_console::restore();
+        }
+    }
+
+    let mut tree = torrent::build_torrent_tree(&info.files);
+    let mut selected = vec![true; info.files.len()];
+    let mut cursor = 0usize;
+    // Why the last Enter was refused (shown under the list until a key).
+    let mut note: Option<String> = None;
+    // Without VT (legacy conhost) crossterm makes the alternate screen a
+    // separate WinAPI buffer while write!(stdout) keeps drawing into the
+    // original one: the picker would be invisible. There it redraws the main
+    // screen instead, as before the alternate screen existed.
+    let alternate = vt_processing_enabled();
+    let _interrupt = picker_console::InterruptGuard::new();
+    terminal::enable_raw_mode().map_err(|_| ())?;
+    picker_console::raw_started(alternate);
+    let _guard = RawGuard;
+    let mut out = std::io::stdout();
+    if alternate {
+        let _ = execute!(out, terminal::EnterAlternateScreen);
+    }
+    let clear = if alternate { terminal::ClearType::FromCursorDown } else { terminal::ClearType::All };
+    // Drop keys buffered by the previous inquire prompt: a stale Enter in
+    // the queue would otherwise confirm the picker instantly, leaving the
+    // drawn tree behind while the next prompt silently takes over input.
+    while event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+        let _ = event::read();
+    }
+    // Some keys (and their release events) can still be in flight right
+    // after the previous prompt; a short pause plus a second drain catches
+    // the late ones, so the picker cannot be confirmed by a ghost Enter.
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    while event::poll(std::time::Duration::from_millis(0)).unwrap_or(false) {
+        let _ = event::read();
+    }
+
+    let mut view_cache = torrent::TreeView::default();
+    loop {
+        view_cache.prepare(&mut tree, &selected);
+        let rows = &view_cache.rows;
+        if cursor >= rows.len() {
+            cursor = rows.len().saturating_sub(1);
+        }
+        let (cols, term_h) = terminal::size().unwrap_or((100, 30));
+        let view = picker_view_rows(term_h);
+        let start = cursor.saturating_sub(view.saturating_sub(1));
+        let width = (cols as usize).saturating_sub(1);
+        let _ = queue!(out, cursor::MoveTo(0, 0), terminal::Clear(clear), cursor::Hide);
+        let header = "ВЫБОР ФАЙЛОВ — ↑↓ движение · →/← раскрыть · Space отметить · Enter подтвердить · Esc отмена";
+        if view == 0 {
+            let _ = write!(out, "{}", clip_cells("Увеличьте высоту терминала (Esc — отмена)", width));
+        } else { let _ = write!(out, "{}\r\n\r\n", clip_cells(header, width)); }
+        for (ri, (path, depth)) in rows.iter().enumerate().skip(start).take(view) {
+            let node = torrent::node_at(&tree, path);
+            let mark = if node.file.is_none() {
+                if node.expanded { "▼" } else { "▶" }
+            } else {
+                " "
+            };
+            let (sel, total) = node.selection;
+            let box_ = if node.file.is_some() {
+                if sel > 0 { "[x]" } else { "[ ]" }.to_string()
+            } else if total > 0 && sel == total {
+                "[x]".to_string()
+            } else if sel > 0 {
+                format!("[{sel}/{total}]")
+            } else {
+                "[ ]".to_string()
+            };
+            // ">" marks the cursor row in plain text: on a legacy console
+            // (no VT) crossterm's Reverse attribute is a no-op, so the
+            // highlight alone left no visible cursor at all. Size leads the
+            // name so clipping a long name never hides it.
+            let line = format!(
+                "{}{}{} {} {} · {}",
+                if ri == cursor { "> " } else { "  " },
+                if *depth > 6 { format!("{}… ", "  ".repeat(6)) } else { "  ".repeat(*depth) },
+                mark,
+                box_,
+                torrent::human_size(node.size),
+                clip(&node.name, 120)
+            );
+            let line = clip_cells(&line, width);
+            if ri == cursor {
+                let _ = queue!(out, crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse));
+            }
+            let _ = write!(out, "{line}\r\n");
+            if ri == cursor {
+                let _ = queue!(out, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset));
+            }
+        }
+        if let Some(text) = note.as_ref().filter(|_| view > 0) {
+            let _ = write!(out, "\r\n{}\r\n", clip_cells(text, width));
+        }
+        let _ = out.flush();
+
+        if picker_console::CANCEL.load(Ordering::SeqCst) { return Err(()); }
+        if !event::poll(std::time::Duration::from_millis(100)).map_err(|_| ())? { continue; }
+        match event::read() {
+            Ok(Event::Key(key)) => {
+                // Ignore release/repeat events: only real presses navigate.
+                if key.kind != event::KeyEventKind::Press {
+                    continue;
+                }
+                note = None;
+                match key.code {
+                KeyCode::Up => cursor = cursor.saturating_sub(1),
+                KeyCode::Down => cursor = (cursor + 1).min(rows.len().saturating_sub(1)),
+                KeyCode::Left => {
+                    if let Some((path, _)) = rows.get(cursor) {
+                        let node = torrent::node_at_mut(&mut tree, path);
+                        if node.file.is_none() {
+                            view_cache.rows_dirty |= node.expanded;
+                            node.expanded = false;
+                        }
+                    }
+                }
+                KeyCode::Right => {
+                    if let Some((path, _)) = rows.get(cursor) {
+                        let node = torrent::node_at_mut(&mut tree, path);
+                        if node.file.is_none() {
+                            view_cache.rows_dirty |= !node.expanded;
+                            node.expanded = true;
+                        }
+                    }
+                }
+                KeyCode::Char(' ') => {
+                    if let Some((path, _)) = rows.get(cursor) {
+                        let node = torrent::node_at_mut(&mut tree, path);
+                        if let Some(fi) = node.file {
+                            if let Some(s) = selected.get_mut(fi) {
+                                *s = !*s;
+                            }
+                        } else {
+                            let (sel, total) = node.selection;
+                            node.set_all(&mut selected, sel != total);
+                        }
+                        view_cache.selection_dirty = true;
+                    }
+                }
+                KeyCode::Enter => {
+                    if view == 0 { continue; }
+                    let chosen: Vec<usize> = info
+                        .files
+                        .iter()
+                        .enumerate()
+                        .filter(|(i, _)| selected.get(*i).copied().unwrap_or(false))
+                        .map(|(_, f)| f.index)
+                        .collect();
+                    // Nothing ticked: keep the picker open (Esc cancels).
+                    if chosen.is_empty() {
+                        note = Some("Выберите хотя бы один файл (Esc — отмена)".into());
+                        continue;
+                    }
+                    if chosen.len() == info.files.len() {
+                        return Ok(None);
+                    }
+                    // Too many scattered files for one command line: say so
+                    // here, where the selection can still be changed.
+                    if let Err(e) = torrent::select_spec(&chosen) {
+                        note = Some(format!("⚠ {e}"));
+                        continue;
+                    }
+                    return Ok(Some(chosen));
+                }
+                KeyCode::Esc | KeyCode::Char('q') => return Err(()),
+                KeyCode::Char('c')
+                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    return Err(())
+                }
+                _ => {}
+                }
+            }
+            Ok(_) => {}
+            Err(_) => return Err(()),
+        }
+    }
+}
+
+/// `clip` by terminal cells instead of chars: CJK names (common in torrents)
+/// take two cells per char, so a char-count clip still wrapped the row and
+/// broke the picker's one-row-per-line viewport math.
+fn clip_cells(text: &str, cells: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let width = |c: char| c.width().unwrap_or(0);
+    if text.chars().map(width).sum::<usize>() <= cells {
+        return text.to_string();
+    }
+    let mut used = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        // Keep one cell for the ellipsis.
+        if used + width(c) + 1 > cells {
+            break;
+        }
+        used += width(c);
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
 // Port of tests/test_cli.py + tests/test_ui.py from the retired Python CLI.
 // inquire's Select/Confirm have no monkeypatch equivalent (they open a real
 // terminal via get_default_terminal()), so retry_with_cookies_inner and
@@ -1068,6 +1486,22 @@ fn exit_code(code: i32) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interactive_overrides_are_honored_without_opening_prompts() {
+        let tc = Toolchain { yt_dlp: None, aria2c: None };
+        let plan = collect(&tc, "https://example.test/video".into(), "out", None, Some("yt-dlp"), Some("audio")).unwrap();
+        assert_eq!(plan.engine, "yt-dlp"); assert_eq!(plan.fmt, "audio");
+    }
+
+    #[test]
+    fn picker_footer_never_moves_the_cursor_beyond_the_last_line() {
+        for height in 6..100 {
+            let newlines = 2 + picker_view_rows(height) + 2;
+            assert!(newlines < height as usize);
+        }
+        assert_eq!(picker_view_rows(4), 0);
+    }
     use std::sync::atomic::AtomicUsize;
 
     #[test]
@@ -1085,6 +1519,7 @@ mod tests {
             out_dir: "d".to_string(),
             cookies_browser: None,
             no_continue: false,
+            torrent: torrent::Choice::default(),
         }
     }
 
@@ -1216,7 +1651,7 @@ mod tests {
             fmt: "best".into(),
             cookies_browser: None,
         };
-        let cmd = cli_command(&job, &tc, false, true).unwrap();
+        let cmd = cli_command(&job, &tc, false, true, &torrent::Choice::default()).unwrap();
         assert_eq!(cmd[cmd.len() - 2], "--");
         assert!(cmd.iter().any(|arg| arg == "--summary-interval=2"));
         std::fs::remove_dir_all(dir).ok();
@@ -1311,7 +1746,7 @@ mod tests {
             || panic!("bad URL must not discover tools")).code, 2);
     }
 
-    // -- retry_with_cookies_inner (test_retry_with_cookies_*, test_no_retry_without_auth_hint, retry_second_decline_returns_failure) --
+    // -- retry_with_cookies_inner (test_retry_with_cookies_*, test_no_retry_without_auth_hint, test_retry_gives_up_after_second_failure) --
 
     #[test]
     fn retry_with_cookies_retries_and_succeeds() {
@@ -1411,11 +1846,12 @@ mod tests {
     }
 
     #[test]
-    fn ask_engine_single_available_needs_no_terminal() {
+    fn ask_engine_single_option_needs_no_terminal() {
         let tc = Toolchain { yt_dlp: Some(PathBuf::from("y")), aria2c: None };
-        assert_eq!(ask_engine("https://youtube.com/watch?v=1", &tc).as_deref(), Some("yt-dlp"));
-        let tc = Toolchain { yt_dlp: None, aria2c: None };
-        assert_eq!(ask_engine("https://x", &tc), None);
+        assert_eq!(
+            ask_engine("https://youtube.com/watch?v=1", &tc).as_deref(),
+            Some("yt-dlp")
+        );
     }
 
     // -- confirm_message (test_confirm_mentions_cookies, test_confirm_aria2_has_no_cookies_line) --
@@ -1433,5 +1869,14 @@ mod tests {
         let msg = confirm_message("aria2", "best", "d", None);
         assert!(msg.contains("aria2c"));
         assert!(!msg.contains("chrome"));
+    }
+
+    #[test]
+    fn picker_rows_are_clipped_by_terminal_cells() {
+        assert_eq!(clip_cells("abc", 3), "abc");
+        assert_eq!(clip_cells("abcdef", 4), "abc…");
+        // Each CJK char is two cells: 3 of them + the ellipsis fill 7 cells.
+        assert_eq!(clip_cells("東京都の写真集", 8), "東京都…");
+        assert_eq!(clip_cells("東京", 4), "東京");
     }
 }

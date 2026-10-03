@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
@@ -7,20 +7,123 @@ use fs4::FileExt;
 
 pub const MAX_HISTORY: usize = 15;
 
+/// A real config.json is a few KB (15+15 history entries, a token). Anything
+/// past this is corrupt or planted and is ignored rather than read whole on
+/// every download (Config::load runs inside YM auth resolution).
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Longest a save waits for another SNATCH process's config.lock. save() runs
+/// on the GUI thread: an untimed LockFileEx behind a stalled peer froze the
+/// whole window. Losing one history/theme write beats a hung UI.
+const SAVE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Only NotFound is an absent configuration. Every other failure must prevent
+/// save's read/merge/write from replacing real data with a default snapshot.
+pub(crate) fn read_capped(p: &Path, max: u64) -> std::io::Result<Option<String>> {
+    use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; opts.custom_flags(libc::O_NONBLOCK); }
+    let file = match opts.open(p) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > max {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "config.json не обычный файл или превышает лимит размера"));
+    }
+    let mut text = String::new();
+    file.take(max + 1).read_to_string(&mut text)?;
+    if text.len() as u64 > max {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "config.json превышает лимит размера"));
+    }
+    Ok(Some(text))
+}
+
+pub(crate) fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::DirBuilderExt; builder.mode(0o700); }
+    builder.create(path)
+}
+
+pub(crate) fn open_lock_file(path: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(create).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    { use std::os::unix::fs::OpenOptionsExt; opts.mode(0o600).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW); }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "файл блокировки не является обычным файлом"));
+    }
+    Ok(file)
+}
+
+/// Exclusive lock, polled instead of blocking so it can give up.
+fn lock_within(file: &std::fs::File, wait: std::time::Duration) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match FileExt::try_lock(file) {
+            Ok(()) => return Ok(()),
+            Err(fs4::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(fs4::TryLockError::WouldBlock) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "config.lock занят другим окном SNATCH",
+                ));
+            }
+            Err(fs4::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     let key = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
     std::env::var_os(key).map(PathBuf::from).filter(|p| !p.as_os_str().is_empty())
 }
 
-pub fn config_dir() -> PathBuf {
-    let non_empty = |v: Option<std::ffi::OsString>| v.filter(|s| !s.is_empty());
-    if let Some(base) = non_empty(std::env::var_os("LOCALAPPDATA")) {
-        return Path::new(&base).join("snatch");
+/// A base directory from the environment that may be touched at all: set,
+/// non-empty and NOT a UNC share. Stat'ing `\\host\share` already sends the
+/// user's NetNTLMv2 response to that host, and this dir also holds the
+/// self-installed yt-dlp/aria2c that get executed - the same rule PATH
+/// entries and SNATCH_YT_DLP/SNATCH_ARIA2C follow in tools.rs.
+pub(crate) fn local_base(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| !crate::engines::is_unc_path(p))
+}
+
+/// %LOCALAPPDATA%, unless it is unset or points at a network share.
+pub fn local_app_data() -> Option<PathBuf> {
+    local_base(std::env::var_os("LOCALAPPDATA"))
+}
+
+pub fn config_dir() -> Result<PathBuf, String> {
+    config_dir_from(
+        std::env::var_os("LOCALAPPDATA"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        home_dir().map(PathBuf::into_os_string),
+    )
+}
+
+fn config_dir_from(
+    local_app_data: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Result<PathBuf, String> {
+    if let Some(base) = local_base(local_app_data).or_else(|| local_base(xdg_config_home)) {
+        return Ok(base.join("snatch"));
     }
-    if let Some(base) = non_empty(std::env::var_os("XDG_CONFIG_HOME")) {
-        return Path::new(&base).join("snatch");
+    if let Some(home) = local_base(home) {
+        return Ok(home.join(".config").join("snatch"));
     }
-    home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".config").join("snatch")
+    Err("Нет безопасной папки настроек: задайте локальный LOCALAPPDATA, XDG_CONFIG_HOME или HOME/USERPROFILE. Общая временная папка не используется.".into())
 }
 
 #[derive(Serialize)]
@@ -41,6 +144,10 @@ pub struct Config {
     url_dirty: Cell<bool>,
     #[serde(skip)]
     dir_dirty: Cell<bool>,
+    #[serde(skip)]
+    default_dir_snapshot: RefCell<String>,
+    #[serde(skip)]
+    theme_snapshot: Cell<bool>,
 }
 
 fn str_field(obj: Option<&serde_json::Map<String, Value>>, key: &str) -> String {
@@ -51,9 +158,11 @@ fn str_field(obj: Option<&serde_json::Map<String, Value>>, key: &str) -> String 
 }
 
 fn list_field(obj: Option<&serde_json::Map<String, Value>>, key: &str) -> Vec<String> {
+    // Saves never write more than MAX_HISTORY entries; a longer list is a
+    // hand-edited or corrupt file and is not worth materialising.
     obj.and_then(|o| o.get(key))
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).take(MAX_HISTORY).collect())
         .unwrap_or_default()
 }
 
@@ -74,6 +183,8 @@ pub fn sanitize(data: &Value) -> Config {
         history_cleared: Cell::new(false),
         url_dirty: Cell::new(false),
         dir_dirty: Cell::new(false),
+        default_dir_snapshot: RefCell::new(str_field(obj, "default_dir")),
+        theme_snapshot: Cell::new(bool_field(obj, "dark_mode", true)),
     }
 }
 fn dedup_front(list: Vec<String>, value: String) -> Vec<String> {
@@ -102,59 +213,111 @@ fn merge_history(local: &[String], disk: &[String], same_epoch: bool, dirty: boo
 }
 
 impl Config {
-    pub fn path() -> PathBuf {
-        config_dir().join("config.json")
+    pub fn path() -> Result<PathBuf, String> {
+        config_dir().map(|p| p.join("config.json"))
+    }
+
+    pub fn try_load() -> Result<Config, String> {
+        let path = Self::path()?;
+        Self::load_checked(&path).map_err(|e| format!("Не удалось прочитать настройки {}: {e}", path.display()))
     }
 
     pub fn load() -> Config {
-        Self::load_from(&Self::path())
+        match Self::try_load() {
+            Ok(cfg) => cfg,
+            Err(e) => { crate::errln(format!("⚠ {e}")); Self::defaults() }
+        }
     }
 
     pub fn load_from(p: &Path) -> Config {
-        let data = std::fs::read_to_string(p)
-            .ok()
-            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-            .unwrap_or(Value::Null);
-        let mut cfg = sanitize(&data);
+        match Self::load_checked(p) {
+            Ok(cfg) => cfg,
+            Err(e) => { crate::errln(format!("⚠ Не удалось прочитать настройки {}: {e}; файл сохранён без изменений", p.display())); Self::defaults() }
+        }
+    }
+
+    fn load_checked(p: &Path) -> std::io::Result<Config> {
+        let Some(text) = read_capped(p, MAX_CONFIG_BYTES)? else { return Ok(Self::defaults()); };
+        let data: Value = serde_json::from_str(&text).map_err(std::io::Error::other)?;
+        if !data.is_object() {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "config.json должен содержать JSON-объект"));
+        }
+        Ok(Self::with_default_dir(sanitize(&data)))
+    }
+
+    fn defaults() -> Config { Self::with_default_dir(sanitize(&Value::Null)) }
+
+    fn with_default_dir(mut cfg: Config) -> Config {
         if cfg.default_dir.is_empty() {
             cfg.default_dir = home_dir()
                 .map(|h| h.join("Downloads").to_string_lossy().into_owned())
                 .unwrap_or_default();
         }
+        cfg.default_dir_snapshot.replace(cfg.default_dir.clone());
         cfg
     }
 
     pub fn save(&self) {
-        self.save_to(&Self::path());
+        if let Err(e) = self.try_save() { crate::errln(format!("⚠ Не удалось сохранить настройки: {e}")); }
+    }
+
+    pub fn try_save(&self) -> Result<(), String> {
+        let path = Self::path()?;
+        self.try_save_to(&path)
+    }
+
+    /// The GUI must not spend three seconds waiting for a peer's lock.
+    pub fn try_save_now(&self) -> Result<(), String> {
+        let path = Self::path()?;
+        self.try_save_to_within(&path, std::time::Duration::ZERO).map_err(|e| e.to_string())
+    }
+
+    pub fn try_save_to(&self, p: &Path) -> Result<(), String> {
+        self.try_save_to_within(p, SAVE_LOCK_WAIT).map_err(|e| e.to_string())
     }
 
     pub fn save_to(&self, p: &Path) {
+        self.save_to_within(p, SAVE_LOCK_WAIT);
+    }
+
+    fn save_to_within(&self, p: &Path, lock_wait: std::time::Duration) {
+        if let Err(e) = self.try_save_to_within(p, lock_wait) {
+            crate::errln(format!("⚠ Не удалось сохранить настройки: {e}"));
+        }
+    }
+
+    fn try_save_to_within(&self, p: &Path, lock_wait: std::time::Duration) -> std::io::Result<()> {
         let result = (|| -> std::io::Result<()> {
             if let Some(parent) = p.parent() {
-                std::fs::create_dir_all(parent)?;
+                create_private_dir(parent)?;
             }
             // Lock a stable sibling file, not config.json: the config itself
             // is atomically replaced on each save, changing the locked inode.
             // Hold this lock through reload, merge and rename. OS locks are
             // released on process exit, unlike create_new marker files.
             let lock_path = p.with_extension("lock");
-            let lock = std::fs::OpenOptions::new()
-                .create(true).truncate(false).read(true).write(true).open(lock_path)?;
-            FileExt::lock(&lock)?;
-            let disk = Self::load_from(p);
+            let lock = open_lock_file(&lock_path, true)?;
+            lock_within(&lock, lock_wait)?;
+            let disk = Self::load_checked(p)?;
+            let default_dir = if self.default_dir != *self.default_dir_snapshot.borrow() {
+                self.default_dir.clone()
+            } else { disk.default_dir.clone() };
+            let dark_mode = if self.dark_mode != self.theme_snapshot.get() { self.dark_mode } else { disk.dark_mode };
             let merged = if self.history_cleared.get() {
                 Config {
-                    default_dir: self.default_dir.clone(), last_dir: self.last_dir.clone(),
+                    default_dir: default_dir.clone(), last_dir: self.last_dir.clone(),
                     urls: self.urls.clone(), dirs: self.dirs.clone(),
                     history_epoch: disk.history_epoch.saturating_add(1),
-                    dark_mode: self.dark_mode,
+                    dark_mode,
                     history_cleared: Cell::new(false),
                     url_dirty: Cell::new(false), dir_dirty: Cell::new(false),
+                    default_dir_snapshot: RefCell::new(default_dir),
+                    theme_snapshot: Cell::new(dark_mode),
                 }
             } else {
                 let same_epoch = self.history_epoch == disk.history_epoch;
                 Config {
-                    default_dir: self.default_dir.clone(),
+                    default_dir: default_dir.clone(),
                     // Like urls/dirs: only a remember_dir() since the last
                     // save may overwrite last_dir. A stale window saving an
                     // unrelated setting must not resurrect a directory that
@@ -163,9 +326,11 @@ impl Config {
                     urls: merge_history(&self.urls, &disk.urls, same_epoch, self.url_dirty.get()),
                     dirs: merge_history(&self.dirs, &disk.dirs, same_epoch, self.dir_dirty.get()),
                     history_epoch: disk.history_epoch,
-                    dark_mode: self.dark_mode,
+                    dark_mode,
                     history_cleared: Cell::new(false),
                     url_dirty: Cell::new(false), dir_dirty: Cell::new(false),
+                    default_dir_snapshot: RefCell::new(default_dir),
+                    theme_snapshot: Cell::new(dark_mode),
                 }
             };
             // Unique tmp name (pid + nanos): with the old fixed "config.tmp",
@@ -199,13 +364,14 @@ impl Config {
                 let _ = std::fs::remove_file(&tmp);
             })
         })();
-        if let Err(e) = result {
-            crate::errln(format!("⚠ Не удалось сохранить настройки: {e}"));
-        } else {
+        if result.is_ok() {
             self.history_cleared.set(false);
             self.url_dirty.set(false);
             self.dir_dirty.set(false);
+            self.default_dir_snapshot.replace(self.default_dir.clone());
+            self.theme_snapshot.set(self.dark_mode);
         }
+        result
     }
 
     pub fn remember_url(&mut self, url: &str) {
@@ -232,9 +398,67 @@ impl Config {
     }
 }
 
+impl Default for Config {
+    fn default() -> Self { Self::defaults() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reads_never_overwrite_the_existing_config() {
+        let dir = std::env::temp_dir().join(format!("snatch-config-preserve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let oversized = json!({"urls": ["https://example.test/a"], "pad": "x".repeat(MAX_CONFIG_BYTES as usize)}).to_string().into_bytes();
+        for bytes in [oversized, b"{\"urls\":\"x\"}\xff".to_vec(), b"{broken".to_vec()] {
+            std::fs::write(&path, &bytes).unwrap();
+            let mut cfg = Config::load_from(&path);
+            cfg.remember_url("https://example.test/new");
+            assert!(cfg.try_save_to(&path).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert!(cfg.url_dirty.get(), "a rejected write must remain retryable");
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_transient_read_lock_does_not_wipe_recovered_settings() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::env::temp_dir().join(format!("snatch-config-sharing-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let bytes = json!({"urls": ["https://example.test/a"], "dirs": ["D:/saved"], "last_dir": "D:/saved", "default_dir": "D:/default", "dark_mode": false}).to_string();
+        std::fs::write(&path, &bytes).unwrap();
+        let held = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).unwrap();
+        let cfg = Config::load_from(&path);
+        assert!(cfg.try_save_to(&path).is_err());
+        drop(held);
+        cfg.try_save_to(&path).unwrap();
+        let saved = Config::load_from(&path);
+        assert_eq!(saved.urls, ["https://example.test/a"]);
+        assert_eq!(saved.last_dir, "D:/saved");
+        assert_eq!(saved.default_dir, "D:/default");
+        assert!(!saved.dark_mode);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_config_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("snatch-config-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let began = std::time::Instant::now();
+        assert!(read_capped(&path, MAX_CONFIG_BYTES).is_err());
+        assert!(std::time::Instant::now().duration_since(began) < std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(dir).ok();
+    }
     use serde_json::json;
 
     #[test]
@@ -393,6 +617,64 @@ mod tests {
     }
 
     #[test]
+    fn unc_bases_are_never_used_for_config_or_tools() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        // Local LOCALAPPDATA wins as before.
+        assert_eq!(config_dir_from(os(r"C:\Users\u\AppData\Local"), None, os(r"C:\Users\u")).unwrap(),
+            Path::new(r"C:\Users\u\AppData\Local").join("snatch"));
+        // A share (or NT-prefix share) is skipped: probing it leaks NetNTLMv2,
+        // and bin\ under it would hold executed tools.
+        for share in [r"\\evil\share", "//evil/share", r"\??\UNC\evil\share", "/??/UNC/evil/share"] {
+            let dir = config_dir_from(os(share), None, os(r"C:\Users\u")).unwrap();
+            assert!(!crate::engines::is_unc_path(&dir), "{share} -> {dir:?}");
+            assert_eq!(dir, Path::new(r"C:\Users\u").join(".config").join("snatch"));
+            assert!(local_base(os(share)).is_none(), "{share} must not be probed");
+        }
+        // Nothing local at all: still never a share.
+        assert!(config_dir_from(os(r"\\evil\a"), os(r"\\evil\b"), os(r"\\evil\c")).is_err());
+        assert!(config_dir_from(None, None, None).is_err(), "never use shared temp or current directory");
+    }
+
+    #[test]
+    fn oversized_config_is_ignored_and_lists_are_capped() {
+        let dir = std::env::temp_dir().join(format!("snatch-rs-config-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut big = String::from("{\"last_dir\": \"x\", \"pad\": \"");
+        big.push_str(&"a".repeat(MAX_CONFIG_BYTES as usize));
+        big.push_str("\"}");
+        std::fs::write(&p, &big).unwrap();
+        assert_eq!(Config::load_from(&p).last_dir, "", "an oversized file is not parsed");
+        let urls: Vec<String> = (0..100).map(|i| format!("https://e.com/{i}")).collect();
+        std::fs::write(&p, json!({"urls": urls}).to_string()).unwrap();
+        assert_eq!(Config::load_from(&p).urls.len(), MAX_HISTORY);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_gives_up_on_a_lock_held_by_a_stalled_peer() {
+        let dir = std::env::temp_dir().join(format!("snatch-rs-config-lockwait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let held = std::fs::OpenOptions::new()
+            .create(true).truncate(false).read(true).write(true).open(p.with_extension("lock")).unwrap();
+        FileExt::lock(&held).unwrap();
+        let mut cfg = Config::load_from(&p);
+        cfg.dark_mode = false;
+        let started = std::time::Instant::now();
+        cfg.save_to_within(&p, std::time::Duration::from_millis(200));
+        // Returned instead of blocking the (GUI) thread behind the peer...
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
+        assert!(!p.exists(), "nothing written without the lock");
+        // ...and saves normally once the peer lets go.
+        FileExt::unlock(&held).unwrap();
+        cfg.save_to_within(&p, std::time::Duration::from_millis(200));
+        assert!(!Config::load_from(&p).dark_mode);
+        drop(held);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn dark_mode_defaults_true_and_persists() {
         let cfg = sanitize(&Value::Null);
         assert!(cfg.dark_mode);
@@ -408,4 +690,5 @@ mod tests {
         assert!(!Config::load_from(&p).dark_mode);
         std::fs::remove_dir_all(&dir).ok();
     }
+
 }
