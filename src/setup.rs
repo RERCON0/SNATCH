@@ -6,9 +6,8 @@ use std::time::Duration;
 use indicatif::{ProgressBar, ProgressStyle};
 use sha2::{Digest, Sha256, Sha512};
 
-const YT_DLP_URL: &str = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe";
-const YT_DLP_SUMS_URL: &str =
-    "https://github.com/yt-dlp/yt-dlp/releases/latest/download/SHA2-512SUMS";
+const YT_DLP_API: &str = "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest";
+const MAX_RELEASE_METADATA: u64 = 1024 * 1024;
 const ARIA2_API: &str = "https://api.github.com/repos/aria2/aria2/releases/latest";
 const MAX_ARIA2_ZIP_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_YT_DLP_BYTES: u64 = 256 * 1024 * 1024;
@@ -43,13 +42,15 @@ fn client() -> Result<reqwest::blocking::Client, String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureKind {
     Transient,
+    /// A verified executable is busy; retry after the active download ends.
+    Deferred,
     Permanent,
 }
 
 impl FailureKind {
     /// Whether a `.part` file may still be useful after this failure.
     fn keeps_part(self) -> bool {
-        matches!(self, Self::Transient)
+        matches!(self, Self::Transient | Self::Deferred)
     }
 
     /// HTTP status classification: 408/429 and 5xx are "try again later"
@@ -126,19 +127,80 @@ fn resumable_part_len(dest: &Path, max: u64) -> u64 {
         .unwrap_or(0)
 }
 
-/// GET with an optional `Range: bytes=<range_from>-` resume header.
+/// GET with an optional `Range: bytes=<range_from>-` and `If-Range`. Some
+/// CDNs ignore If-Range, so download_inner also checks the 206 validator.
 fn send_get(
     c: &reqwest::blocking::Client,
     url: &str,
     label: &str,
     range_from: u64,
+    validator: Option<&str>,
 ) -> Result<reqwest::blocking::Response, DownloadFailure> {
     let mut req = c.get(url);
     if range_from > 0 {
         req = req.header(reqwest::header::RANGE, format!("bytes={range_from}-"));
+        if let Some(validator) = validator {
+            req = req.header(reqwest::header::IF_RANGE, validator);
+        }
     }
     req.send()
         .map_err(|e| DownloadFailure::transient(format!("не удалось скачать {label}: {e}")))
+}
+
+/// Sidecar holding the server version (ETag / Last-Modified) of the bytes in
+/// a `.part`, saved when the part was started.
+fn validator_path(part: &Path) -> PathBuf {
+    let mut name = part.as_os_str().to_owned();
+    name.push(".validator");
+    PathBuf::from(name)
+}
+
+fn read_validator(part: &Path) -> Option<String> {
+    crate::config::read_capped(&validator_path(part), 256)
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty() && v.len() <= 256 && v.bytes().all(|b| (0x20..0x7f).contains(&b)))
+}
+
+/// A `.part` and its validator always go together.
+fn remove_part(part: &Path) {
+    let _ = std::fs::remove_file(part);
+    let _ = std::fs::remove_file(validator_path(part));
+}
+
+/// What If-Range can be bound to: a strong ETag (If-Range must not use a weak
+/// one), else Last-Modified. None: the part can never be resumed safely.
+fn response_validator(resp: &reqwest::blocking::Response) -> Option<String> {
+    let header = |name| resp.headers().get(name).and_then(|v| v.to_str().ok());
+    header(reqwest::header::ETAG)
+        .filter(|etag| !etag.starts_with("W/"))
+        .or_else(|| header(reqwest::header::LAST_MODIFIED))
+        .map(str::to_string)
+}
+
+/// Start offset of a 206 (`Content-Range: bytes <start>-<end>/<total>`).
+fn content_range_start(resp: &reqwest::blocking::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .strip_prefix("bytes ")?
+        .split_once('-')?
+        .0
+        .parse()
+        .ok()
+}
+
+/// Full length from a 416's `Content-Range: bytes */<total>`.
+fn unsatisfiable_total(resp: &reqwest::blocking::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .strip_prefix("bytes */")?
+        .parse()
+        .ok()
 }
 
 fn download(c: &reqwest::blocking::Client, url: &str, dest: &Path, label: &str, max: u64) -> Result<(), DownloadFailure> {
@@ -151,7 +213,7 @@ fn download(c: &reqwest::blocking::Client, url: &str, dest: &Path, label: &str, 
             let keep = f.kind.keeps_part()
                 && std::fs::metadata(dest).map(|m| m.len() > 0).unwrap_or(false);
             if !keep {
-                let _ = std::fs::remove_file(dest);
+                remove_part(dest);
             }
             Err(f)
         }
@@ -165,19 +227,47 @@ fn download_inner(
     label: &str,
     max: u64,
 ) -> Result<(), DownloadFailure> {
-    let part_len = resumable_part_len(dest, max);
-    let mut resp = send_get(c, url, label, part_len)?;
+    // Resume only a part whose server version is known: the yt-dlp URL is
+    // releases/latest/, so an old part may belong to a previous release, and
+    // its head plus a new release's tail is a file that never existed (its
+    // checksum always fails). Without a saved validator, start over.
+    let validator = read_validator(dest);
+    let part_len = if validator.is_some() { resumable_part_len(dest, max) } else { 0 };
+    let mut resp = send_get(c, url, label, part_len, validator.as_deref())?;
     let mut plan = resume_plan(part_len, resp.status().as_u16());
     if let Some(ResumePlan::Refetch) = plan {
-        // 416: the part is stale or already complete. Truncate it and retry
-        // once without Range - a 416 error body must never be streamed as
-        // content. Truncating first also means a failed retry cannot leave the
-        // same stale part to 416 forever.
+        if unsatisfiable_total(&resp) == Some(part_len)
+            && response_validator(&resp).as_deref() == validator.as_deref()
+        {
+            // 416 for exactly our length: the part may already be complete
+            // (e.g. only the checksum fetch failed). Keep it; the checksum
+            // still decides whether it matches the current release.
+            return Ok(());
+        }
+        // 416: the part is stale. Truncate it and retry once without Range -
+        // a 416 error body must never be streamed as content. Truncating
+        // first also means a failed retry cannot leave the same stale part to
+        // 416 forever.
         File::create(dest).map_err(|e| {
             DownloadFailure::permanent(format!("не удалось создать {}: {e}", dest.display()))
         })?;
-        resp = send_get(c, url, label, 0)?;
+        resp = send_get(c, url, label, 0, None)?;
         plan = resume_plan(0, resp.status().as_u16());
+    }
+    if let Some(ResumePlan::Append { offset }) = plan {
+        if content_range_start(&resp) != Some(offset)
+            || response_validator(&resp).as_deref() != validator.as_deref()
+        {
+            // GitHub's release CDN has returned 206 even for a stale
+            // If-Range. Check the response's ETag/Last-Modified ourselves as
+            // well as the start offset, or we might splice two releases.
+            // No response validator means we cannot safely append either.
+            File::create(dest).map_err(|e| DownloadFailure::permanent(format!(
+                "не удалось очистить устаревшую часть {}: {e}", dest.display()
+            )))?;
+            resp = send_get(c, url, label, 0, None)?;
+            plan = resume_plan(0, resp.status().as_u16());
+        }
     }
 
     let (mut file, offset, expected) = match plan {
@@ -191,6 +281,15 @@ fn download_inner(
             let file = File::create(dest).map_err(|e| {
                 DownloadFailure::permanent(format!("не удалось создать {}: {e}", dest.display()))
             })?;
+            // Record which server version this part holds, for If-Range.
+            match response_validator(&resp) {
+                Some(validator) => {
+                    let _ = std::fs::write(validator_path(dest), validator);
+                }
+                None => {
+                    let _ = std::fs::remove_file(validator_path(dest));
+                }
+            }
             (file, 0, resp.content_length().unwrap_or(0))
         }
         // `Refetch` was resolved above; `None` means the response is not
@@ -314,6 +413,51 @@ fn yt_dlp_checksum(sums: &str) -> Option<&str> {
     })
 }
 
+fn read_metadata(resp: impl Read, label: &str) -> Result<Vec<u8>, DownloadFailure> {
+    let mut bytes = Vec::new();
+    resp.take(MAX_RELEASE_METADATA + 1).read_to_end(&mut bytes)
+        .map_err(|e| DownloadFailure::transient(format!("чтение {label}: {e}")))?;
+    if bytes.len() as u64 > MAX_RELEASE_METADATA {
+        return Err(DownloadFailure::permanent(format!("{label}: ответ больше 1 МБ")));
+    }
+    Ok(bytes)
+}
+
+fn release_json(c: &reqwest::blocking::Client, url: &str) -> Result<serde_json::Value, DownloadFailure> {
+    let resp = c.get(url).send().map_err(|e| DownloadFailure::transient(format!("релиз: {e}")))?;
+    if !resp.status().is_success() {
+        // GitHub uses 403 (not just 429) for exhausted API rate limits.
+        // Other 403s remain permanent; transport/rate failures preserve parts.
+        if resp.status().as_u16() == 403
+            && (resp.headers().get("x-ratelimit-remaining").is_some_and(|v| v == "0")
+                || resp.headers().contains_key(reqwest::header::RETRY_AFTER))
+        {
+            return Err(DownloadFailure::transient("GitHub API: превышен лимит запросов; повторите установку позже"));
+        }
+        return Err(DownloadFailure::from_http_status(resp.status().as_u16(), format!("релиз: HTTP {}", resp.status())));
+    }
+    serde_json::from_slice(&read_metadata(resp, "API релизов")?)
+        .map_err(|e| DownloadFailure::permanent(format!("ответ API релизов: {e}")))
+}
+
+fn yt_dlp_release_urls(release: &serde_json::Value) -> Result<(String, String), DownloadFailure> {
+    let tag = release.get("tag_name").and_then(serde_json::Value::as_str)
+        .filter(|t| !t.is_empty() && *t != "." && *t != ".." && t.len() <= 80 && t.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+        .ok_or_else(|| DownloadFailure::permanent("в API yt-dlp нет допустимого tag_name"))?;
+    let base = format!("https://github.com/yt-dlp/yt-dlp/releases/download/{tag}");
+    Ok((format!("{base}/yt-dlp.exe"), format!("{base}/SHA2-512SUMS")))
+}
+
+fn retry_transient<T>(mut attempt: impl FnMut() -> Result<T, DownloadFailure>) -> Result<T, DownloadFailure> {
+    for n in 0..3 {
+        match attempt() {
+            Err(f) if f.kind == FailureKind::Transient && n < 2 => std::thread::sleep(Duration::from_secs(1 << n)),
+            result => return result,
+        }
+    }
+    unreachable!("last attempt always returns")
+}
+
 fn copy_limited(reader: impl Read, mut writer: impl Write, max: u64) -> Result<(), String> {
     let n = std::io::copy(&mut reader.take(max + 1), &mut writer)
         .map_err(|e| format!("сбой распаковки: {e}"))?;
@@ -321,17 +465,82 @@ fn copy_limited(reader: impl Read, mut writer: impl Write, max: u64) -> Result<(
     Ok(())
 }
 
+/// One installer per tool at a time, across processes (the GUI's «обновить»
+/// next to `snatch --install-tools` in a terminal). Windows lets a second
+/// writer keep its handle on `<tool>.part` while the first renames the
+/// verified file into place, so its late writes used to land inside the
+/// freshly checked exe - which was then executed. Held for the whole attempt,
+/// cleanup included: the `.part` files belong to whoever holds it. Lock files
+/// are never deleted (a new inode would not be the locked one).
+fn install_lock(bin: &Path, tool: &str) -> Result<File, String> {
+    use fs4::{FileExt, TryLockError};
+    let path = bin.join(format!("{tool}.install.lock"));
+    let file = crate::config::open_lock_file(&path, true)
+        .map_err(|e| format!("блокировка установки {}: {e}", path.display()))?;
+    match FileExt::try_lock(&file) {
+        Ok(()) => Ok(file),
+        Err(TryLockError::WouldBlock) => Err(format!(
+            "{tool} уже устанавливается в другом окне SNATCH — дождитесь окончания и повторите"
+        )),
+        Err(TryLockError::Error(e)) => Err(format!("блокировка установки {tool}: {e}")),
+    }
+}
+
+/// `<tool>.exe.old`: where a running tool is moved aside.
+fn old_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(".old");
+    PathBuf::from(name)
+}
+
+/// Puts a verified aria2c `.part` in place. Windows can move aside a running
+/// aria2c.exe before publishing its replacement; aria2c does not read its
+/// executable again after startup. Do NOT use this for PyInstaller yt-dlp:
+/// it reads modules from its exe during downloads and moving that file breaks
+/// the running process.
+fn publish_tool(tmp: &Path, dest: &Path) -> std::io::Result<()> {
+    recover_tool(dest)?;
+    let direct = match std::fs::rename(tmp, dest) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(old_path(dest));
+            return Ok(());
+        }
+        Err(e) => e,
+    };
+    let old = old_path(dest);
+    let _ = std::fs::remove_file(&old);
+    if std::fs::rename(dest, &old).is_err() {
+        return Err(direct);
+    }
+    if let Err(e) = std::fs::rename(tmp, dest) {
+        // Never leave the tool missing: put the previous one back.
+        if let Err(restore) = std::fs::rename(&old, dest) {
+            return Err(std::io::Error::new(e.kind(), format!("установка: {e}; восстановление: {restore}; резерв: {}", old.display())));
+        }
+        return Err(e);
+    }
+    let _ = std::fs::remove_file(&old);
+    Ok(())
+}
+
+fn recover_tool(dest: &Path) -> std::io::Result<()> {
+    let old = old_path(dest);
+    if !dest.exists() && old.is_file() { std::fs::rename(old, dest)?; }
+    Ok(())
+}
+
 pub fn install_yt_dlp(bin: &Path) -> Result<PathBuf, String> {
     if !cfg!(windows) {
         return Err("Автоустановка yt-dlp поддерживается только на Windows.".to_string());
     }
-    match install_yt_dlp_inner(bin) {
+    let _lock = install_lock(bin, "yt-dlp")?;
+    match retry_transient(|| install_yt_dlp_inner(bin)) {
         Ok(p) => Ok(p),
         Err(f) => {
             // Transient failures keep `yt-dlp.exe.part` for the next attempt's
             // Range-resume; only permanent ones clean it up.
             if !f.kind.keeps_part() {
-                let _ = std::fs::remove_file(bin.join("yt-dlp.exe.part"));
+                remove_part(&bin.join("yt-dlp.exe.part"));
             }
             Err(f.message)
         }
@@ -345,10 +554,11 @@ fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
     if std::io::stdout().is_terminal() {
         crate::outln("⬇ Скачиваю yt-dlp.exe (официальный релиз)…");
     }
-    download(&c, YT_DLP_URL, &tmp, "yt-dlp.exe", MAX_YT_DLP_BYTES)?;
-
+    // Resolve the mutable latest alias once, then use one immutable release
+    // for both assets. Publishing a new release between GETs cannot mix them.
+    let (payload_url, sums_url) = yt_dlp_release_urls(&release_json(&c, YT_DLP_API)?)?;
     let sums = c
-        .get(YT_DLP_SUMS_URL)
+        .get(&sums_url)
         .send()
         .map_err(|e| DownloadFailure::transient(format!("не удалось скачать SHA2-512SUMS: {e}")))?;
     if !sums.status().is_success() {
@@ -359,20 +569,26 @@ fn install_yt_dlp_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
             format!("не удалось скачать SHA2-512SUMS: HTTP {}", sums.status()),
         ));
     }
-    let sums_text = sums
-        .text()
-        .map_err(|e| DownloadFailure::transient(format!("не удалось прочитать SHA2-512SUMS: {e}")))?;
+    let sums_text = String::from_utf8(read_metadata(sums, "SHA2-512SUMS")?)
+        .map_err(|e| DownloadFailure::permanent(format!("SHA2-512SUMS не UTF-8: {e}")))?;
     let expected = yt_dlp_checksum(&sums_text)
         .ok_or_else(|| DownloadFailure::permanent("в SHA2-512SUMS нет записи для yt-dlp.exe"))?;
-
+    download(&c, &payload_url, &tmp, "yt-dlp.exe", MAX_YT_DLP_BYTES)?;
     let got = sha512_hex(&tmp).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(expected) {
-        let _ = std::fs::remove_file(&tmp);
+        remove_part(&tmp);
         return Err(DownloadFailure::permanent("контрольная сумма SHA-512 не совпала — файл не сохранён"));
     }
 
-    std::fs::rename(&tmp, &dest)
-        .map_err(|e| DownloadFailure::permanent(format!("не удалось установить yt-dlp.exe: {e}")))?;
+    // Never move aside a running PyInstaller image: it reads modules from its
+    // exe while downloading. A failed direct replacement keeps the verified
+    // part + validator; the next installation rechecks its checksum and tries
+    // again once the running download has finished.
+    std::fs::rename(&tmp, &dest).map_err(|e| DownloadFailure {
+        kind: FailureKind::Deferred,
+        message: format!("не удалось установить yt-dlp.exe (возможно, он занят загрузкой; повторите установку после её завершения): {e}"),
+    })?;
+    let _ = std::fs::remove_file(validator_path(&tmp));
     Ok(dest)
 }
 
@@ -380,14 +596,15 @@ pub fn install_aria2(bin: &Path) -> Result<PathBuf, String> {
     if !cfg!(windows) {
         return Err("Автоустановка aria2c поддерживается только на Windows.".to_string());
     }
-    match install_aria2_inner(bin) {
+    let _lock = install_lock(bin, "aria2c")?;
+    match retry_transient(|| install_aria2_inner(bin)) {
         Ok(p) => Ok(p),
         Err(f) => {
             // Transient failures keep both `.part` files for the next attempt's
             // Range-resume; only permanent ones clean them up.
             if !f.kind.keeps_part() {
                 let _ = std::fs::remove_file(bin.join("aria2c.exe.part"));
-                let _ = std::fs::remove_file(bin.join("aria2.zip.part"));
+                remove_part(&bin.join("aria2.zip.part"));
             }
             Err(f.message)
         }
@@ -396,22 +613,11 @@ pub fn install_aria2(bin: &Path) -> Result<PathBuf, String> {
 
 fn install_aria2_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
     let c = client().map_err(DownloadFailure::permanent)?;
+    recover_tool(&bin.join("aria2c.exe")).map_err(|e| DownloadFailure::transient(format!("восстановление aria2c: {e}")))?;
     if std::io::stdout().is_terminal() {
         crate::outln("⬇ Ищу свежий релиз aria2…");
     }
-    let api = c
-        .get(ARIA2_API)
-        .send()
-        .map_err(|e| DownloadFailure::transient(format!("не удалось получить список релизов aria2: {e}")))?;
-    if !api.status().is_success() {
-        return Err(DownloadFailure::from_http_status(
-            api.status().as_u16(),
-            format!("не удалось получить список релизов aria2: HTTP {}", api.status()),
-        ));
-    }
-    let release: serde_json::Value = api
-        .json()
-        .map_err(|e| DownloadFailure::permanent(format!("не удалось разобрать ответ API релизов aria2: {e}")))?;
+    let release = release_json(&c, ARIA2_API)?;
     let (url, expected_sha256) = aria2_asset(&release).map_err(DownloadFailure::permanent)?;
 
     let zip_path = bin.join("aria2.zip.part");
@@ -419,7 +625,7 @@ fn install_aria2_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
     let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(&expected_sha256) {
         // The archive is unusable and must not be resumed later.
-        let _ = std::fs::remove_file(&zip_path);
+        remove_part(&zip_path);
         return Err(DownloadFailure::permanent("SHA-256 архива aria2 не совпала — установка остановлена"));
     }
 
@@ -450,12 +656,12 @@ fn install_aria2_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
                 File::create(&tmp).map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
             copy_limited(&mut entry, &mut out, MAX_ARIA2C_BYTES)?;
         }
-        std::fs::rename(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))
+        publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))
     })();
     // The archive file handle must be dropped before Windows lets us delete
     // it, so cleanup happens after the extraction block regardless of outcome
     // (previously the zip leaked in bin\ on every failure path).
-    let _ = std::fs::remove_file(&zip_path);
+    remove_part(&zip_path);
     extracted.map_err(DownloadFailure::permanent)?;
     Ok(dest)
 }
@@ -544,6 +750,271 @@ mod tests {
         for status in [400, 403, 404, 410, 416] {
             assert_eq!(FailureKind::from_http_status(status), FailureKind::Permanent, "HTTP {status}");
         }
+    }
+
+    /// Local HTTP server answering `n` requests (one per connection) with
+    /// `respond(i, lowercased request)`; returns the URL and the requests seen.
+    fn serve<F>(n: usize, respond: F) -> (String, std::thread::JoinHandle<Vec<String>>)
+    where
+        F: Fn(usize, &str) -> String + Send + 'static,
+    {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/tool.exe", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for i in 0..n {
+                let (mut sock, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 1024];
+                loop {
+                    let k = sock.read(&mut buf).unwrap();
+                    if k == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..k]);
+                    if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                sock.write_all(respond(i, &text).as_bytes()).unwrap();
+                seen.push(text);
+            }
+            seen
+        });
+        (url, handle)
+    }
+
+    fn reply(status: &str, headers: &str, body: &str) -> String {
+        format!("HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+    }
+
+    fn part_in(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("snatch-setup-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("tool.exe.part");
+        (dir, part)
+    }
+
+    #[test]
+    fn a_part_without_a_known_version_is_never_resumed() {
+        let (dir, part) = part_in("novalidator");
+        std::fs::write(&part, b"OLD-RELEASE-HEAD").unwrap();
+        let (url, server) = serve(1, |_, _| reply("200 OK", "ETag: \"v2\"\r\n", "NEW-RELEASE"));
+        download(&client().unwrap(), &url, &part, "tool", 1024).unwrap();
+        let seen = server.join().unwrap();
+        assert!(!seen[0].contains("range:"), "no validator, no Range: {}", seen[0]);
+        assert_eq!(std::fs::read(&part).unwrap(), b"NEW-RELEASE");
+        assert_eq!(read_validator(&part).as_deref(), Some("\"v2\""));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn resume_is_bound_to_the_saved_version_by_if_range() {
+        // Same version: 206 appended.
+        let (dir, part) = part_in("ifrange-same");
+        std::fs::write(&part, b"ABC").unwrap();
+        std::fs::write(validator_path(&part), "\"v1\"").unwrap();
+        let (url, server) = serve(1, |_, _| reply("206 Partial Content", "Content-Range: bytes 3-5/6\r\nETag: \"v1\"\r\n", "DEF"));
+        download(&client().unwrap(), &url, &part, "tool", 1024).unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].contains("range: bytes=3-") && seen[0].contains("if-range: \"v1\""), "{}", seen[0]);
+        assert_eq!(std::fs::read(&part).unwrap(), b"ABCDEF");
+        std::fs::remove_dir_all(dir).ok();
+
+        // A newer release behind the same `latest` URL: the server ignores the
+        // Range (200) and the old head is NOT kept.
+        let (dir, part) = part_in("ifrange-changed");
+        std::fs::write(&part, b"ABC").unwrap();
+        std::fs::write(validator_path(&part), "\"v1\"").unwrap();
+        let (url, server) = serve(1, |_, _| reply("200 OK", "ETag: \"v2\"\r\n", "XYZ123"));
+        download(&client().unwrap(), &url, &part, "tool", 1024).unwrap();
+        server.join().unwrap();
+        assert_eq!(std::fs::read(&part).unwrap(), b"XYZ123");
+        assert_eq!(read_validator(&part).as_deref(), Some("\"v2\""));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_206_for_the_wrong_bytes_restarts_instead_of_splicing() {
+        let (dir, part) = part_in("wrong206");
+        std::fs::write(&part, b"ABC").unwrap();
+        std::fs::write(validator_path(&part), "\"v1\"").unwrap();
+        let (url, server) = serve(2, |i, _| {
+            if i == 0 {
+                reply("206 Partial Content", "Content-Range: bytes 0-2/6\r\n", "ABC")
+            } else {
+                reply("200 OK", "ETag: \"v1\"\r\n", "ABCDEF")
+            }
+        });
+        download(&client().unwrap(), &url, &part, "tool", 1024).unwrap();
+        let seen = server.join().unwrap();
+        assert!(!seen[1].contains("range:"), "the retry is a whole-file GET: {}", seen[1]);
+        assert_eq!(std::fs::read(&part).unwrap(), b"ABCDEF");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_complete_part_is_kept_on_416_for_its_full_length() {
+        // E.g. the SUMS fetch failed right after a full download: the next
+        // attempt must not throw the finished part away and start over.
+        let (dir, part) = part_in("complete416");
+        std::fs::write(&part, b"ABCDEF").unwrap();
+        std::fs::write(validator_path(&part), "\"v1\"").unwrap();
+        let (url, server) = serve(1, |_, _| reply("416 Range Not Satisfiable", "Content-Range: bytes */6\r\nETag: \"v1\"\r\n", ""));
+        download(&client().unwrap(), &url, &part, "tool", 1024).unwrap();
+        assert_eq!(server.join().unwrap().len(), 1, "no second request");
+        assert_eq!(std::fs::read(&part).unwrap(), b"ABCDEF");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn only_one_installer_per_tool_at_a_time() {
+        let (dir, _) = part_in("installlock");
+        let first = install_lock(&dir, "yt-dlp").unwrap();
+        let busy = install_lock(&dir, "yt-dlp").unwrap_err();
+        assert!(busy.contains("уже устанавливается"), "{busy}");
+        // Another tool is independent.
+        let other = install_lock(&dir, "aria2c").unwrap();
+        drop(first);
+        install_lock(&dir, "yt-dlp").unwrap();
+        drop(other);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_aria2c_is_replaced_not_left_stale() {
+        // A copy of PING.EXE stands in for a running aria2c.exe.
+        let (dir, _) = part_in("running");
+        let dest = dir.join("tool.exe");
+        let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        std::fs::copy(system.join("System32").join("PING.EXE"), &dest).unwrap();
+        let mut running = std::process::Command::new(&dest)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let tmp = dir.join("tool.exe.part");
+        std::fs::write(&tmp, b"new verified build").unwrap();
+        assert!(std::fs::rename(&tmp, &dest).is_err(), "precondition: a running image cannot be overwritten");
+        publish_tool(&tmp, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new verified build");
+        assert!(!tmp.exists());
+        running.kill().ok();
+        running.wait().ok();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn stale_same_length_416_fetches_current_release() {
+        let (dir, part) = part_in("stale416");
+        std::fs::write(&part, b"ABCDEF").unwrap();
+        std::fs::write(validator_path(&part), "\"old\"").unwrap();
+        let (url, server) = serve(2, |i, _| if i == 0 {
+            reply("416 Range Not Satisfiable", "Content-Range: bytes */6\r\nETag: \"new\"\r\n", "")
+        } else { reply("200 OK", "ETag: \"new\"\r\n", "XYZ123") });
+        download(&client().unwrap(), &url, &part, "tool", 1024).unwrap();
+        assert_eq!(server.join().unwrap().len(), 2);
+        assert_eq!(std::fs::read(&part).unwrap(), b"XYZ123");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_transient_503_retries_and_resumes_in_the_same_attempt() {
+        let (dir, part) = part_in("retry-503");
+        std::fs::write(&part, b"ABC").unwrap();
+        std::fs::write(validator_path(&part), "\"v1\"").unwrap();
+        let (url, server) = serve(2, |i, _| if i == 0 {
+            reply("503 Service Unavailable", "", "")
+        } else { reply("206 Partial Content", "ETag: \"v1\"\r\nContent-Range: bytes 3-5/6\r\n", "DEF") });
+        let c = client().unwrap();
+        retry_transient(|| download(&c, &url, &part, "tool", 1024)).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("range: bytes=3-"));
+        assert_eq!(std::fs::read(&part).unwrap(), b"ABCDEF");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn interrupted_publish_recovers_previous_binary_before_network() {
+        let (dir, _) = part_in("recover-old");
+        let dest = dir.join("aria2c.exe");
+        std::fs::write(old_path(&dest), b"working binary").unwrap();
+        recover_tool(&dest).unwrap();
+        assert_eq!(std::fs::read(dest).unwrap(), b"working binary");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn release_metadata_is_capped_and_assets_share_one_tag() {
+        let err = read_metadata(&vec![b'x'; MAX_RELEASE_METADATA as usize + 1][..], "release").unwrap_err();
+        assert_eq!(err.kind, FailureKind::Permanent);
+        let (exe, sums) = yt_dlp_release_urls(&json!({"tag_name": "2026.08.19"})).unwrap();
+        assert!(exe.contains("/download/2026.08.19/") && sums.contains("/download/2026.08.19/"));
+        assert!(yt_dlp_release_urls(&json!({"tag_name": "../evil"})).is_err());
+    }
+
+    #[test]
+    fn github_rate_limit_403_preserves_parts_but_an_ordinary_403_does_not() {
+        for rate_limited in [false, true] {
+            let (url, server) = serve(1, move |_, _| reply("403 Forbidden",
+                if rate_limited { "X-RateLimit-Remaining: 0\r\n" } else { "" }, "{}"));
+            let failure = release_json(&client().unwrap(), &url).unwrap_err();
+            assert_eq!(failure.kind.keeps_part(), rate_limited);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_206_from_a_new_release_restarts_even_if_if_range_was_ignored() {
+        let (dir, part) = part_in("wrong-etag");
+        std::fs::write(&part, b"ABC").unwrap();
+        std::fs::write(validator_path(&part), "\"v1\"").unwrap();
+        let (url, server) = serve(2, |i, _| {
+            if i == 0 {
+                reply("206 Partial Content", "Content-Range: bytes 3-5/6\r\nETag: \"v2\"\r\n", "DEF")
+            } else {
+                reply("200 OK", "ETag: \"v2\"\r\n", "XYZ123")
+            }
+        });
+        download(&client().unwrap(), &url, &part, "tool", 1024).unwrap();
+        let seen = server.join().unwrap();
+        assert!(seen[0].contains("if-range: \"v1\""));
+        assert!(!seen[1].contains("range:"), "restart must fetch a whole file: {}", seen[1]);
+        assert_eq!(std::fs::read(&part).unwrap(), b"XYZ123");
+        assert_eq!(read_validator(&part).as_deref(), Some("\"v2\""));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_running_yt_dlp_keeps_its_exe_and_verified_part_until_retry() {
+        let (dir, _) = part_in("running-ytdlp");
+        let dest = dir.join("yt-dlp.exe");
+        let system = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let original = system.join("System32").join("PING.EXE");
+        std::fs::copy(&original, &dest).unwrap();
+        let mut running = std::process::Command::new(&dest)
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let tmp = dir.join("yt-dlp.exe.part");
+        std::fs::write(&tmp, b"new verified build").unwrap();
+        assert!(std::fs::rename(&tmp, &dest).is_err(), "a running image cannot be replaced");
+        assert_eq!(std::fs::read(&dest).unwrap(), std::fs::read(original).unwrap());
+        assert_eq!(std::fs::read(&tmp).unwrap(), b"new verified build");
+        assert!(!old_path(&dest).exists());
+        running.kill().ok();
+        running.wait().unwrap();
+        std::fs::rename(&tmp, &dest).unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new verified build");
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

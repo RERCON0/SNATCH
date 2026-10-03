@@ -1,9 +1,29 @@
 use std::path::{Path, PathBuf};
 
+/// Invisible format characters that can disguise text: bidi embeddings,
+/// overrides and isolates (U+202E turns "Track \u{202E}3pm.exe" into what
+/// reads as "Track exe.mp3"), directional marks, zero-width space / word
+/// joiners, BOM and soft hyphen. `char::is_control` is category Cc only and
+/// lets all of these through. ZWJ/ZWNJ (U+200C/U+200D) stay: emoji sequences
+/// and several scripts need them, and they cannot reorder text.
+pub fn is_disguising_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{180E}' | '\u{200B}' | '\u{200E}' | '\u{200F}'
+        | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}'
+        | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}'
+        | '\u{1BCA0}'..='\u{1BCA3}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
+}
+
 pub fn clip(text: &str, width: usize) -> String {
     // Labels may come from a hand-edited config or a remote filename. Never
-    // pass C0/DEL controls (notably ESC/OSC) into terminal menus or widgets.
-    let cleaned: String = text.trim().chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
+    // pass C0/DEL controls (notably ESC/OSC) into terminal menus or widgets,
+    // nor invisible bidi/format characters that make a name read as another.
+    let cleaned: String = text
+        .trim()
+        .chars()
+        .filter(|c| !is_disguising_format(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
     let t = cleaned.trim();
     if t.chars().count() <= width {
         t.to_string()
@@ -40,15 +60,20 @@ pub fn safe_read_dirs(path: &Path) -> Vec<PathBuf> {
 /// `examine_limit` directory entries have been examined, and the bool
 /// reports whether more entries remained. The cap counts raw directory
 /// entries, before filtering; filters and sorting are otherwise identical
-/// to `safe_read_dirs`. The GUI uses this so a huge or slow directory can't
-/// stall the UI thread for an unbounded time.
+/// to `safe_read_dirs`. This caps entry count, not filesystem latency; GUI
+/// callers run the checked variant on a worker thread.
 pub fn safe_read_dirs_limited(path: &Path, examine_limit: usize) -> (Vec<PathBuf>, bool) {
+    try_read_dirs_limited(path, examine_limit).unwrap_or_default()
+}
+
+pub fn try_read_dirs_limited(path: &Path, examine_limit: usize) -> std::io::Result<(Vec<PathBuf>, bool)> {
     if crate::engines::is_unc_path(path) {
-        return (Vec::new(), false);
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Сетевая UNC-папка не поддерживается"));
     }
     let mut truncated = false;
     let mut out: Vec<PathBuf> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(path) {
+    {
+        let entries = std::fs::read_dir(path)?;
         for (examined, entry) in entries.flatten().enumerate() {
             if examined >= examine_limit {
                 truncated = true;
@@ -79,7 +104,7 @@ pub fn safe_read_dirs_limited(path: &Path, examine_limit: usize) -> (Vec<PathBuf
     out.sort_by_cached_key(|p| {
         p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
     });
-    (out, truncated)
+    Ok((out, truncated))
 }
 
 #[cfg(test)]
@@ -87,11 +112,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unreadable_listing_is_an_error_not_an_empty_directory() {
+        let file = std::env::temp_dir().join(format!("snatch-not-a-dir-{}", std::process::id()));
+        std::fs::write(&file, b"file").unwrap();
+        assert!(try_read_dirs_limited(&file, 100).is_err());
+        std::fs::remove_file(file).ok();
+    }
+
+    #[test]
     fn clip_shortens_long_text() {
         assert_eq!(clip("abcdef", 4), "abc…");
         assert_eq!(clip("abc", 10), "abc");
         assert_eq!(clip("  spaced  ", 20), "spaced");
         assert_eq!(clip("name\x1b]0;fake title\x07.zip", 80), "name ]0;fake title .zip");
+    }
+
+    #[test]
+    fn clip_drops_invisible_bidi_and_format_characters() {
+        // U+202E would display "Track \u{202E}3pm.exe" as "Track exe.mp3".
+        assert_eq!(clip("Track \u{202E}3pm.exe", 80), "Track 3pm.exe");
+        for c in ['\u{200E}', '\u{200F}', '\u{2066}', '\u{2069}', '\u{FEFF}', '\u{00AD}', '\u{200B}',
+            '\u{034F}', '\u{206A}', '\u{FFF9}', '\u{1BCA0}', '\u{E0020}'] {
+            assert_eq!(clip(&format!("a{c}b"), 80), "ab", "U+{:04X}", c as u32);
+        }
+        // ZWJ is part of emoji sequences and some scripts: kept.
+        assert_eq!(clip("👨\u{200D}👩", 80), "👨\u{200D}👩");
+        // Real RTL letters are text, not format characters.
+        assert_eq!(clip("שלום", 80), "שלום");
     }
 
     #[test]

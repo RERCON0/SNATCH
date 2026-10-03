@@ -96,15 +96,25 @@ pub fn looks_like_auth(line: &str) -> bool {
     dominated && AUTH_HINTS.iter().any(|p| contains_ignore_ascii_case(line, p))
 }
 
+/// aria2's progress summary starts the line; finding `[#` anywhere would
+/// mistake a yt-dlp Destination containing `[#gid ... (NN%)]` for progress.
+fn aria2_summary(line: &str) -> Option<&str> {
+    let line = line.trim_start();
+    let summary = &line[..=line.find(']')?];
+    let (gid, rest) = summary.strip_prefix("[#")?.split_once(' ')?;
+    if gid.is_empty() || !gid.bytes().all(|b| b.is_ascii_hexdigit())
+        || !rest.split_whitespace().next()?.contains('/')
+    {
+        return None;
+    }
+    Some(summary)
+}
+
 pub fn parse_progress(line: &str) -> Option<f32> {
-    // aria2's "(NN%)" summary shape, gated on its "[#<gid> " marker. Without
-    // the gate ANY line containing "(N%)" parses as progress - e.g. a yt-dlp
-    // "[download] Destination: ...(100%).mp4" whose title happens to carry a
-    // percentage would jump the bar to that value.
-    if line.contains("[#") {
-        if let Some(i) = line.find("%)") {
-            if let Some(start) = line[..i].rfind('(') {
-                if let Ok(p) = line[start + 1..i].parse::<f32>() {
+    if let Some(summary) = aria2_summary(line) {
+        if let Some(i) = summary.find("%)") {
+            if let Some(start) = summary[..i].rfind('(') {
+                if let Ok(p) = summary[start + 1..i].parse::<f32>() {
                     if (0.0..=100.0).contains(&p) {
                         return Some(p / 100.0);
                     }
@@ -129,9 +139,7 @@ pub fn parse_progress(line: &str) -> Option<f32> {
 /// download progress; [FileAlloc:...] is a separate allocation stage, not a
 /// second file's percentage. Used by both terminal and GUI frontends.
 pub fn aria2_stat(line: &str) -> Option<String> {
-    let start = line.find("[#")?;
-    let end = start + line[start..].find(']')?;
-    let summary = &line[start..=end];
+    let summary = aria2_summary(line)?;
     let percent = (parse_progress(summary)? * 100.0).round() as u32;
     let amount = summary.split_whitespace().nth(1)?.split('(').next()?;
     if let Some(start) = line.find("[FileAlloc:") {
@@ -344,9 +352,16 @@ fn has_control_chars(u: &str) -> bool {
 /// path - even just `is_file()` - makes Windows perform SMB authentication
 /// against the remote host, leaking the user's NetNTLMv2 hash (offline
 /// cracking / relay), so UNC inputs are refused before any filesystem call.
+/// Also true for the NT object-manager prefix `\??\` (and `/??/`): Win32
+/// passes it through untouched, so `\??\UNC\host\share` reaches the same SMB
+/// share without starting with two separators. Nobody types a local path
+/// that way, so every `\??\` path is treated as one we must not touch.
 fn is_unc_text(s: &str) -> bool {
     let bytes = s.as_bytes();
-    bytes.len() >= 2 && matches!(bytes[0], b'\\' | b'/') && matches!(bytes[1], b'\\' | b'/')
+    let sep = |b: u8| matches!(b, b'\\' | b'/');
+    let double = bytes.len() >= 2 && sep(bytes[0]) && sep(bytes[1]);
+    let nt_prefix = bytes.len() >= 4 && sep(bytes[0]) && &bytes[1..3] == b"??" && sep(bytes[3]);
+    double || nt_prefix
 }
 
 pub fn is_unc_path(p: &Path) -> bool {
@@ -536,7 +551,7 @@ pub fn is_direct_download(url: &str) -> bool {
         && FILE_EXT.contains(&suffix_of(&percent_decode(&path_from_url(url))).as_str())
 }
 
-fn is_bittorrent_input(url: &str) -> bool {
+pub fn is_bittorrent_input(url: &str) -> bool {
     if scheme_of(url) == "magnet" {
         return true;
     }
@@ -599,7 +614,7 @@ fn format_flags(fmt: &str) -> Vec<&'static str> {
 /// mkdirs it; preflight must not): shared by both for collision decisions.
 fn absolute_out_dir(out_dir: &Path) -> PathBuf {
     let expanded = expanduser(out_dir);
-    if expanded.is_absolute() {
+    if is_unc_path(&expanded) || expanded.is_absolute() {
         expanded
     } else {
         std::env::current_dir().unwrap_or_default().join(expanded)
@@ -621,18 +636,25 @@ fn url_basename(url: &str) -> String {
 /// Lock and ownership records live outside Downloads, shared by CLI/GUI and
 /// both editions of SNATCH. A bare .aria2 file does NOT establish that its
 /// source URL matches this job; aria2 -c can overwrite an unrelated partial.
-fn aria2_state_dir() -> PathBuf {
-    config_dir().join("aria2-locks")
+fn aria2_state_dir() -> Result<PathBuf, String> {
+    config_dir().map(|p| p.join("aria2-locks"))
+}
+
+/// NTFS compares file names without Unicode's context-sensitive final-sigma
+/// lowercasing. Lowercase each scalar on its own: ΚΑΛΟΣ and καλοσ must hash
+/// to the same lock even when a final Σ would become ς in str::to_lowercase.
+pub(crate) fn ntfs_case_key(s: &str) -> String {
+    s.chars().flat_map(char::to_lowercase).collect()
 }
 
 fn aria2_target_key(out: &Path, name: &str) -> String {
     let canonical = std::fs::canonicalize(out).unwrap_or_else(|_| out.to_path_buf());
     let path = canonical.to_string_lossy();
-    let key = if cfg!(windows) { path.to_lowercase() } else { path.into_owned() };
+    let key = if cfg!(windows) { ntfs_case_key(&path) } else { path.into_owned() };
     let mut hash = Sha256::new();
     hash.update(key.as_bytes());
     hash.update([0]);
-    hash.update(if cfg!(windows) { name.to_lowercase() } else { name.to_string() }.as_bytes());
+    hash.update(if cfg!(windows) { ntfs_case_key(name) } else { name.to_string() }.as_bytes());
     format!("{:x}", hash.finalize())
 }
 
@@ -660,7 +682,7 @@ fn aria2_owned_partial_in(url: &str, out: &Path, state_dir: &Path) -> bool {
 }
 
 fn aria2_owned_partial(url: &str, out: &Path) -> bool {
-    aria2_owned_partial_in(url, out, &aria2_state_dir())
+    aria2_state_dir().is_ok_and(|state| aria2_owned_partial_in(url, out, &state))
 }
 
 fn aria2_foreign_target(url: &str, out: &Path) -> bool {
@@ -693,7 +715,8 @@ fn aria2_foreign_pair(url: &str, out: &Path) -> Option<String> {
 /// Stable lock files are never deleted, or another process could lock a new
 /// inode while an earlier download still holds the old one.
 pub fn lock_aria2_target(job: &Job, wait: bool) -> Result<Option<std::fs::File>, String> {
-    lock_aria2_target_in(job, wait, &aria2_state_dir())
+    if job.engine != "aria2" || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) { return Ok(None); }
+    lock_aria2_target_in(job, wait, &aria2_state_dir()?)
 }
 
 fn lock_aria2_target_in(job: &Job, wait: bool, state_dir: &Path) -> Result<Option<std::fs::File>, String> {
@@ -751,8 +774,8 @@ fn aria2_flags(owned_partial: bool) -> Vec<&'static str> {
 }
 
 pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
-    // Защита от неизвестного движка: иначе он молча ушёл бы по yt-dlp-ветке
-    // (else ниже) и получил бы чужие флаги.
+    // Нативные движки не строят внешнюю команду; без этого guard'а они молча
+    // ушли бы по yt-dlp-ветке (else ниже) и получили бы чужие флаги.
     if job.engine != "yt-dlp" && job.engine != "aria2" {
         return Err(format!("Неизвестный движок: {:?}", job.engine));
     }
@@ -852,6 +875,45 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     Ok(cmd)
 }
 
+/// Like [`build`], but applies the user's torrent [`Choice`]: `--select-file`
+/// for a partial selection, and the .torrent fetched while listing as aria2's
+/// input instead of the magnet/URL - aria2 downloads exactly what was listed
+/// and does not fetch the metadata twice. (No RPC: with `--enable-rpc` aria2
+/// runs as a daemon and never exits after the download - live stats come
+/// from the `--summary-interval` console output instead.)
+///
+/// [`Choice`]: crate::torrent::Choice
+pub fn build_for_run(job: &Job, tc: &Toolchain, choice: &crate::torrent::Choice) -> Result<Vec<OsString>, String> {
+    let mut cmd = build(job, tc)?;
+    if job.engine != "aria2" || !is_bittorrent_input(&job.url) {
+        return Ok(cmd);
+    }
+    // build() ends with ["--", url]: the input stays after the terminator and
+    // every flag goes before it, so aria2c never treats the input as an
+    // option argument.
+    if let Some(meta) = &choice.meta {
+        if meta.path().is_file() {
+            meta.touch();
+            if let Some(input) = cmd.last_mut() {
+                *input = meta.path().as_os_str().to_os_string();
+            }
+        } else if choice.files.is_some() && scheme_of(&job.url) != "magnet" {
+            // Gone (a temp cleaner during a long pause). A magnet pins its
+            // content by hash, so aria2 can simply fetch it again; an http(s)
+            // .torrent may have changed since, and the picked indices would
+            // then select different files.
+            return Err("файлы выбирались по .torrent, которого больше нет — добавьте ссылку и выберите файлы заново".into());
+        }
+    }
+    if let Some(sel) = &choice.files {
+        if let Some(spec) = crate::torrent::select_spec(sel)? {
+            let insert_at = cmd.len().saturating_sub(2);
+            cmd.insert(insert_at, format!("--select-file={spec}").into());
+        }
+    }
+    Ok(cmd)
+}
+
 pub fn preflight_warning(job: &Job) -> Vec<String> {
     // ffmpeg presence does not change mid-process; probe PATH once per run.
     static HAS_FFMPEG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -885,6 +947,10 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool) -> Vec<String> {
     // E-1/F1: collision feedback. A bare file is renamed around; a foreign
     // file+control pair stops the job (aria2 would auto-continue it).
     let out = absolute_out_dir(&job.out_dir);
+    if is_unc_path(&out) {
+        warns.push("Сетевая UNC-папка не поддерживается — выберите локальную папку.".into());
+        return warns;
+    }
     if job.engine == "aria2" || (job.engine == "yt-dlp" && is_direct_download(&job.url)) {
         if let Some(name) = aria2_foreign_pair(&job.url, &out) {
             warns.push(format!(
@@ -907,7 +973,12 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
     let Some(program) = cmd.first() else {
         return RunResult { code: 127, auth_hint: false };
     };
-    let mut child = match Command::new(program)
+    let install_guard = match crate::tools::lock_for_spawn(Path::new(program)) {
+        Ok(guard) => guard,
+        Err(e) => { crate::errln(e); return RunResult { code: 127, auth_hint: false }; }
+    };
+    let mut command = Command::new(program);
+    command
         .args(&cmd[1..])
         // Same nudge as the GUI: makes a *non-frozen* (python-based) yt-dlp
         // emit UTF-8 into pipes; the frozen yt-dlp.exe ignores it, which the
@@ -915,50 +986,56 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return RunResult { code: 127, auth_hint: false },
+        .stderr(Stdio::piped());
+    let (mut child, proc_job) = match crate::job_object::spawn(&mut command, false) {
+        Ok(result) => result,
+        Err(e) => {
+            crate::errln(format!("✘ Защита дерева загрузчика: {e}"));
+            return RunResult { code: 127, auth_hint: false };
+        }
     };
-
+    drop(install_guard);
     let stdout = child.stdout.take().expect("stdout piped");
     let stdout_thread = std::thread::spawn(move || relay_stdout(stdout, std::io::stdout()));
-    let mut auth_hint = false;
-    if let Some(err) = child.stderr.take() {
-        let mut reader = BufReader::new(err);
-        let mut sink = std::io::stderr();
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {}
+    let stderr = child.stderr.take();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut auth_hint = false;
+        if let Some(err) = stderr {
+            let mut reader = BufReader::new(err);
+            let mut sink = std::io::stderr();
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                // Decode before detecting hints: frozen yt-dlp may emit cp1251.
+                let line = decode_child_bytes(&buf);
+                if capture_stderr && !auth_hint && looks_like_auth(&line) {
+                    auth_hint = true;
+                }
+                // Neutralize terminal escapes before echoing server text.
+                let cleaned = sanitize_child_output(&line);
+                let _ = sink.write_all(cleaned.as_bytes());
+                let _ = sink.flush();
             }
-            // Detect auth hints on the decoded line (`lines()` would Err on
-            // the cp1251 bytes the frozen yt-dlp.exe emits and - via the old
-            // `else { break }` - close this pipe out from under the child).
-            let line = decode_child_bytes(&buf);
-            if capture_stderr && !auth_hint && looks_like_auth(&line) {
-                auth_hint = true;
-            }
-            // Neutralize C0 control characters (except \n\t\r) before echoing:
-            // server-controlled text (video titles inside yt-dlp errors) must
-            // not inject raw ESC sequences into the user's terminal. Writing
-            // the decoded String (not raw bytes) also renders correctly on a
-            // Windows console: std re-encodes it via WriteConsoleW, whereas
-            // raw cp1251 bytes would turn into mojibake/U+FFFD.
-            let cleaned = sanitize_child_output(&line);
-            let _ = sink.write_all(cleaned.as_bytes());
-            let _ = sink.flush();
         }
-    }
-
+        auth_hint
+    });
     let code = match child.wait() {
         Ok(status) => status.code().unwrap_or(130),
         Err(_) => 127,
     };
-    let _ = stdout_thread.join();
+    if let Some(job) = &proc_job { job.terminate(); }
+    match stdout_thread.join() {
+        Ok(Ok(())) => {},
+        Ok(Err(e)) => crate::errln(format!("⚠ Не удалось передать вывод загрузчика: {e}")),
+        Err(_) => crate::errln("⚠ Поток stdout загрузчика завершился с паникой"),
+    }
+    let auth_hint = stderr_thread.join().unwrap_or_else(|_| {
+        crate::errln("⚠ Поток stderr загрузчика завершился с паникой; подсказка авторизации недоступна"); false
+    });
     RunResult { code, auth_hint }
 }
 
@@ -1075,10 +1152,59 @@ mod tests {
             r"\/evil.com\share\movie.torrent",
             r"/\evil.com\share\movie.torrent",
             r"\\?\UNC\evil.com\share\movie.torrent",
+            // NT prefix: Win32 passes "\??\" straight through, so this
+            // reaches \\evil.com\share without a leading double separator.
+            r"\??\UNC\evil.com\share\movie.torrent",
+            "/??/UNC/evil.com/share/movie.torrent",
         ] {
             assert!(is_unc_path(Path::new(bad)), "{bad}");
             let err = validate_url(bad).unwrap_err();
             assert!(err.contains("UNC"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn ntfs_key_does_not_depend_on_final_sigma_context() {
+        assert_eq!(ntfs_case_key("ΚΑΛΟΣ"), ntfs_case_key("καλοσ"));
+        assert_eq!(ntfs_case_key("ΚΑΛΟΣ"), "καλοσ");
+        #[cfg(windows)]
+        {
+            // An absolute directory avoids other parallel tests temporarily
+            // changing the process-wide current working directory.
+            let out = std::env::current_exe().unwrap();
+            let out = out.parent().unwrap();
+            assert_eq!(aria2_target_key(out, "ΚΑΛΟΣ"), aria2_target_key(out, "καλοσ"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ntfs_sigma_aliases_share_a_key_for_the_same_actual_file() {
+        let dir = tmp_out(); std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ΚΑΛΟΣ.mp3"), b"same file").unwrap();
+        for name in ["καλοσ.mp3", "ΚΑΛΟΣ.mp3"] {
+            assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"same file");
+            assert_eq!(aria2_target_key(&dir, name), aria2_target_key(&dir, "ΚΑΛΟΣ.mp3"));
+        }
+        if dir.join("καλος.mp3").exists() {
+            assert_eq!(aria2_target_key(&dir, "καλος.mp3"), aria2_target_key(&dir, "ΚΑΛΟΣ.mp3"));
+        } else {
+            // This volume distinguishes final sigma. Do not merge two
+            // different files' .origin records merely by linguistic folding.
+            std::fs::write(dir.join("καλος.mp3"), b"different file").unwrap();
+            assert_ne!(aria2_target_key(&dir, "καλος.mp3"), aria2_target_key(&dir, "ΚΑΛΟΣ.mp3"));
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn preflight_rejects_unc_before_collision_probes() {
+        for path in [r"\\127.0.0.1\snatch-test", r"\??\UNC\127.0.0.1\snatch-test"] {
+            let job = Job { engine: "aria2".into(), url: "https://example.test/video.mp4".into(),
+                out_dir: path.into(), fmt: "best".into(), cookies_browser: None };
+            let warnings = preflight_warning_with_ffmpeg(&job, true);
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("UNC"));
         }
     }
 
@@ -1370,9 +1496,9 @@ mod tests {
     }
 
     #[test]
-    fn unknown_engine_is_not_dispatched_to_ytdlp() {
+    fn native_engine_is_not_dispatched_to_ytdlp() {
         let out = tmp_out();
-        let job = Job { engine: "native".into(), url: "https://example.com/1".into(),
+        let job = Job { engine: "native".into(), url: "https://example.test/x".into(),
             out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
         assert!(build(&job, &tc_ytdlp()).is_err());
         assert!(!out.exists());
@@ -1551,6 +1677,12 @@ mod tests {
         assert_eq!(parse_progress("ERROR: Unsupported URL"), None);
         // a percentage inside a title/path is not progress
         assert_eq!(parse_progress("[download] Destination: C:\\v\\Progress (100%).mp4"), None);
+        let title_with_aria2_marker = "[download] Destination: C:\\v\\Clip [#abc123 1MiB/2MiB(88%)].mp4";
+        assert_eq!(parse_progress(title_with_aria2_marker), None);
+        assert_eq!(aria2_stat(title_with_aria2_marker), None);
+        assert_eq!(parse_progress("  [#50e13e 880KiB/0.9MiB(88%) CN:1]"), Some(0.88));
+        assert_eq!(parse_progress("[#50e13e 880KiB/0.9MiB(oops%) CN:1]"), None);
+        assert_eq!(aria2_stat("prefix [#50e13e 880KiB/0.9MiB(88%) CN:1]"), None);
         assert_eq!(parse_progress("[Merger] Merging (50%) something"), None);
     }
 

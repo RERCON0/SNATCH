@@ -1,7 +1,10 @@
 pub mod config;
 pub mod engines;
+mod http;
+pub mod job_object;
 pub mod setup;
 pub mod tools;
+pub mod torrent;
 pub mod ui;
 
 pub const BANNER: &str = r#"

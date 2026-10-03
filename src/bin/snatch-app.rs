@@ -18,7 +18,8 @@ use snatch_rs::engines::{
 };
 use snatch_rs::setup::{install_aria2, install_yt_dlp};
 use snatch_rs::tools::{bootstrap_dir, Toolchain};
-use snatch_rs::ui::{clip, safe_read_dirs_limited};
+use snatch_rs::{job_object, torrent};
+use snatch_rs::ui::{clip, try_read_dirs_limited};
 use snatch_rs::{BANNER, TELEGRAM_URL};
 
 const APP_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " — by rercon prod.");
@@ -70,6 +71,11 @@ enum Msg {
     ErrLine(u64, String),
     Progress(u64, f32),
     TorrentStatus(u64, f32, String),
+    /// File list resolved for a torrent job (metadata fetched off-thread).
+    /// The tree is built on the listing thread: a huge/hostile torrent must
+    /// not stall (or overflow) the UI thread.
+    TorrentFiles(u64, Result<(torrent::Listing, Vec<torrent::TorrNode>), String>),
+    DirListed(PathBuf, PathBuf, Result<(Vec<PathBuf>, bool), String>),
     TorrentMeta(u64, String),
     TorrentName(u64, String),
     TorrentLog(u64, String),
@@ -79,131 +85,6 @@ enum Msg {
     /// фоновом потоке, а не на UI-потоке)
     SetupDone(bool, Toolchain),
     ToolsReady(Toolchain),
-}
-
-/// Win32 job object with KILL_ON_JOB_CLOSE, hand-rolled FFI (the project
-/// deliberately has no windows/winapi crate). The spawned loader is assigned
-/// to a job for the lifetime of its monitor thread, which fixes two orphan
-/// classes at once:
-/// - "отменить" used to `Child::kill()` only the direct child; yt-dlp's own
-///   children (ffmpeg mid-merge, aria2c as external downloader) survived and
-///   kept writing to the output folder;
-/// - if the GUI itself dies (crash, task-manager kill), the OS closes the
-///   last job handle and takes the whole downloader tree with it.
-///
-/// `TerminateJobObject` on cancel kills the tree in one call.
-#[cfg(windows)]
-mod job_object {
-    use std::ffi::c_void;
-
-    type Handle = *mut c_void;
-
-    #[repr(C)]
-    struct IoCounters {
-        read_ops: u64,
-        write_ops: u64,
-        other_ops: u64,
-        read_bytes: u64,
-        write_bytes: u64,
-        other_bytes: u64,
-    }
-
-    #[repr(C)]
-    struct BasicLimitInformation {
-        per_process_user_time_limit: i64,
-        per_job_user_time_limit: i64,
-        limit_flags: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-
-    #[repr(C)]
-    struct ExtendedLimitInformation {
-        basic: BasicLimitInformation,
-        io: IoCounters,
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_used: usize,
-        peak_job_memory_used: usize,
-    }
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x2000;
-    const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-
-    extern "system" {
-        fn CreateJobObjectW(attrs: *mut c_void, name: *const u16) -> Handle;
-        fn SetInformationJobObject(job: Handle, class: i32, info: *const c_void, len: u32) -> i32;
-        fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
-        fn TerminateJobObject(job: Handle, exit_code: u32) -> i32;
-        fn CloseHandle(h: Handle) -> i32;
-    }
-
-    pub struct Job {
-        handle: Handle,
-    }
-
-    // The handle is process-global state; it is created on the UI thread and
-    // then owned exclusively by one monitor thread.
-    unsafe impl Send for Job {}
-
-    impl Job {
-        /// Returns None (and leaks nothing) if any step fails - the caller
-        /// falls back to plain Child::kill semantics.
-        pub fn create_and_assign(process: Handle) -> Option<Self> {
-            unsafe {
-                let handle = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-                if handle.is_null() {
-                    return None;
-                }
-                let mut info: ExtendedLimitInformation = std::mem::zeroed();
-                info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-                let ok = SetInformationJobObject(
-                    handle,
-                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
-                    &info as *const _ as *const c_void,
-                    std::mem::size_of::<ExtendedLimitInformation>() as u32,
-                );
-                if ok == 0 || AssignProcessToJobObject(handle, process) == 0 {
-                    CloseHandle(handle);
-                    return None;
-                }
-                Some(Self { handle })
-            }
-        }
-
-        pub fn terminate(&self) {
-            unsafe {
-                TerminateJobObject(self.handle, 1);
-            }
-        }
-    }
-
-    impl Drop for Job {
-        fn drop(&mut self) {
-            unsafe {
-                // Last handle closes -> KILL_ON_JOB_CLOSE reaps whatever of
-                // the tree is still alive.
-                CloseHandle(self.handle);
-            }
-        }
-    }
-}
-
-/// Non-Windows placeholder so the monitor-loop code below stays cfg-free.
-#[cfg(not(windows))]
-mod job_object {
-    pub struct Job;
-
-    impl Job {
-        pub fn create_and_assign(_process: *mut std::ffi::c_void) -> Option<Self> {
-            None
-        }
-        pub fn terminate(&self) {}
-    }
 }
 
 /// One running or just-finished-and-being-retried download. Everything that
@@ -235,6 +116,9 @@ struct ActiveJob {
     /// of a corrupt resume) - distinct from resumed_seen, which is whether
     /// yt-dlp printed "Resuming download" during this run.
     no_continue: bool,
+    /// Torrent file selection + fetched metadata, kept so a paused job
+    /// resumes with the same selection (default for every other job).
+    select: torrent::Choice,
 }
 
 impl ActiveJob {
@@ -246,11 +130,243 @@ impl ActiveJob {
 
 /// A job stopped via "пауза" instead of "отмена" - just enough to redisplay
 /// it and respawn it unchanged when the user clicks "продолжить".
+#[derive(Clone)]
 struct PausedJob {
     job: Job,
     label: String,
     progress: Option<f32>,
     status: String,
+    select: torrent::Choice,
+    no_continue: bool,
+}
+
+#[derive(Clone)]
+struct QueuedJob {
+    job: Job,
+    select: torrent::Choice,
+    no_continue: bool,
+}
+
+/// A torrent job waiting in the file-pick modal: first while its file list
+/// is fetched off-thread, then while the user ticks the files.
+struct TorrentPick {
+    id: u64,
+    job: Job,
+    /// Set on cancel/close: the listing thread kills its aria2c at once
+    /// instead of fetching metadata nobody will use.
+    cancel: Arc<AtomicBool>,
+    info: Option<torrent::TorrentInfo>,
+    /// Metadata fetched for a magnet/http(s) input; the download reuses it.
+    meta: Option<torrent::Meta>,
+    selected: Vec<bool>,
+    tree: Vec<torrent::TorrNode>,
+    view: torrent::TreeView,
+    /// The listing failed: the modal says why and offers the whole torrent
+    /// instead of silently switching to it.
+    error: Option<String>,
+    /// Why "скачать" was refused (a selection too scattered to pass).
+    hint: Option<String>,
+}
+
+impl TorrentPick {
+    /// Still fetching the file list: the form stays usable for running jobs
+    /// and the run row shows a cancel; the modal only opens once there is a
+    /// list (or an error) to act on.
+    fn loading(&self) -> bool {
+        self.info.is_none() && self.error.is_none()
+    }
+}
+
+/// What a frame of the pick modal asked for.
+#[derive(Default)]
+struct PickActions {
+    confirm: bool,
+    cancel: bool,
+    all: bool,
+    none: bool,
+    download_all: bool,
+    /// Rects of the dialog's buttons this frame - the layout test checks
+    /// they stay inside the dialog and never overlap.
+    #[cfg_attr(not(test), allow(dead_code))]
+    buttons: Vec<egui::Rect>,
+}
+
+/// The pick modal itself (list or error state). Free of `SnatchApp` so its
+/// geometry can be tested; returns the frame's actions and the window rect.
+fn torrent_pick_window(ctx: &egui::Context, pick: &mut TorrentPick) -> (PickActions, Option<egui::Rect>) {
+    let mut act = PickActions::default();
+    // Never wider than the window: at the default 460px a fixed 560px dialog
+    // pushed the folder toggles/checkboxes off-screen. Frame margins + a gap.
+    let screen_w = ctx.screen_rect().width();
+    let frame_w = ctx.style().spacing.window_margin.sum().x + 24.0;
+    let width = (screen_w - frame_w).clamp(200.0, 560.0);
+    let shown = egui::Window::new(window_title("ВЫБОР ФАЙЛОВ ТОРРЕНТА"))
+        .collapsible(false)
+        .resizable(false)
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .show(ctx, |ui| {
+            ui.set_width(width);
+            if let Some(err) = &pick.error {
+                ui.colored_label(ui.visuals().error_fg_color, err);
+                if let Some(hint) = &pick.hint { ui.colored_label(ui.visuals().warn_fg_color, hint); }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let accent = ui.visuals().hyperlink_color;
+                        let all = ui.add(accent_button(accent, "[ скачать всё ]"));
+                        let cancel = ui.button("[ отмена ]");
+                        act.download_all = all.clicked();
+                        act.cancel = cancel.clicked();
+                        act.buttons.extend([all.rect, cancel.rect]);
+                    });
+                });
+                return;
+            }
+            let Some(info) = &pick.info else { return };
+            ui.weak(format!(
+                "«{}» · файлов {} · всего {}",
+                clip(&info.name, 60),
+                info.files.len(),
+                torrent::human_size(info.total)
+            ));
+            ui.weak(format!("Папка: {}", clip(&pick.job.out_dir.to_string_lossy(), 80)));
+            ui.add_space(4.0);
+            torrent_tree_rows(ui, &mut pick.tree, &mut pick.selected, &mut pick.view);
+            let count = pick.view.selected;
+            if count > 0 && count < pick.selected.len() {
+                ui.add_space(4.0);
+                ui.weak("Соседние невыбранные файлы могут появиться частично скачанными — так устроены торренты.");
+            }
+            if let Some(hint) = &pick.hint {
+                ui.add_space(4.0);
+                ui.colored_label(ui.visuals().warn_fg_color, hint);
+            }
+            ui.add_space(6.0);
+            // Selection buttons and actions on separate rows: at the default
+            // 460px width one row cannot hold all four, and the right-aligned
+            // pair slid over "снять все" (its clicks landed on "отмена").
+            ui.horizontal(|ui| {
+                let all = ui.button("[ все ]");
+                let none = ui.button("[ снять все ]");
+                act.all = all.clicked();
+                act.none = none.clicked();
+                act.buttons.extend([all.rect, none.rect]);
+            });
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let accent = ui.visuals().hyperlink_color;
+                    let confirm =
+                        ui.add_enabled(count > 0, accent_button(accent, format!("[ скачать ({count}) ]")));
+                    let cancel = ui.button("[ отмена ]");
+                    act.confirm = confirm.clicked();
+                    act.cancel = cancel.clicked();
+                    act.buttons.extend([confirm.rect, cancel.rect]);
+                });
+            });
+        });
+    (act, shown.map(|r| r.response.rect))
+}
+
+/// Visible rows of the pick tree, used by the row geometry test.
+#[cfg(test)]
+fn torrent_visible_rows(
+    nodes: &[torrent::TorrNode],
+    depth: usize,
+    prefix: &mut Vec<usize>,
+    rows: &mut Vec<(Vec<usize>, usize)>,
+) {
+    for (i, n) in nodes.iter().enumerate() {
+        prefix.push(i);
+        rows.push((prefix.clone(), depth));
+        if n.file.is_none() && n.expanded {
+            torrent_visible_rows(&n.children, depth + 1, prefix, rows);
+        }
+        prefix.pop();
+    }
+}
+
+/// Height of one pick-list row: a single interact-size control (checkbox /
+/// ▶ toggle). `show_rows` positions rows by this number - the old fixed 22px
+/// against real 28px rows made the scrollbar jump and clipped the last rows.
+fn torrent_row_height(ui: &egui::Ui) -> f32 {
+    ui.spacing().interact_size.y
+}
+
+/// One row of the pick list, held to exactly `row_h` for folders and files.
+fn torrent_tree_row(
+    ui: &mut egui::Ui,
+    tree: &mut [torrent::TorrNode],
+    selected: &mut [bool],
+    row: &(Vec<usize>, usize),
+    row_h: f32,
+) -> (bool, bool) {
+    let mut expanded_changed = false;
+    let mut selection_changed = false;
+    let (path, depth) = row;
+    let (is_dir, name, size, expanded, leaf, sel, total) = {
+        let node = torrent::node_at(tree, path);
+        let (sel, total) = node.selection;
+        (node.file.is_none(), node.name.clone(), node.size, node.expanded, node.file, sel, total)
+    };
+    let layout = egui::Layout::left_to_right(egui::Align::Center);
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), row_h), layout, |ui| {
+        ui.set_min_height(row_h);
+        // A long name ends in "…" at the dialog's edge instead of widening
+        // the row past it.
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        ui.add_space((*depth).min(6) as f32 * 14.0);
+        if *depth > 6 { ui.label("…"); }
+        if is_dir {
+            let marker = if expanded { "▼" } else { "▶" };
+            if ui
+                .add(egui::Button::new(marker).frame(false).min_size(egui::vec2(18.0, 18.0)))
+                .clicked()
+            {
+                torrent::node_at_mut(tree, path).expanded = !expanded;
+                expanded_changed = true;
+            }
+            // A partly picked folder must not look unpicked: "–" box, and a
+            // click ticks the whole folder.
+            let partial = sel > 0 && sel < total;
+            let mut all = total > 0 && sel == total;
+            if ui.add(egui::Checkbox::new(&mut all, "").indeterminate(partial)).changed() {
+                torrent::node_at_mut(tree, path).set_all(selected, all);
+                selection_changed = true;
+            }
+            // Size and the partial count lead: a long name is what gets
+            // truncated at the dialog's edge, never them.
+            let count = if partial { format!("{sel}/{total} · ") } else { String::new() };
+            ui.label(format!("{} · {count}{}", torrent::human_size(size), clip(&name, 120)));
+        } else {
+            ui.add_space(18.0);
+            if let Some(fi) = leaf {
+                if fi < selected.len() {
+                    selection_changed |= ui.checkbox(
+                        &mut selected[fi],
+                        format!("{} · {}", torrent::human_size(size), clip(&name, 120)),
+                    ).changed();
+                }
+            }
+        }
+    });
+    (expanded_changed, selection_changed)
+}
+
+/// The pick list itself: flattened rows + a virtualized scroll area.
+fn torrent_tree_rows(ui: &mut egui::Ui, tree: &mut [torrent::TorrNode], selected: &mut [bool], view: &mut torrent::TreeView) {
+    view.prepare(tree, selected);
+    let row_h = torrent_row_height(ui);
+    egui::ScrollArea::vertical()
+        .max_height(380.0)
+        .auto_shrink([false, true])
+        .show_rows(ui, row_h, view.rows.len(), |ui, range| {
+            for row in &view.rows[range] {
+                let (expanded, selection) = torrent_tree_row(ui, tree, selected, row, row_h);
+                view.rows_dirty |= expanded;
+                view.selection_dirty |= selection;
+            }
+        });
 }
 
 struct DirBrowser {
@@ -260,6 +376,9 @@ struct DirBrowser {
     /// The last listing hit `DIR_BROWSER_SCAN_CAP`: more entries may exist.
     truncated: bool,
     listed_for: Option<PathBuf>,
+    in_flight: Option<PathBuf>,
+    resolve_initial: bool,
+    error: Option<String>,
 }
 
 fn torrent_console_line(id: u64, line: &str) -> Option<Msg> {
@@ -324,6 +443,8 @@ struct SnatchApp {
     /// MAX_CONCURRENT at once, matching the CLI's `-j` default.
     jobs: Vec<ActiveJob>,
     next_job_id: u64,
+    next_pick_id: u64,
+    torrent_pick: Option<TorrentPick>,
     /// A job that just finished with an auth-shaped failure, offering a
     /// cookies retry. Lives here (not in `jobs`, which only holds active
     /// ones) so the offer survives after the failed job is removed.
@@ -359,7 +480,7 @@ struct SnatchApp {
     dark_mode: bool,
     /// Links added past MAX_CONCURRENT active jobs. FIFO, except an explicit
     /// cookies retry jumps the line (push_front) - see the retry button.
-    queue: VecDeque<Job>,
+    queue: VecDeque<QueuedJob>,
 }
 
 /// CLI's `-j` defaults to 3 concurrent downloads; match it here so the two
@@ -769,27 +890,25 @@ fn dashed_separator(ui: &mut egui::Ui) {
 /// from the mockup grew by the scale factor, so the app never matched the
 /// HTML side by side. Pinning pixels_per_point to a constant makes one
 /// design px equal UI_SCALE physical px on any display, whatever the OS
-/// reports. UI_SCALE is larger than 1.0: the original 1:1 version read too
-/// small, so the whole interface gets a global nudge instead of per-widget
-/// size edits. The viewport is sized in logical px (OS-scaled), so the
-/// desired physical size is divided back by the native scale.
+/// reports. UI_SCALE is larger than 1.0 for readability. Viewport commands
+/// take egui points and winit applies the effective scale itself; multiplying
+/// those dimensions again would scale the window twice.
 const UI_SCALE: f32 = 1.18;
 
 fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
-    if ctx.pixels_per_point() == UI_SCALE {
+    if ctx.pixels_per_point() == UI_SCALE && !resize_viewport {
         return;
     }
-    let native = ctx.native_pixels_per_point().unwrap_or(1.0);
     ctx.set_pixels_per_point(UI_SCALE);
     if resize_viewport {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            460.0 * UI_SCALE / native,
-            640.0 * UI_SCALE / native,
+            460.0,
+            640.0,
         )));
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-        460.0 * UI_SCALE / native,
-        520.0 * UI_SCALE / native,
+        460.0,
+        520.0,
     )));
 }
 
@@ -832,20 +951,17 @@ fn path_drive_letter(p: &Path) -> Option<u8> {
 
 impl SnatchApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let cfg = Config::load();
+        let (cfg, warning) = match Config::try_load() {
+            Ok(cfg) => (cfg, None),
+            Err(e) => (Config::default(), Some(e)),
+        };
         setup_theme(&cc.egui_ctx, cfg.dark_mode);
         pin_pixel_scale(&cc.egui_ctx, true);
-        let out_dir = if !cfg.last_dir.is_empty() {
-            cfg.last_dir.clone()
-        } else {
-            cfg.default_dir.clone()
-        };
         let (tx, rx) = channel();
         // Bitmask query, no filesystem I/O: the old per-letter exists() probe
         // blocked startup for seconds when a mapped network drive was dead
         // (SMB redirector timeouts), with the window already created but not
         // yet painting.
-        let drives = list_drives();
         // Toolchain::discover() stats every PATH entry and scans the WinGet
         // package dirs - same dead-network-share stall risk, so it runs off
         // the UI thread; the CTA stays disabled until ToolsReady arrives
@@ -857,6 +973,18 @@ impl SnatchApp {
             let _ = tc_tx.send(Msg::ToolsReady(tc));
             tc_ctx.request_repaint();
         });
+        let mut app = Self::from_config(cfg, tx, rx);
+        if let Some(warning) = warning {
+            app.push_log(format!("⚠ {warning}; файл настроек сохранён без изменений"));
+            app.set_status(StatusKind::Warn, "Не удалось прочитать настройки — см. журнал");
+            app.show_log_window = true;
+        }
+        app
+    }
+
+    fn from_config(cfg: Config, tx: Sender<Msg>, rx: Receiver<Msg>) -> Self {
+        let out_dir = if !cfg.last_dir.is_empty() { cfg.last_dir.clone() } else { cfg.default_dir.clone() };
+        let drives = list_drives();
         let dark_mode = cfg.dark_mode;
         Self {
             url: String::new(),
@@ -871,6 +999,8 @@ impl SnatchApp {
             phase: Phase::Idle,
             jobs: Vec::new(),
             next_job_id: 0,
+            next_pick_id: 0,
+            torrent_pick: None,
             retry_offer: None,
             paused: Vec::new(),
             status: String::new(),
@@ -885,6 +1015,9 @@ impl SnatchApp {
                 entries: Vec::new(),
                 truncated: false,
                 listed_for: None,
+                in_flight: None,
+                resolve_initial: false,
+                error: None,
             },
             drives,
             tx,
@@ -910,7 +1043,14 @@ impl SnatchApp {
             style.visuals = terminal_visuals(self.dark_mode);
         });
         self.cfg.dark_mode = self.dark_mode;
-        self.cfg.save();
+        if !self.save_config() { self.set_status(StatusKind::Warn, "Настройки темы не сохранены — см. журнал"); }
+    }
+
+    fn save_config(&mut self) -> bool {
+        match self.cfg.try_save_now() {
+            Ok(()) => true,
+            Err(e) => { self.push_log(format!("⚠ Не удалось сохранить настройки: {e}")); self.show_log_window = true; false }
+        }
     }
 
     fn effective_engine(&self) -> &'static str {
@@ -1036,10 +1176,46 @@ impl SnatchApp {
                         j.progress = Some(p);
                     }
                 }
+                Msg::DirListed(requested, resolved, result) => {
+                    self.browser.in_flight = None;
+                    if self.browser.open && self.browser.current == requested {
+                        self.browser.current = resolved.clone();
+                        self.browser.listed_for = Some(resolved);
+                        match result {
+                            Ok((entries, truncated)) => { self.browser.entries = entries; self.browser.truncated = truncated; self.browser.error = None; }
+                            Err(e) => { self.browser.entries.clear(); self.browser.error = Some(e); }
+                        }
+                    }
+                }
                 Msg::TorrentStatus(id, p, status) => {
                     if let Some(j) = self.job_mut(id) {
                         j.progress = Some(p);
                         j.set_status(StatusKind::None, status);
+                    }
+                }
+                Msg::TorrentFiles(id, result) => {
+                    let is_current = self.torrent_pick.as_ref().is_some_and(|p| p.id == id);
+                    if is_current {
+                        match result {
+                            Ok((listing, tree)) => {
+                                let single = listing.info.files.len() <= 1 && self.phase != Phase::Setup;
+                                if let Some(pick) = self.torrent_pick.as_mut() {
+                                    pick.selected = vec![true; listing.info.files.len()];
+                                    pick.tree = tree;
+                                    pick.view = torrent::TreeView::default();
+                                    pick.info = Some(listing.info);
+                                    pick.meta = listing.meta;
+                                }
+                                if single { self.finish_torrent_pick(ctx, None); }
+                            }
+                            Err(e) => {
+                                // The modal shows why and lets the user pick
+                                // "скачать всё" or cancel - no silent switch.
+                                if let Some(pick) = self.torrent_pick.as_mut() {
+                                    pick.error = Some(e);
+                                }
+                            }
+                        }
                     }
                 }
                 Msg::TorrentMeta(id, name) => {
@@ -1079,6 +1255,7 @@ impl SnatchApp {
                         self.set_status(StatusKind::Err, "Не всё удалось установить — см. журнал");
                         self.show_log_window = true;
                     }
+                    self.fill_free_slots(ctx);
                 }
             }
         }
@@ -1106,7 +1283,8 @@ impl SnatchApp {
         // "Готово" branch: the file IS complete, claiming "отменено, можно
         // докачать" would send the user to re-download a finished file.
         if aj.cancelled && code != 0 {
-            self.set_status(StatusKind::Warn, format!("«{label}» отменено (файл можно докачать)"));
+            let text = format!("«{label}» отменено (файл можно докачать)");
+            self.set_status(StatusKind::Warn, text);
             self.fill_free_slots(ctx);
             return;
         }
@@ -1116,6 +1294,8 @@ impl SnatchApp {
             self.set_status(StatusKind::None, format!("«{label}» на паузе"));
             self.paused.push(PausedJob {
                 job: aj.job.clone(), label, progress: aj.progress, status: aj.status,
+                select: aj.select,
+                no_continue: false,
             });
             self.fill_free_slots(ctx);
             return;
@@ -1133,8 +1313,15 @@ impl SnatchApp {
             0 => {
                 self.cfg.remember_url(&aj.job.url);
                 self.cfg.remember_dir(&aj.job.out_dir.to_string_lossy());
-                self.cfg.save();
-                self.set_status(StatusKind::Ok, format!("«{label}» готово: {}", aj.job.out_dir.display()));
+                let persisted = self.save_config();
+                let mut text = format!("«{label}» готово: {}", aj.job.out_dir.display());
+                if aj.select.files.is_some() {
+                    // aria2 writes whole pieces: unselected neighbours of the
+                    // chosen files can exist yet be incomplete.
+                    text.push_str(" · соседние невыбранные файлы могут быть неполными");
+                }
+                if !persisted { text.push_str(" · история не сохранена — см. журнал"); }
+                self.set_status(if persisted { StatusKind::Ok } else { StatusKind::Warn }, text);
             }
             127 => self.set_status(
                 StatusKind::Err,
@@ -1156,23 +1343,43 @@ impl SnatchApp {
                     // per-job UI for one-shot, rarely-needed friction.
                     self.retry_offer = Some(aj.job.clone());
                 } else if retry_from_scratch {
-                    self.spawn_job(ctx, aj.job.clone(), true);
-                    self.set_status(StatusKind::Warn, format!("«{label}»: докачка дала битый файл — повторяю с начала"));
+                    if self.spawn_job(ctx, aj.job.clone(), true, aj.select.clone()) {
+                        self.set_status(StatusKind::Warn, format!("«{label}»: докачка дала битый файл — повторяю с начала"));
+                    } else {
+                        self.retain_failed_start(aj.job, aj.select, true);
+                    }
                 }
             }
         }
         self.fill_free_slots(ctx);
     }
 
+    fn retain_failed_start(&mut self, job: Job, select: torrent::Choice, no_continue: bool) {
+        self.paused.push(PausedJob { label: engines::batch_name(&job.url), job, progress: None,
+            status: self.status.clone(), select, no_continue });
+    }
+
+    fn retire_offers(&mut self, url: &str) {
+        if self.retry_offer.as_ref().is_some_and(|job| job.url == url) { self.retry_offer = None; }
+    }
+
+    fn retry_with_cookies(&mut self, ctx: &egui::Context) {
+        let Some(mut job) = self.retry_offer.clone() else { return };
+        job.cookies_browser = Some(self.cookies_browser.clone());
+        if self.dispatch_job(ctx, job, torrent::Choice::default()) { self.retry_offer = None; }
+    }
+
     /// Starts queued jobs until MAX_CONCURRENT is reached or the queue runs
     /// out. Called after any job finishes, freeing a slot.
     fn fill_free_slots(&mut self, ctx: &egui::Context) {
-        if self.close_requested {
+        if self.close_requested || self.phase == Phase::Setup {
             return;
         }
         while self.jobs.len() < MAX_CONCURRENT {
-            let Some(job) = self.queue.pop_front() else { break };
-            self.spawn_job(ctx, job, false);
+            let Some(queued) = self.queue.pop_front() else { break };
+            if !self.spawn_job(ctx, queued.job.clone(), queued.no_continue, queued.select.clone()) {
+                self.retain_failed_start(queued.job, queued.select, queued.no_continue);
+            }
         }
     }
 
@@ -1184,6 +1391,7 @@ impl SnatchApp {
     /// matching the CLI's `-j` batch where each URL picks its own engine but
     /// shares format/folder.
     fn start_download(&mut self, ctx: &egui::Context) {
+        if self.close_requested { self.set_status(StatusKind::Warn, "Приложение закрывается"); return; }
         if self.phase == Phase::Setup {
             self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
             return;
@@ -1201,15 +1409,13 @@ impl SnatchApp {
             return;
         }
         let fmt = if engine == "yt-dlp" { self.fmt.clone() } else { "best".to_string() };
-        let cookies = if engine == "yt-dlp" && self.use_cookies {
-            Some(self.cookies_browser.clone())
-        } else {
-            None
+        let cookies = if !self.use_cookies { None } else {
+            match engine.as_str() {
+                "yt-dlp" => Some(self.cookies_browser.clone()),
+                _ => None,
+            }
         };
-        let already_running = self.jobs.iter().any(|j| j.job.url == url)
-            || self.queue.iter().any(|j| j.url == url)
-            || self.paused.iter().any(|p| p.job.url == url);
-        if already_running {
+        if self.url_in_flight(&url) {
             self.set_status(StatusKind::Err, "Эта ссылка уже скачивается, в очереди или на паузе");
             return;
         }
@@ -1220,35 +1426,167 @@ impl SnatchApp {
             fmt,
             cookies_browser: cookies,
         };
+        // Torrents resolve their file list first: the user ticks files in a
+        // modal before the actual download starts. URL and stale offers are
+        // left untouched until the pick ends (start_picked / cancel).
+        if job.engine == "aria2" && engines::is_bittorrent_input(&job.url) {
+            // The modal disables the form, so this is only a safety net: a
+            // second pick must never replace the open one and its job.
+            if self.torrent_pick.is_some() {
+                self.set_status(StatusKind::Err, "Сначала завершите выбор файлов открытого торрента");
+                return;
+            }
+            self.begin_torrent_pick(ctx, job);
+            return;
+        }
         // A failed-job offer is not an active job. If the user starts that
         // link manually, retire the stale offer; otherwise clicking its retry
         // button afterward could start a second writer on the same file.
-        if self.retry_offer.as_ref().is_some_and(|old| old.url == job.url) {
-            self.retry_offer = None;
-        }
         // Cleared once the job is valid and either starting or queued - not
         // on a validation error above, so a typo doesn't lose what's typed.
-        self.url.clear();
-        if self.jobs.len() < MAX_CONCURRENT {
-            self.spawn_job(ctx, job, false);
-        } else {
-            self.queue.push_back(job);
-            self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+        let url = job.url.clone();
+        if self.dispatch_job(ctx, job, torrent::Choice::default()) {
+            self.retire_offers(&url);
+            self.url.clear();
         }
+    }
+
+    /// Whether this link is already running, queued or paused.
+    fn url_in_flight(&self, url: &str) -> bool {
+        self.jobs.iter().any(|j| j.job.url == url)
+            || self.queue.iter().any(|j| j.job.url == url)
+            || self.paused.iter().any(|p| p.job.url == url)
+            || self.torrent_pick.as_ref().is_some_and(|p| p.job.url == url)
+    }
+
+    /// Final step of a torrent pick: start (or queue) the job with what the
+    /// user chose. The pick can stay open for minutes, so duplicates are
+    /// checked again here, and only now are the URL field and stale offers
+    /// for this link consumed. Returns whether the job is running or queued.
+    fn start_picked(&mut self, ctx: &egui::Context, job: Job, choice: torrent::Choice) -> bool {
+        if self.url_in_flight(&job.url) {
+            self.set_status(StatusKind::Err, "Эта ссылка уже скачивается, в очереди или на паузе");
+            return false;
+        }
+        // Before dispatch: a queued or failed start overrides it.
+        self.set_status(StatusKind::None, "Скачиваю торрент…");
+        let url = job.url.clone();
+        let started = self.dispatch_job(ctx, job, choice);
+        if started {
+            self.retire_offers(&url);
+            if self.url.trim() == url { self.url.clear(); }
+        }
+        started
+    }
+
+    /// Retain the fetched metadata and selection when a lock/spawn refuses
+    /// this attempt, so retrying the modal never repeats a slow magnet fetch.
+    fn finish_torrent_pick(&mut self, ctx: &egui::Context, files: Option<Vec<usize>>) {
+        if let Some(mut pick) = self.torrent_pick.take() {
+            let choice = torrent::Choice { files, meta: pick.meta.clone() };
+            if !self.start_picked(ctx, pick.job.clone(), choice) {
+                pick.hint = Some(self.status.clone());
+                self.torrent_pick = Some(pick);
+            }
+        }
+    }
+
+    /// Closes the pick modal without starting anything. A listing still in
+    /// flight is told to stop, which kills its aria2c right away.
+    fn cancel_torrent_pick(&mut self) -> Option<Job> {
+        let pick = self.torrent_pick.take()?;
+        pick.cancel.store(true, Ordering::Relaxed);
+        Some(pick.job)
+    }
+
+    /// Queue-or-start for jobs that are ready to run. Returns whether the job
+    /// is now running or queued (false: spawn_job refused it).
+    fn dispatch_job(
+        &mut self,
+        ctx: &egui::Context,
+        job: Job,
+        select: torrent::Choice,
+    ) -> bool {
+        if self.close_requested { self.set_status(StatusKind::Warn, "Приложение закрывается"); return false; }
+        if self.url_in_flight(&job.url) {
+            self.set_status(StatusKind::Warn, "Эта ссылка уже скачивается, ожидает или находится в выборе файлов"); return false;
+        }
+        if self.jobs.len() < MAX_CONCURRENT {
+            self.spawn_job(ctx, job, false, select)
+        } else {
+            self.queue.push_back(QueuedJob { job, select, no_continue: false });
+            self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+            true
+        }
+    }
+
+    /// Fetch the torrent file list off-thread, then show the pick modal.
+    fn begin_torrent_pick(&mut self, ctx: &egui::Context, job: Job) {
+        if self.close_requested || self.phase == Phase::Setup {
+            self.set_status(StatusKind::Warn, "Новая загрузка недоступна во время закрытия или установки"); return;
+        }
+        self.browser.open = false;
+        self.show_dir_history = false;
+        self.show_url_history = false;
+        let id = self.next_pick_id;
+        self.next_pick_id += 1;
+        let aria2c = self.tc.aria2c.clone();
+        let url = job.url.clone();
+        let tx = self.tx.clone();
+        let ctx_bg = ctx.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_bg = cancel.clone();
+        std::thread::spawn(move || {
+            let result = match aria2c {
+                Some(path) => torrent::show_files(&path, &url, torrent::METADATA_TIMEOUT, &cancel_bg)
+                    .map(|listing| {
+                        let tree = torrent::build_torrent_tree(&listing.info.files);
+                        (listing, tree)
+                    }),
+                None => Err("aria2c не найден — установите загрузчики".to_string()),
+            };
+            let _ = tx.send(Msg::TorrentFiles(id, result));
+            ctx_bg.request_repaint();
+        });
+        self.torrent_pick = Some(TorrentPick {
+            id,
+            job,
+            cancel,
+            info: None,
+            meta: None,
+            selected: Vec::new(),
+            tree: Vec::new(),
+            view: torrent::TreeView::default(),
+            error: None,
+            hint: None,
+        });
+        self.set_status(StatusKind::None, "Получаю список файлов торрента…");
     }
 
     /// Spawns the loader for an already-validated job as a new concurrent
     /// entry in `self.jobs`. `no_continue` retries a resumed yt-dlp download
     /// from scratch: a stale/corrupt .part can't be validated by yt-dlp and
     /// poisons the run (Errno 22 mid-download or a merger "Invalid data"
-    /// afterwards), so one clean retry heals it.
-    fn spawn_job(&mut self, ctx: &egui::Context, job: Job, no_continue: bool) {
+    /// afterwards), so one clean retry heals it. Returns whether the job is
+    /// now running (false: refused, with the reason already in the status).
+    fn spawn_job(
+        &mut self,
+        ctx: &egui::Context,
+        job: Job,
+        no_continue: bool,
+        select: torrent::Choice,
+    ) -> bool {
         // The close flow vetoes the window close until `jobs` is empty. A
         // spawn racing in from a still-clickable button right after × would
         // add an uncancelled process past cancel_all() and defer closing
         // until that download finishes.
         if self.close_requested {
-            return;
+            self.set_status(StatusKind::Warn, "Приложение закрывается — загрузка не запущена");
+            return false;
+        }
+        if self.phase == Phase::Setup { self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков"); return false; }
+        if self.url_in_flight(&job.url) {
+            self.set_status(StatusKind::Warn, "Эта ссылка уже скачивается, ожидает или находится в выборе файлов"); return false;
         }
         let label = engines::batch_name(&job.url);
         let warns = preflight_warning(&job);
@@ -1257,14 +1595,14 @@ impl SnatchApp {
             Ok(lock) => lock,
             Err(e) => {
                 self.set_status(StatusKind::Err, format!("«{label}»: {e}"));
-                return;
+                return false;
             }
         };
-        let mut cmd = match engines::build(&job, &self.tc) {
-            Ok(c) => c,
+        let mut cmd = match engines::build_for_run(&job, &self.tc, &select) {
+            Ok(cmd) => cmd,
             Err(e) => {
                 self.set_status(StatusKind::Err, format!("«{label}»: {e}"));
-                return;
+                return false;
             }
         };
 
@@ -1278,6 +1616,10 @@ impl SnatchApp {
             cmd.insert(insert_at, "--no-continue".into());
         }
 
+        let install_guard = match snatch_rs::tools::try_lock_for_spawn(Path::new(&cmd[0])) {
+            Ok(guard) => guard,
+            Err(e) => { self.set_status(StatusKind::Err, e); return false; }
+        };
         let mut command = Command::new(&cmd[0]);
         command
             .args(&cmd[1..])
@@ -1303,28 +1645,19 @@ impl SnatchApp {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let mut child = match command.spawn() {
-            Ok(c) => c,
-            Err(_) => {
-                self.set_status(StatusKind::Err, format!("«{label}»: не удалось запустить загрузчик"));
-                return;
+        let (mut child, proc_job) = match job_object::spawn(&mut command, true) {
+            Ok(result) => result,
+            Err(e) => {
+                self.set_status(StatusKind::Err, format!("«{label}»: запуск/защита загрузчика: {e}"));
+                self.push_log(format!("✘ Загрузчик остановлен: {e}"));
+                return false;
             }
         };
         // Put the loader into a kill-on-close job object before it has
         // spawned children of its own (ffmpeg, aria2c-as-external-downloader)
         // - see mod job_object for the two orphan classes this closes.
         // Named proc_job: `job` is the engines::Job parameter below.
-        let proc_job = {
-            #[cfg(windows)]
-            {
-                use std::os::windows::io::AsRawHandle;
-                job_object::Job::create_and_assign(child.as_raw_handle())
-            }
-            #[cfg(not(windows))]
-            {
-                job_object::Job::create_and_assign(std::ptr::null_mut())
-            }
-        };
+        drop(install_guard);
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
 
@@ -1347,6 +1680,7 @@ impl SnatchApp {
             missing_control_file: false,
             resumed_seen: false,
             no_continue,
+            select,
         });
 
         let tx = self.tx.clone();
@@ -1496,21 +1830,28 @@ impl SnatchApp {
             let _ = tx.send(Msg::Done(id, code));
             ctx_w.request_repaint();
         });
+        true
     }
 
     fn start_setup(&mut self, ctx: &egui::Context) {
         self.setup_started = true;
         self.phase = Phase::Setup;
-        // A stale cookies-retry offer must not stay clickable through Setup
-        // (it used to spawn a download on top of the installer, and the
-        // SetupDone handler then flipped the phase out from under it).
-        self.retry_offer = None;
+        // Keep refused jobs/offers available after installation; spawn_job's
+        // Setup guard prevents the old overlapping-installer retry race.
         self.clear_log();
         self.set_status(StatusKind::None, "Устанавливаю загрузчики…");
         let tx = self.tx.clone();
         let ctx_w = ctx.clone();
         std::thread::spawn(move || {
-            let bin = bootstrap_dir();
+            let bin = match bootstrap_dir() {
+                Ok(bin) => bin,
+                Err(e) => {
+                    let _ = tx.send(Msg::SetupLog(e));
+                    let _ = tx.send(Msg::SetupDone(false, Toolchain::discover()));
+                    ctx_w.request_repaint();
+                    return;
+                }
+            };
             let mut ok = std::fs::create_dir_all(&bin).is_ok();
             if ok {
                 let _ = tx.send(Msg::SetupLog(format!(
@@ -1666,6 +2007,7 @@ impl SnatchApp {
                         .on_hover_text("Закрыть")
                         .clicked()
                     {
+                        self.cancel_torrent_pick();
                         if !self.jobs.is_empty() {
                             self.close_requested = true;
                             self.cancel_all();
@@ -1815,6 +2157,7 @@ impl SnatchApp {
             if self.engine_mode == EngineMode::Auto {
                 let guess = self.effective_engine();
                 if !self.url.trim().is_empty() {
+                    let guess_label = guess;
                     // Two guesses at a font-tweak fix (the default label font,
                     // then the "button" family) each moved this the wrong way
                     // or overshot - the buttons' own vertical centering isn't
@@ -1824,7 +2167,7 @@ impl SnatchApp {
                     // exact center - no font-metric guessing involved.
                     let color = ui.visuals().weak_text_color();
                     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-                    let galley = ui.painter().layout_no_wrap(format!("→ {guess}"), font, color);
+                    let galley = ui.painter().layout_no_wrap(format!("→ {guess_label}"), font, color);
                     // Exact rect-center math landed a hair high - likely the
                     // "→" glyph's own ink sits above its box's true center,
                     // not a layout issue. Small fixed nudge down.
@@ -1900,6 +2243,7 @@ impl SnatchApp {
     }
 
     fn ui_dir_history(&mut self, ctx: &egui::Context, opened_this_frame: bool) {
+        if self.torrent_pick.is_some() || self.close_requested { self.show_dir_history = false; return; }
         if !self.show_dir_history {
             return;
         }
@@ -1965,6 +2309,7 @@ impl SnatchApp {
     }
 
     fn open_dir_browser(&mut self) {
+        if self.close_requested || self.torrent_pick.is_some() { return; }
         // Cheap bitmask query - a drive plugged in since startup shows up.
         self.drives = list_drives();
         let typed = PathBuf::from(self.out_dir.trim());
@@ -1982,34 +2327,45 @@ impl SnatchApp {
             .is_some_and(|letter| self.drives.iter().any(|d| path_drive_letter(d) == Some(letter)));
         #[cfg(not(windows))]
         let root_known = true;
-        let start = if !root_known {
+        let start = if !root_known || typed.as_os_str().is_empty() {
             home_dir().unwrap_or_else(|| PathBuf::from("."))
-        } else if typed.is_dir() {
-            typed
-        } else if let Some(parent) = typed.parent().filter(|p| !is_unc_path(p) && p.is_dir()) {
-            parent.to_path_buf()
         } else {
-            home_dir().unwrap_or_else(|| PathBuf::from("."))
+            typed
         };
         self.browser.current = start;
         self.browser.listed_for = None;
+        self.browser.resolve_initial = true;
+        self.browser.entries.clear();
+        self.browser.error = None;
         self.browser.open = true;
     }
 
     fn ui_dir_browser(&mut self, ctx: &egui::Context) {
+        if self.torrent_pick.is_some() || self.close_requested { self.browser.open = false; return; }
         if !self.browser.open {
             return;
         }
         let opened_this_frame = self.browser.listed_for.is_none();
-        if self.browser.listed_for.as_ref() != Some(&self.browser.current) {
-            // Capped scan: a huge or slow directory lists up to
-            // DIR_BROWSER_SCAN_CAP entries instead of freezing the UI thread
-            // for the whole traversal.
-            let (entries, truncated) =
-                safe_read_dirs_limited(&self.browser.current, DIR_BROWSER_SCAN_CAP);
-            self.browser.entries = entries;
-            self.browser.truncated = truncated;
-            self.browser.listed_for = Some(self.browser.current.clone());
+        if self.browser.listed_for.as_ref() != Some(&self.browser.current) && self.browser.in_flight.is_none() {
+            let requested = self.browser.current.clone();
+            let initial = self.browser.resolve_initial;
+            self.browser.resolve_initial = false;
+            self.browser.in_flight = Some(requested.clone());
+            self.browser.entries.clear();
+            self.browser.error = None;
+            let tx = self.tx.clone();
+            let ctx = ctx.clone();
+            // One active scan; newer navigation coalesces in browser.current.
+            // Both the initial is_dir probe and enumeration stay off the UI.
+            std::thread::spawn(move || {
+                let mut resolved = requested.clone();
+                if initial && !is_unc_path(&resolved) && !resolved.is_dir() {
+                    if let Some(parent) = resolved.parent().filter(|p| !is_unc_path(p) && p.is_dir()) { resolved = parent.to_path_buf(); }
+                }
+                let result = try_read_dirs_limited(&resolved, DIR_BROWSER_SCAN_CAP).map_err(|e| e.to_string());
+                let _ = tx.send(Msg::DirListed(requested, resolved, result));
+                ctx.request_repaint();
+            });
         }
 
         let mut still_open = true;
@@ -2019,6 +2375,8 @@ impl SnatchApp {
         let cur = self.browser.current.clone();
         let entries = &self.browser.entries;
         let truncated = self.browser.truncated;
+        let loading = self.browser.listed_for.as_ref() != Some(&cur);
+        let error = self.browser.error.clone();
         let home = home_dir().unwrap_or_default();
         let drives = self.drives.clone();
 
@@ -2069,7 +2427,11 @@ impl SnatchApp {
                                 navigate = Some(d.clone());
                             }
                         }
-                        if entries.is_empty() {
+                        if loading {
+                            slow_spinner(ui); ui.weak("Читаю каталог…");
+                        } else if let Some(error) = &error {
+                            ui.colored_label(ui.visuals().error_fg_color, format!("Не удалось прочитать каталог: {error}"));
+                        } else if entries.is_empty() {
                             if truncated {
                                 ui.weak(format!(
                                     "… среди первых {DIR_BROWSER_SCAN_CAP} записей вложенных папок нет"
@@ -2105,7 +2467,7 @@ impl SnatchApp {
                     // easy to navigate somewhere and not notice you still
                     // had to confirm.
                     let accent = ui.visuals().hyperlink_color;
-                    if ui.add(accent_button(accent, "Выбрать эту папку")).clicked() {
+                    if ui.add_enabled(!loading && error.is_none(), accent_button(accent, "Выбрать эту папку")).clicked() {
                         chosen = Some(cur.clone());
                     }
                     if ui.button("Отмена").clicked() {
@@ -2137,8 +2499,9 @@ impl SnatchApp {
     }
 
     fn ui_cookies_row(&mut self, ui: &mut egui::Ui) {
-        let yt = self.effective_engine() == "yt-dlp";
+        let engine = self.effective_engine();
         ui.add_space(6.0);
+        let yt = engine == "yt-dlp";
         ui.add_enabled_ui(self.phase != Phase::Setup && yt, |ui| {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.use_cookies, "куки из браузера");
@@ -2211,6 +2574,9 @@ impl SnatchApp {
             if remove { drop_idx = Some(i); }
             if !pj.status.is_empty() { ui.weak(clip(&pj.status, 90)); }
         }
+        // The paused row that actually left the list this frame (a refused
+        // resume keeps its row), for the index shift of "убрать" below.
+        let mut resumed_row = None;
         if let Some(i) = resume_idx {
             if self.phase == Phase::Setup {
                 // Resuming during setup would start a loader while the
@@ -2219,11 +2585,23 @@ impl SnatchApp {
                 self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
             } else {
                 let pj = self.paused.remove(i);
+                resumed_row = Some(i);
                 if self.jobs.len() < MAX_CONCURRENT {
-                    self.spawn_job(ctx, pj.job, false);
-                    self.set_status(StatusKind::None, format!("«{}»: продолжаю…", pj.label));
-                } else {
-                    self.queue.push_back(pj.job);
+                    // A refused start (lock held, folder gone, a re-pick
+                    // needed once its .torrent was cleaned up…) must neither
+                    // lose the job nor hide spawn_job's reason behind
+                    // "продолжаю…": it stays paused, with that error shown.
+                    let started =
+                        self.spawn_job(ctx, pj.job.clone(), pj.no_continue, pj.select.clone());
+                    if started {
+                        self.set_status(StatusKind::None, format!("«{}»: продолжаю…", pj.label));
+                    } else {
+                        self.paused.insert(i, pj);
+                        resumed_row = None;
+                    }
+                } else if self.close_requested { self.paused.insert(i, pj); resumed_row = None; }
+                else {
+                    self.queue.push_back(QueuedJob { job: pj.job, select: pj.select, no_continue: pj.no_continue });
                     self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
                 }
             }
@@ -2231,7 +2609,7 @@ impl SnatchApp {
         if let Some(i) = drop_idx {
             // If resume and remove were clicked in the same frame, the first
             // removal shifted indices. The clicked row is now elsewhere.
-            let idx = if resume_idx.is_some_and(|r| r < i) { i - 1 } else { i };
+            let idx = if resumed_row.is_some_and(|r| r < i) { i - 1 } else { i };
             if resume_idx != Some(i) && idx < self.paused.len() {
                 let pj = self.paused.remove(idx);
                 if self.status == format!("«{}» на паузе", pj.label) {
@@ -2248,6 +2626,24 @@ impl SnatchApp {
                 slow_spinner(ui);
                 ui.label("скачиваю yt-dlp и aria2c…");
             });
+            return;
+        }
+
+        // While a torrent's file list loads, the CTA spot shows that (with a
+        // cancel) - the job controls above stay usable meanwhile.
+        if self.torrent_pick.as_ref().is_some_and(TorrentPick::loading) {
+            let mut cancel = false;
+            ui.horizontal(|ui| {
+                slow_spinner(ui);
+                ui.weak("получаю список файлов торрента…");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    cancel = ui.button("[ отмена ]").clicked();
+                });
+            });
+            if cancel {
+                self.abort_torrent_pick();
+            }
+            self.ui_queue_count(ui);
             return;
         }
 
@@ -2288,10 +2684,74 @@ impl SnatchApp {
         if clicked {
             self.start_download(ctx);
         }
+        self.ui_queue_count(ui);
+    }
+
+    fn ui_queue_count(&self, ui: &mut egui::Ui) {
         if !self.queue.is_empty() {
             ui.add_space(4.0);
             ui.weak(format!("В очереди: {}", self.queue.len()));
         }
+    }
+
+    /// Torrent file-selection modal (list or error), shown once loading is
+    /// done; the loading phase lives in the run row. Drawn in the Foreground
+    /// order so update()'s dim overlay (Middle) stays beneath it.
+    fn ui_torrent_pick(&mut self, ctx: &egui::Context) {
+        let Some(pick) = self.torrent_pick.as_mut() else { return };
+        if pick.loading() {
+            return;
+        }
+        let (act, _) = torrent_pick_window(ctx, pick);
+        if act.all || act.none {
+            pick.selected.iter_mut().for_each(|s| *s = act.all);
+            pick.view.selection_dirty = true;
+            pick.hint = None;
+        }
+        // Never start aria2c while the installer is replacing it: keep the
+        // pick open and say why.
+        if (act.confirm || act.download_all) && self.phase == Phase::Setup {
+            pick.hint = Some("Дождитесь установки загрузчиков".into());
+            return;
+        }
+        if act.confirm {
+            let chosen: Vec<usize> = pick
+                .info
+                .iter()
+                .flat_map(|info| info.files.iter().enumerate())
+                .filter(|(i, _)| pick.selected.get(*i).copied().unwrap_or(false))
+                .map(|(_, f)| f.index)
+                .collect();
+            let every = chosen.len() == pick.selected.len();
+            if chosen.is_empty() { pick.hint = Some("Выберите хотя бы один файл".into()); return; }
+            // Refuse a too-scattered selection here, while it can be changed,
+            // not as a failed start after the modal is gone.
+            if let Err(e) = torrent::select_spec(&chosen) {
+                pick.hint = Some(e);
+            } else {
+                let files = if every { None } else { Some(chosen) };
+                self.finish_torrent_pick(ctx, files);
+            }
+            return;
+        }
+        if act.download_all {
+            self.finish_torrent_pick(ctx, None);
+            return;
+        }
+        if act.cancel {
+            self.abort_torrent_pick();
+        }
+    }
+
+    /// The user backed out of a pick (modal or loading row): stop it and
+    /// give the link back to the URL field.
+    fn abort_torrent_pick(&mut self) {
+        if let Some(job) = self.cancel_torrent_pick() {
+            if self.url.trim().is_empty() {
+                self.url = job.url;
+            }
+        }
+        self.set_status(StatusKind::None, "Выбор файлов отменён");
     }
 }
 
@@ -2302,13 +2762,20 @@ impl eframe::App for SnatchApp {
         pin_pixel_scale(ctx, false);
         self.drain(ctx);
         let log_was_open = self.show_log_window;
-        if self.phase != Phase::Setup {
+        // A drop while the pick modal is open would swap the URL field from
+        // under the torrent being picked.
+        if self.phase != Phase::Setup && self.torrent_pick.is_none() {
             let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
             if let Some(path) = dropped {
                 self.set_torrent_file(&path);
             }
         }
-        if ctx.input(|i| i.viewport().close_requested()) && !self.jobs.is_empty() {
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            // An open pick dies with the window; its aria2c is stopped too.
+            self.cancel_torrent_pick();
+        }
+        if close_requested && !self.jobs.is_empty() {
             // eframe exits the event loop in THIS frame unless the close is
             // vetoed - the old flag-only version let the process die before
             // the monitor thread (100ms poll) reached kill(), orphaning the
@@ -2352,6 +2819,13 @@ impl eframe::App for SnatchApp {
                     .inner_margin(egui::Margin::symmetric(26.0, 18.0)),
             )
             .show(ctx, |ui| {
+            // Choosing files (or reading a listing error) is modal: the form
+            // under the dim overlay takes no clicks/keys. Its window has a
+            // cancel. While the list only loads, see the form rows below.
+            let picking = self.torrent_pick.as_ref().is_some_and(|p| !p.loading());
+            if picking {
+                ui.disable();
+            }
             // The HTML window is 660px wide, with 26px content padding. A
             // resized native window may be wider; keep the form centred at
             // the same 608px maximum instead of stretching fields edge to edge.
@@ -2442,7 +2916,7 @@ impl eframe::App for SnatchApp {
                 );
                 if cfg!(windows) && ui
                     .add_enabled(
-                        self.phase != Phase::Setup && self.jobs.is_empty(),
+                        self.phase != Phase::Setup && self.jobs.is_empty() && self.torrent_pick.is_none(),
                         egui::Button::new("установить загрузчики"),
                     )
                     .clicked()
@@ -2461,7 +2935,7 @@ impl eframe::App for SnatchApp {
                             // mockup's .btn is 12.5px with 7px 12px padding -
                             // .small() dropped it to the Small style and made
                             // the button visibly smaller than the HTML one.
-                            .add_enabled(self.phase != Phase::Setup && self.jobs.is_empty(),
+                            .add_enabled(self.phase != Phase::Setup && self.jobs.is_empty() && self.torrent_pick.is_none(),
                                 egui::Button::new("обновить").wrap_mode(egui::TextWrapMode::Extend))
                             .on_hover_text("Перескачать свежие yt-dlp и aria2c")
                             .clicked()
@@ -2474,18 +2948,38 @@ impl eframe::App for SnatchApp {
             dashed_separator(ui);
 
             ui.add_space(14.0);
-            self.ui_url_row(ui, ctx);
-            let dir_history_opened = self.ui_engine_row(ui);
-            self.ui_cookies_row(ui);
+            // During a pick the link/engine/folder fields belong to it; the
+            // job rows in ui_run_row stay live (pause/cancel while a magnet
+            // fetches its metadata).
+            let form_free = self.torrent_pick.is_none();
+            let dir_history_opened = ui
+                .add_enabled_ui(form_free, |ui| {
+                    self.ui_url_row(ui, ctx);
+                    let opened = self.ui_engine_row(ui);
+                    self.ui_cookies_row(ui);
+                    opened
+                })
+                .inner;
             ui.add_space(10.0);
             self.ui_run_row(ui, ctx);
             self.ui_dir_history(ctx, dir_history_opened);
+            if picking {
+                // Middle order: above the panels, below the Foreground pick
+                // window. Paint only - the form itself is disabled above.
+                let screen = ctx.screen_rect();
+                ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new("torrent-pick-dim"),
+                ))
+                .rect_filled(screen, 0.0, egui::Color32::from_black_alpha(120));
+            }
+            self.ui_torrent_pick(ctx);
             self.ui_dir_browser(ctx);
 
             // retry_offer only ever comes from a job's own just-finished
             // failure, so it doesn't need a phase/slot gate to *show* - only
             // the click below needs to decide start-now vs queue.
-            if let Some(job) = self.retry_offer.clone() {
+            if self.retry_offer.is_some() {
                 ui.add_space(6.0);
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
@@ -2496,19 +2990,7 @@ impl eframe::App for SnatchApp {
                     // persistent checkbox. A single (possibly provoked) 403
                     // shouldn't silently opt every future download into
                     // reading the browser's cookie store.
-                    let mut job = job;
-                    job.cookies_browser = Some(self.cookies_browser.clone());
-                    self.retry_offer = None;
-                    if self.jobs.iter().any(|j| j.job.url == job.url)
-                        || self.queue.iter().any(|j| j.url == job.url)
-                        || self.paused.iter().any(|j| j.job.url == job.url)
-                    {
-                        self.set_status(StatusKind::Warn, "Эта ссылка уже скачивается или ждёт в очереди");
-                    } else if self.jobs.len() < MAX_CONCURRENT {
-                        self.spawn_job(ctx, job, false);
-                    } else {
-                        self.queue.push_front(job);
-                    }
+                    self.retry_with_cookies(ctx);
                 }
             }
 
@@ -2633,6 +3115,103 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
 
+    fn test_app() -> SnatchApp {
+        let (tx, rx) = channel();
+        SnatchApp::from_config(snatch_rs::config::sanitize(&serde_json::Value::Null), tx, rx)
+    }
+
+    fn test_job(url: &str) -> Job {
+        Job { engine: "yt-dlp".into(), url: url.into(), out_dir: std::env::temp_dir(), fmt: "best".into(), cookies_browser: None }
+    }
+
+    #[test]
+    fn refused_starts_keep_typed_urls_offers_and_queued_checkpoints() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let job = test_job("https://example.test/watch");
+        app.url = job.url.clone(); app.out_dir = job.out_dir.to_string_lossy().into_owned();
+        app.retry_offer = Some(job.clone());
+        app.start_download(&ctx);
+        assert_eq!(app.url, job.url);
+        assert!(app.retry_offer.is_some());
+        app.retry_with_cookies(&ctx);
+        assert!(app.retry_offer.is_some());
+        app.queue.push_back(QueuedJob { job: job.clone(),
+            select: torrent::Choice { files: Some(vec![1, 3]), meta: None }, no_continue: true });
+        app.fill_free_slots(&ctx);
+        assert_eq!(app.paused.len(), 1);
+        assert_eq!(app.paused[0].job.url, job.url);
+        assert_eq!(app.paused[0].select.files.as_deref(), Some([1, 3].as_slice()));
+        assert!(app.paused[0].no_continue);
+        assert!(!app.paused[0].status.is_empty());
+    }
+
+    #[test]
+    fn a_refused_automatic_restart_stays_retryable_without_a_false_status() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let job = test_job("https://example.test/watch");
+        app.jobs.push(ActiveJob { id: 1, job: job.clone(), label: "video".into(), progress: Some(0.8), status: String::new(),
+            status_kind: StatusKind::None, warns: vec![], cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancelled: false, pausing: false, auth_seen: false, missing_control_file: false, resumed_seen: true,
+            no_continue: false, select: torrent::Choice::default() });
+        app.finish_job(1, 1, &ctx);
+        assert!(app.jobs.is_empty());
+        assert_eq!(app.paused.len(), 1);
+        assert_eq!(app.paused[0].job.url, job.url);
+        assert!(app.paused[0].no_continue);
+        assert!(!app.status.contains("повторяю с начала"));
+        assert!(matches!(app.status_kind, StatusKind::Err));
+    }
+
+    #[test]
+    fn closing_refuses_picks_and_dispatch_before_any_side_effect() {
+        let ctx = egui::Context::default();
+        let mut app = test_app(); app.close_requested = true;
+        let job = test_job("https://example.test/watch");
+        assert!(!app.dispatch_job(&ctx, job.clone(), torrent::Choice::default()));
+        app.begin_torrent_pick(&ctx, job);
+        assert!(app.torrent_pick.is_none()); assert!(app.queue.is_empty()); assert!(app.jobs.is_empty());
+        assert_eq!(app.next_pick_id, 0);
+    }
+
+    #[test]
+    fn an_open_pick_blocks_duplicate_downloads_and_directory_popups() {
+        let ctx = egui::Context::default(); let mut app = test_app();
+        let job = test_job("https://example.test/watch");
+        app.torrent_pick = Some(TorrentPick { id: 1, job: job.clone(), cancel: Arc::new(AtomicBool::new(false)),
+            info: None, meta: None, selected: vec![], tree: vec![], view: torrent::TreeView::default(), error: None, hint: None });
+        assert!(app.url_in_flight(&job.url));
+        app.retry_offer = Some(job); app.retry_with_cookies(&ctx);
+        assert!(app.retry_offer.is_some()); assert!(app.jobs.is_empty());
+        app.open_dir_browser(); assert!(!app.browser.open);
+    }
+
+    #[test]
+    fn viewport_sizes_are_in_egui_points_without_a_second_scale() {
+        for native in [1.0, 1.25, 2.0] {
+            let ctx = egui::Context::default();
+            let mut input = egui::RawInput::default();
+            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(native);
+            let output = ctx.run(input, |ctx| pin_pixel_scale(ctx, true));
+            let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
+            assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(460.0, 640.0))));
+            assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::MinInnerSize(size) if *size == egui::vec2(460.0, 520.0))));
+        }
+    }
+
+    #[test]
+    fn directory_errors_are_visible_and_stale_scans_do_not_replace_navigation() {
+        let ctx = egui::Context::default(); let mut app = test_app();
+        let current = std::env::temp_dir().join("wanted"); let previous = std::env::temp_dir().join("previous");
+        app.browser.open = true; app.browser.current = current.clone(); app.browser.in_flight = Some(previous.clone());
+        app.tx.send(Msg::DirListed(previous.clone(), previous, Ok((vec!["stale".into()], false)))).unwrap();
+        app.drain(&ctx); assert_eq!(app.browser.current, current); assert!(app.browser.entries.is_empty());
+        app.tx.send(Msg::DirListed(current.clone(), current.clone(), Err("test access denied".into()))).unwrap();
+        app.drain(&ctx); assert_eq!(app.browser.listed_for, Some(current));
+        assert_eq!(app.browser.error.as_deref(), Some("test access denied"));
+    }
+
     #[test]
     fn torrent_console_summary_cannot_replace_gui_status_with_separator() {
         assert!(torrent_console_line(1, "*** Download Progress Summary as of now ***").is_none());
@@ -2693,6 +3272,116 @@ mod tests {
         for height in heights {
             assert!((height - 34.0).abs() < 1.0, "row + spacing must be 28 + 6, got {height}");
         }
+    }
+
+    #[test]
+    fn torrent_pick_rows_have_the_height_show_rows_assumes() {
+        let ctx = egui::Context::default();
+        setup_theme(&ctx, true);
+        let files = [
+            torrent::FileEntry { index: 1, path: "folder/a.bin".into(), size: 10 },
+            torrent::FileEntry { index: 2, path: "folder/sub/b.bin".into(), size: 20 },
+            torrent::FileEntry { index: 3, path: "top.txt".into(), size: 5 },
+        ];
+        let mut tree = torrent::build_torrent_tree(&files);
+        tree[0].expanded = true;
+        let mut selected = vec![true; files.len()];
+        let mut rows = Vec::new();
+        torrent_visible_rows(&tree, 0, &mut Vec::new(), &mut rows);
+        // folder, folder/sub, folder/a.bin, top.txt: two folder rows (▶ toggle
+        // + checkbox) and two file rows (checkbox only).
+        assert_eq!(rows.len(), 4);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0))),
+            ..Default::default()
+        };
+        let (mut heights, mut pitch) = (Vec::new(), 0.0);
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let row_h = torrent_row_height(ui);
+                pitch = row_h + ui.spacing().item_spacing.y;
+                for row in &rows {
+                    let top = ui.cursor().top();
+                    torrent_tree_row(ui, &mut tree, &mut selected, row, row_h);
+                    heights.push(ui.cursor().top() - top);
+                }
+            });
+        });
+        for height in heights {
+            assert!((height - pitch).abs() < 0.5, "every row must advance {pitch}, got {height}");
+        }
+    }
+
+    #[test]
+    fn torrent_pick_window_fits_the_default_window() {
+        let ctx = egui::Context::default();
+        setup_theme(&ctx, true);
+        let files: Vec<torrent::FileEntry> = (1..=30)
+            .map(|i| torrent::FileEntry {
+                index: i,
+                path: format!(
+                    "Очень длинное имя папки релиза {}/вложенная папка с длинным именем/файл номер {i} с длинным названием.mkv",
+                    i % 3
+                ),
+                size: 1 << 30,
+            })
+            .collect();
+        let mut tree = torrent::build_torrent_tree(&files);
+        for node in &mut tree {
+            node.expanded = true;
+        }
+        let mut pick = TorrentPick {
+            id: 0,
+            job: Job {
+                engine: "aria2".into(),
+                url: "magnet:?xt=urn:btih:c01abfff06149cb74765dca1b5226003eeb4e877".into(),
+                out_dir: PathBuf::from("."),
+                fmt: "best".into(),
+                cookies_browser: None,
+            },
+            cancel: Arc::new(AtomicBool::new(false)),
+            info: Some(torrent::TorrentInfo {
+                name: "Очень длинное имя торрента, которое не помещается в одну строку диалога".into(),
+                total: 30 << 30,
+                files: files.clone(),
+            }),
+            meta: None,
+            selected: vec![true; files.len()],
+            tree,
+            view: torrent::TreeView::default(),
+            error: None,
+            hint: None,
+        };
+        // The app's default (and minimum) window is 460 points wide.
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(460.0, 640.0));
+        let frame = |pick: &mut TorrentPick| {
+            let (mut rect, mut buttons) = (None, Vec::new());
+            // A Window settles its size over the first frames.
+            for _ in 0..3 {
+                let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let _ = ctx.run(input, |ctx| {
+                    let (act, shown) = torrent_pick_window(ctx, pick);
+                    (rect, buttons) = (shown, act.buttons);
+                });
+            }
+            (rect.expect("the pick window is shown"), buttons)
+        };
+        let check = |what: &str, (dialog, buttons): (egui::Rect, Vec<egui::Rect>), expected: usize| {
+            assert!(screen.contains_rect(dialog), "{what} dialog {dialog:?} must fit {screen:?}");
+            assert_eq!(buttons.len(), expected, "{what}: buttons drawn");
+            for (i, a) in buttons.iter().enumerate() {
+                assert!(dialog.contains_rect(*a), "{what}: button {a:?} outside {dialog:?}");
+                for b in &buttons[i + 1..] {
+                    let both = a.intersect(*b);
+                    // An overlap made a click on one button hit the other.
+                    assert!(both.width() <= 0.0 || both.height() <= 0.0, "{what}: {a:?} overlaps {b:?}");
+                }
+            }
+        };
+        check("list", frame(&mut pick), 4);
+        pick.info = None;
+        pick.error = Some("не удалось получить метаданные торрента (таймаут)".into());
+        check("error", frame(&mut pick), 2);
     }
 
     #[test]
