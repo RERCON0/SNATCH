@@ -674,16 +674,44 @@ pub fn split_cli_args(s: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-/// aria2 flags from user extras that would silently break the guarantees the
-/// lock/origin records rely on: output name/dir, resume state, config path or
-/// overwrite permission. Rejected instead of letting the download's identity
-/// drift from what was recorded. Short options are also matched in their
-/// attached form (`-oNAME`, `-dDIR`, `-c...`).
-fn forbidden_aria2_arg(arg: &str) -> bool {
-    let long = ["--out", "--dir", "--continue", "--conf-path", "--allow-overwrite"];
-    arg == "-o" || arg == "-d" || arg == "-c"
-        || long.iter().any(|f| arg == *f || arg.starts_with(&format!("{f}=")))
-        || (arg.len() > 2 && (arg.starts_with("-o") || arg.starts_with("-d") || arg.starts_with("-c")))
+/// aria2c accepts any unambiguous prefix of a long option, so a blacklist of
+/// full names is bypassable (`--ou=`, `--conti=true`). Only a whitelist is
+/// safe: flags that cannot change WHAT and WHERE aria2 saves - rate/split/
+/// connection limits, proxies, HTTP headers, timeouts, retries. Everything
+/// else is rejected, because the lock/origin records were computed for
+/// SNATCH's own pins (name, dir, `-c`, config, input files).
+const ARIA2_EXTRA_LONG: &[&str] = &[
+    "max-connection-per-server", "split", "min-split-size",
+    "max-download-limit", "max-overall-download-limit",
+    "max-upload-limit", "max-overall-upload-limit",
+    "max-tries", "retry-wait", "timeout", "connect-timeout",
+    "lowest-speed-limit", "max-file-not-found",
+    "all-proxy", "http-proxy", "https-proxy", "ftp-proxy", "no-proxy",
+    "all-proxy-user", "all-proxy-passwd", "http-user", "http-passwd",
+    "header", "user-agent", "referer",
+    "load-cookies", "save-cookies", "http-accept-gzip",
+];
+const ARIA2_EXTRA_SHORT: &[char] = &['x', 's', 'k', 'j', 'm', 't', 'u', 'U'];
+
+fn aria2_extra_allowed(arg: &str) -> bool {
+    if let Some(rest) = arg.strip_prefix("--") {
+        let name = rest.split('=').next().unwrap_or(rest);
+        if name.is_empty() {
+            return false;
+        }
+        // A prefix must match exactly one whitelisted flag: if it is also a
+        // prefix of some other aria2 option, aria2 itself treats it as
+        // ambiguous and refuses, so accepting it cannot enable anything else.
+        if ARIA2_EXTRA_LONG.contains(&name) {
+            return true;
+        }
+        let mut matches = ARIA2_EXTRA_LONG.iter().filter(|f| f.starts_with(name));
+        return matches.next().is_some() && matches.next().is_none();
+    }
+    if let Some(rest) = arg.strip_prefix('-') {
+        return rest.chars().next().is_some_and(|c| ARIA2_EXTRA_SHORT.contains(&c));
+    }
+    false
 }
 
 /// Absolute output directory without touching the filesystem (build() also
@@ -944,10 +972,11 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
             cmd.push("--auto-save-interval=1".into());
         }
         for a in &extras.extra_aria2 {
-            if forbidden_aria2_arg(a) {
+            if !aria2_extra_allowed(a) {
                 return Err(format!(
-                    "доп. аргумент aria2 `{a}` конфликтует с защитой имён и докачки: имя, \
-                     папку, режим -c и путь конфига задаёт сам SNATCH"
+                    "доп. аргумент aria2 `{a}` вне разрешённого набора — имя, папку, режим \
+                     докачки, конфиг и входные файлы задаёт сам SNATCH; разрешены только \
+                     лимиты, прокси, заголовки, таймауты и повторы"
                 ));
             }
             cmd.push(a.clone().into());
@@ -1786,23 +1815,24 @@ mod tests {
     }
 
     #[test]
-    fn aria2_extras_cannot_override_name_or_resume_pins() {
+    fn aria2_extras_are_whitelisted_not_blacklisted() {
         let out = tmp_out();
         let job = Job { engine: "aria2".into(), url: "https://h/f.bin".into(),
             out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
-        for bad in [vec!["-o", "evil"], vec!["--out=evil"], vec!["-d/tmp"], vec!["-c"],
-                    vec!["--allow-overwrite=true"], vec!["--conf-path=x"]] {
-            let extras = RunExtras {
-                extra_aria2: bad.iter().map(|s| s.to_string()).collect(),
-                ..RunExtras::default()
-            };
-            assert!(build_with(&job, &tc_aria2(), &extras).is_err(), "{bad:?}");
+        // aria2c resolves unambiguous prefixes, so abbreviations of
+        // identity-changing flags must be refused alongside full names.
+        for bad in ["-o", "-oX", "--out=evil.bin", "--ou=evil.bin", "-d/tmp",
+                    "-c", "--conti=true", "--allow-overw=true", "--conf-path=x",
+                    "-i", "--input-file=x", "-T", "-M", "-Z", "--max-o=1"] {
+            let extras = RunExtras { extra_aria2: vec![bad.into()], ..RunExtras::default() };
+            assert!(build_with(&job, &tc_aria2(), &extras).is_err(), "{bad}");
         }
-        let ok = RunExtras {
-            extra_aria2: vec!["-x16".into(), "--max-tries=3".into()],
-            ..RunExtras::default()
-        };
-        assert!(build_with(&job, &tc_aria2(), &ok).is_ok());
+        for ok in ["-x16", "--max-tries=3", "--max-download-l=1M", "--user-agent=Foo",
+                   "--referer=http://x", "--connect-timeout=5",
+                   "--all-proxy=http://127.0.0.1:8080"] {
+            let extras = RunExtras { extra_aria2: vec![ok.into()], ..RunExtras::default() };
+            assert!(build_with(&job, &tc_aria2(), &extras).is_ok(), "{ok}");
+        }
         std::fs::remove_dir_all(&out).ok();
     }
 
