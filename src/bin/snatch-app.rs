@@ -16,7 +16,9 @@ use snatch_rs::engines::{
     self, detect_engine, is_unc_path, looks_like_auth, parse_progress, preflight_warning, validate_url, Job,
     COOKIES_BROWSERS, FORMATS,
 };
-use snatch_rs::setup::{install_aria2, install_deno, install_ffmpeg, install_yt_dlp};
+use snatch_rs::setup::{
+    install_aria2_with, install_deno_with, install_ffmpeg_with, install_yt_dlp_with, SetupProgress,
+};
 use snatch_rs::tools::{bootstrap_dir, Toolchain};
 use snatch_rs::{job_object, torrent};
 use snatch_rs::ui::{clip, try_read_dirs_limited};
@@ -81,6 +83,8 @@ enum Msg {
     TorrentLog(u64, String),
     Done(u64, i32),
     SetupLog(String),
+    /// Live installer progress: asset label, bytes done, total if known.
+    SetupProgress(String, u64, Option<u64>),
     /// (успех, обновлённая цепочка инструментов - discover делается в том же
     /// фоновом потоке, а не на UI-потоке)
     SetupDone(bool, Toolchain),
@@ -444,6 +448,8 @@ struct SnatchApp {
     /// Startup discovery may finish after an installer run; its stale result
     /// must never replace the toolchain found by SetupDone.
     setup_started: bool,
+    /// Last installer progress line (see `setup_progress_text`).
+    setup_progress: Option<(String, u64, Option<u64>)>,
     phase: Phase,
     /// Currently running downloads, most recently started last. Up to
     /// MAX_CONCURRENT at once, matching the CLI's `-j` default.
@@ -718,6 +724,23 @@ fn accent_button(accent: egui::Color32, text: impl Into<String>) -> egui::Button
 /// Device Flow login wait. This draws the same arc (same size, color, 20
 /// points, 240° sweep) but asks for the next frame ~66 ms out (~15 fps);
 /// status updates and input still repaint immediately.
+/// One line of installer feedback: asset, downloaded bytes and a percent
+/// when the server declared a size. The old static "скачиваю…" gave no idea
+/// whether to wait a minute or ten.
+fn setup_progress_text(p: Option<&(String, u64, Option<u64>)>) -> String {
+    match p {
+        Some((label, done, Some(total))) if *total > 0 => format!(
+            "{label}: {} из {} ({:.0}%)",
+            torrent::human_size(*done),
+            torrent::human_size(*total),
+            *done as f64 * 100.0 / *total as f64,
+        ),
+        Some((label, done, _)) if *done > 0 => format!("{label}: {}", torrent::human_size(*done)),
+        Some((label, _, _)) => format!("{label}: подготовка…"),
+        None => "скачиваю yt-dlp, aria2c, ffmpeg и Deno…".to_string(),
+    }
+}
+
 fn slow_spinner(ui: &mut egui::Ui) {
     let size = ui.style().spacing.interact_size.y;
     let (rect, response) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
@@ -1025,6 +1048,7 @@ impl SnatchApp {
             cfg,
             tc: Toolchain { yt_dlp: None, aria2c: None },
             setup_started: false,
+            setup_progress: None,
             phase: Phase::Idle,
             jobs: Vec::new(),
             next_job_id: 0,
@@ -1269,8 +1293,12 @@ impl SnatchApp {
                 Msg::TorrentLog(id, line) => self.push_job_log(id, line),
                 Msg::Done(id, code) => self.finish_job(id, code, ctx),
                 Msg::SetupLog(line) => self.push_log(line),
+                Msg::SetupProgress(label, done, total) => {
+                    self.setup_progress = Some((label, done, total));
+                }
                 Msg::ToolsReady(tc) => apply_initial_discovery(&mut self.tc, self.setup_started, tc),
                 Msg::SetupDone(ok, tc) => {
+                    self.setup_progress = None;
                     self.tc = tc;
                     // Only leave Setup from Setup: an unconditional Idle here
                     // could re-enable the CTA on top of an already-running
@@ -1875,6 +1903,7 @@ impl SnatchApp {
     fn start_setup(&mut self, ctx: &egui::Context) {
         self.setup_started = true;
         self.phase = Phase::Setup;
+        self.setup_progress = None;
         // Keep refused jobs/offers available after installation; spawn_job's
         // Setup guard prevents the old overlapping-installer retry race.
         self.clear_log();
@@ -1882,6 +1911,10 @@ impl SnatchApp {
         let tx = self.tx.clone();
         let ctx_w = ctx.clone();
         std::thread::spawn(move || {
+            let tx_prog = tx.clone();
+            let mut report = move |p: SetupProgress| {
+                let _ = tx_prog.send(Msg::SetupProgress(p.label, p.done, p.total));
+            };
             let bin = match bootstrap_dir() {
                 Ok(bin) => bin,
                 Err(e) => {
@@ -1897,7 +1930,7 @@ impl SnatchApp {
                     "Устанавливаю загрузчики в {}",
                     bin.display()
                 )));
-                match install_yt_dlp(&bin) {
+                match install_yt_dlp_with(&bin, &mut report) {
                     Ok(p) => {
                         let _ = tx.send(Msg::SetupLog(format!("yt-dlp: {}", p.display())));
                     }
@@ -1906,7 +1939,7 @@ impl SnatchApp {
                         ok = false;
                     }
                 }
-                match install_aria2(&bin) {
+                match install_aria2_with(&bin, &mut report) {
                     Ok(p) => {
                         let _ = tx.send(Msg::SetupLog(format!("aria2c: {}", p.display())));
                     }
@@ -1915,7 +1948,7 @@ impl SnatchApp {
                         ok = false;
                     }
                 }
-                match install_ffmpeg(&bin) {
+                match install_ffmpeg_with(&bin, &mut report) {
                     Ok(p) => {
                         let _ = tx.send(Msg::SetupLog(format!("ffmpeg: {}", p.display())));
                     }
@@ -1924,7 +1957,7 @@ impl SnatchApp {
                         ok = false;
                     }
                 }
-                match install_deno(&bin) {
+                match install_deno_with(&bin, &mut report) {
                     Ok(p) => {
                         let _ = tx.send(Msg::SetupLog(format!("Deno: {}", p.display())));
                     }
@@ -2728,7 +2761,7 @@ impl SnatchApp {
         if self.phase == Phase::Setup {
             ui.horizontal(|ui| {
                 slow_spinner(ui);
-                ui.label("скачиваю yt-dlp и aria2c…");
+                ui.label(setup_progress_text(self.setup_progress.as_ref()));
             });
             return;
         }
@@ -3227,6 +3260,16 @@ mod tests {
 
     fn test_job(url: &str) -> Job {
         Job { engine: "yt-dlp".into(), url: url.into(), out_dir: std::env::temp_dir(), fmt: "best".into(), cookies_browser: None }
+    }
+
+    #[test]
+    fn setup_progress_text_shows_bytes_percent_and_a_fallback() {
+        let p = ("ffmpeg".to_string(), 50 * 1024 * 1024, Some(100 * 1024 * 1024));
+        let t = setup_progress_text(Some(&p));
+        assert!(t.contains("ffmpeg") && t.contains("50%"), "{t}");
+        let p = ("yt-dlp.exe".to_string(), 1024, None);
+        assert!(setup_progress_text(Some(&p)).contains("yt-dlp.exe"));
+        assert_eq!(setup_progress_text(None), "скачиваю yt-dlp, aria2c, ffmpeg и Deno…");
     }
 
     #[test]

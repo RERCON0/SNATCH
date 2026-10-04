@@ -689,7 +689,7 @@ const ARIA2_EXTRA_LONG: &[&str] = &[
     "all-proxy", "http-proxy", "https-proxy", "ftp-proxy", "no-proxy",
     "all-proxy-user", "all-proxy-passwd", "http-user", "http-passwd",
     "header", "user-agent", "referer",
-    "load-cookies", "save-cookies", "http-accept-gzip",
+    "load-cookies",
 ];
 const ARIA2_EXTRA_SHORT: &[char] = &['x', 's', 'k', 'j', 'm', 't', 'u', 'U'];
 
@@ -712,6 +712,42 @@ fn aria2_extra_allowed(arg: &str) -> bool {
         return rest.chars().next().is_some_and(|c| ARIA2_EXTRA_SHORT.contains(&c));
     }
     false
+}
+
+/// Validates the whole extras list, not just single tokens: a whitelisted
+/// flag may take its value as the next token (`-x 16`, `--max-tries 3`,
+/// `--header "A: b"`), and that token is a value, not a bare URI. A bare
+/// token anywhere else is refused so a second URL cannot sneak in.
+fn validate_aria2_extras(args: &[String]) -> Result<(), String> {
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if !aria2_extra_allowed(a) {
+            let why = if a.starts_with('-') {
+                format!("доп. аргумент aria2 `{a}` вне разрешённого набора")
+            } else {
+                format!("голый аргумент `{a}` в extras не разрешён (лишний URL?)")
+            };
+            return Err(format!(
+                "{why} — имя, папку, режим докачки, конфиг и входные файлы задаёт сам SNATCH; \
+                 разрешены только лимиты, прокси, заголовки, таймауты и повторы"
+            ));
+        }
+        // `--flag value` and `-x value` consume the next token as the value;
+        // `--flag=value`/`-x16` carry it themselves. All whitelisted flags
+        // take a value, so a missing one is a user error worth naming.
+        let expects_value = !a.contains('=') && (a.starts_with("--") || a.len() == 2);
+        if expects_value {
+            i += 1;
+            if i >= args.len() {
+                return Err(format!(
+                    "доп. аргумент aria2 `{a}` требует значение (например, `{a}=...` или `{a} ...`)"
+                ));
+            }
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 /// Absolute output directory without touching the filesystem (build() also
@@ -971,14 +1007,8 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
             cmd.push("--file-allocation=none".into());
             cmd.push("--auto-save-interval=1".into());
         }
+        validate_aria2_extras(&extras.extra_aria2)?;
         for a in &extras.extra_aria2 {
-            if !aria2_extra_allowed(a) {
-                return Err(format!(
-                    "доп. аргумент aria2 `{a}` вне разрешённого набора — имя, папку, режим \
-                     докачки, конфиг и входные файлы задаёт сам SNATCH; разрешены только \
-                     лимиты, прокси, заголовки, таймауты и повторы"
-                ));
-            }
             cmd.push(a.clone().into());
         }
         cmd.push("--".into());
@@ -1821,18 +1851,32 @@ mod tests {
             out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
         // aria2c resolves unambiguous prefixes, so abbreviations of
         // identity-changing flags must be refused alongside full names.
-        for bad in ["-o", "-oX", "--out=evil.bin", "--ou=evil.bin", "-d/tmp",
-                    "-c", "--conti=true", "--allow-overw=true", "--conf-path=x",
-                    "-i", "--input-file=x", "-T", "-M", "-Z", "--max-o=1"] {
-            let extras = RunExtras { extra_aria2: vec![bad.into()], ..RunExtras::default() };
-            assert!(build_with(&job, &tc_aria2(), &extras).is_err(), "{bad}");
+        for bad in [vec!["-o"], vec!["-oX"], vec!["--out=evil.bin"], vec!["--ou=evil.bin"],
+                    vec!["-d/tmp"], vec!["-c"], vec!["--conti=true"], vec!["--allow-overw=true"],
+                    vec!["--conf-path=x"], vec!["-i"], vec!["--input-file=x"], vec!["-T"],
+                    vec!["-M"], vec!["-Z"], vec!["--max-o=1"], vec!["--save-cookies=x"],
+                    vec!["https://evil.example/x"]] {
+            let extras = RunExtras {
+                extra_aria2: bad.iter().map(|s| s.to_string()).collect(),
+                ..RunExtras::default()
+            };
+            assert!(build_with(&job, &tc_aria2(), &extras).is_err(), "{bad:?}");
         }
-        for ok in ["-x16", "--max-tries=3", "--max-download-l=1M", "--user-agent=Foo",
-                   "--referer=http://x", "--connect-timeout=5",
-                   "--all-proxy=http://127.0.0.1:8080"] {
-            let extras = RunExtras { extra_aria2: vec![ok.into()], ..RunExtras::default() };
-            assert!(build_with(&job, &tc_aria2(), &extras).is_ok(), "{ok}");
+        // `=`/attached and space-separated values are both accepted.
+        for ok in [vec!["-x16"], vec!["-x", "16"], vec!["--max-tries=3"], vec!["--max-tries", "3"],
+                   vec!["--max-download-l=1M"], vec!["--user-agent=Foo"],
+                   vec!["--header", "A: b"], vec!["--referer=http://x"],
+                   vec!["--connect-timeout", "5"], vec!["--all-proxy=http://127.0.0.1:8080"]] {
+            let extras = RunExtras {
+                extra_aria2: ok.iter().map(|s| s.to_string()).collect(),
+                ..RunExtras::default()
+            };
+            assert!(build_with(&job, &tc_aria2(), &extras).is_ok(), "{ok:?}");
         }
+        // A flag left without its value must say so, not blame the value.
+        let extras = RunExtras { extra_aria2: vec!["--max-tries".into()], ..RunExtras::default() };
+        let err = build_with(&job, &tc_aria2(), &extras).unwrap_err();
+        assert!(err.contains("значение"), "{err}");
         std::fs::remove_dir_all(&out).ok();
     }
 
