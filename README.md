@@ -54,7 +54,8 @@ Windows (winget):
 ```powershell
 winget install yt-dlp.yt-dlp
 winget install aria2.aria2
-winget install Gyan.FFmpeg   # опционально, для mp3
+winget install Gyan.FFmpeg      # склейка видео+звук и mp3
+winget install DenoLand.Deno    # JS-рантайм для YouTube
 ```
 
 SNATCH находит binaries в таком порядке: своя автоустановленная копия (`%LOCALAPPDATA%\snatch\bin`) → `PATH` → папки WinGet (`%LOCALAPPDATA%\Microsoft\WinGet\Packages`, `...\WinGet\Links`).
