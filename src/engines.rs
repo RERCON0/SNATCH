@@ -644,30 +644,46 @@ pub struct RunExtras {
 pub fn split_cli_args(s: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut quoted = false;
+    // Which quote opened the current span: a `'` inside double quotes is a
+    // literal apostrophe (`"D:\Bob's Files"`), not a closing quote.
+    let mut quote: Option<char> = None;
     let mut token = false;
     for c in s.chars() {
         if c == '\0' {
             return Err("дополнительные аргументы содержат NUL".into());
         }
-        match c {
-            '"' | '\'' => { quoted = !quoted; token = true; }
-            c if c.is_whitespace() && !quoted => {
+        match quote {
+            Some(q) if c == q => { quote = None; token = true; }
+            Some(_) => { cur.push(c); token = true; }
+            None if c == '"' || c == '\'' => { quote = Some(c); token = true; }
+            None if c.is_whitespace() => {
                 if token || !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
                     token = false;
                 }
             }
-            c => { cur.push(c); token = true; }
+            None => { cur.push(c); token = true; }
         }
     }
-    if quoted {
+    if quote.is_some() {
         return Err("незакрытая кавычка в дополнительных аргументах".into());
     }
     if token || !cur.is_empty() {
         out.push(cur);
     }
     Ok(out)
+}
+
+/// aria2 flags from user extras that would silently break the guarantees the
+/// lock/origin records rely on: output name/dir, resume state, config path or
+/// overwrite permission. Rejected instead of letting the download's identity
+/// drift from what was recorded. Short options are also matched in their
+/// attached form (`-oNAME`, `-dDIR`, `-c...`).
+fn forbidden_aria2_arg(arg: &str) -> bool {
+    let long = ["--out", "--dir", "--continue", "--conf-path", "--allow-overwrite"];
+    arg == "-o" || arg == "-d" || arg == "-c"
+        || long.iter().any(|f| arg == *f || arg.starts_with(&format!("{f}=")))
+        || (arg.len() > 2 && (arg.starts_with("-o") || arg.starts_with("-d") || arg.starts_with("-c")))
 }
 
 /// Absolute output directory without touching the filesystem (build() also
@@ -928,6 +944,12 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
             cmd.push("--auto-save-interval=1".into());
         }
         for a in &extras.extra_aria2 {
+            if forbidden_aria2_arg(a) {
+                return Err(format!(
+                    "доп. аргумент aria2 `{a}` конфликтует с защитой имён и докачки: имя, \
+                     папку, режим -c и путь конфига задаёт сам SNATCH"
+                ));
+            }
             cmd.push(a.clone().into());
         }
         cmd.push("--".into());
@@ -1752,6 +1774,35 @@ mod tests {
         let i = s.iter().position(|a| a == "--sub-langs").unwrap();
         assert_eq!(s[i + 1], "ru,en");
         assert!(s.windows(2).any(|w| w == ["--limit-rate", "5M"]));
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn quotes_do_not_leak_across_each_other() {
+        assert_eq!(split_cli_args("--paths \"D:\\Bob's Files\"").unwrap(),
+                   vec!["--paths", "D:\\Bob's Files"]);
+        assert_eq!(split_cli_args("'it \"quotes\" too'").unwrap(),
+                   vec!["it \"quotes\" too"]);
+    }
+
+    #[test]
+    fn aria2_extras_cannot_override_name_or_resume_pins() {
+        let out = tmp_out();
+        let job = Job { engine: "aria2".into(), url: "https://h/f.bin".into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        for bad in [vec!["-o", "evil"], vec!["--out=evil"], vec!["-d/tmp"], vec!["-c"],
+                    vec!["--allow-overwrite=true"], vec!["--conf-path=x"]] {
+            let extras = RunExtras {
+                extra_aria2: bad.iter().map(|s| s.to_string()).collect(),
+                ..RunExtras::default()
+            };
+            assert!(build_with(&job, &tc_aria2(), &extras).is_err(), "{bad:?}");
+        }
+        let ok = RunExtras {
+            extra_aria2: vec!["-x16".into(), "--max-tries=3".into()],
+            ..RunExtras::default()
+        };
+        assert!(build_with(&job, &tc_aria2(), &ok).is_ok());
         std::fs::remove_dir_all(&out).ok();
     }
 

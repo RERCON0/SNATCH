@@ -193,10 +193,10 @@ pub fn sanitize(data: &Value) -> Config {
 /// from the history needs the credentials re-entered - safe by default.
 fn redact_credentials(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
-    let (authority, tail) = match rest.split_once('/') {
-        Some((authority, tail)) => (authority, format!("/{tail}")),
-        None => (rest, String::new()),
-    };
+    // The authority ends at the first '/', '?' or '#': an '@' in the query
+    // (`https://host?email=a@b`) is not userinfo and must not be rewritten.
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
     match authority.rsplit_once('@') {
         Some((_, host)) => format!("{scheme}://{host}{tail}"),
         None => url.to_string(),
@@ -718,10 +718,12 @@ mod tests {
         cfg.remember_url("https://token@host.tld/");
         cfg.remember_url("https://host.tld/plain?a=b@c");
         cfg.remember_url("magnet:?xt=urn:btih:abc");
-        assert_eq!(cfg.urls[3], "https://host.tld/a.zip?x=1");
-        assert_eq!(cfg.urls[2], "https://host.tld/");
-        assert_eq!(cfg.urls[1], "https://host.tld/plain?a=b@c");
-        assert_eq!(cfg.urls[0], "magnet:?xt=urn:btih:abc");
+        cfg.remember_url("https://host.tld?email=a@b");
+        assert_eq!(cfg.urls[4], "https://host.tld/a.zip?x=1");
+        assert_eq!(cfg.urls[3], "https://host.tld/");
+        assert_eq!(cfg.urls[2], "https://host.tld/plain?a=b@c");
+        assert_eq!(cfg.urls[1], "magnet:?xt=urn:btih:abc");
+        assert_eq!(cfg.urls[0], "https://host.tld?email=a@b");
         std::fs::remove_dir_all(&dir).ok();
     }
 
