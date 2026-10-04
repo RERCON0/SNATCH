@@ -22,7 +22,7 @@ use snatch_rs::engines::{
     validate_cookies_browser, validate_url, Job, RunResult, COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
 };
 #[cfg(windows)]
-use snatch_rs::setup::{install_aria2, install_yt_dlp};
+use snatch_rs::setup::{install_aria2, install_deno, install_ffmpeg, install_yt_dlp};
 #[cfg(windows)]
 use snatch_rs::tools::bootstrap_dir;
 use snatch_rs::tools::Toolchain;
@@ -78,13 +78,29 @@ struct Args {
     /// Забыть последние ссылки и папки
     #[arg(long)]
     clear_history: bool,
-    /// Установить загрузчики в папку SNATCH (Windows)
+    /// Установить загрузчики и помощники (yt-dlp, aria2c, ffmpeg, Deno)
+    /// в собственную папку SNATCH (Windows)
     #[arg(long)]
     install_tools: bool,
     /// Не докачивать прерванное, начать файл с начала — лечит протухший .part
     /// («Invalid data» при склейке). В GUI такой повтор происходит автоматически.
     #[arg(long)]
     no_continue: bool,
+    /// Скачивать субтитры рядом с видео (yt-dlp)
+    #[arg(long)]
+    subs: bool,
+    /// Языки субтитров, например ru,en (по умолчанию ru,en)
+    #[arg(long, value_name = "LANGS")]
+    sub_langs: Option<String>,
+    /// Скачивать плейлист целиком (по умолчанию — только одиночное видео)
+    #[arg(long)]
+    playlist: bool,
+    /// Дополнительные аргументы yt-dlp, как в командной строке
+    #[arg(long, value_name = "ARGS")]
+    yt_dlp_args: Option<String>,
+    /// Дополнительные аргументы aria2c
+    #[arg(long, value_name = "ARGS")]
+    aria2_args: Option<String>,
 }
 
 #[derive(Clone)]
@@ -98,6 +114,17 @@ struct Plan {
     /// Torrent file selection plus the metadata fetched while listing;
     /// default = every file, aria2 fetches the metadata itself.
     torrent: torrent::Choice,
+    extras: engines::RunExtras,
+}
+
+fn extras_from_args(args: &Args) -> Result<engines::RunExtras, String> {
+    Ok(engines::RunExtras {
+        subs: args.subs,
+        sub_langs: args.sub_langs.clone().unwrap_or_default(),
+        playlist: args.playlist,
+        extra_ytdlp: args.yt_dlp_args.as_deref().map(engines::split_cli_args).transpose()?.unwrap_or_default(),
+        extra_aria2: args.aria2_args.as_deref().map(engines::split_cli_args).transpose()?.unwrap_or_default(),
+    })
 }
 
 fn plan_from_args(args: &Args) -> Option<Plan> {
@@ -107,6 +134,13 @@ fn plan_from_args(args: &Args) -> Option<Plan> {
     };
     let engine = args.engine.clone().unwrap_or_else(|| detect_engine(url).to_string());
     let fmt = args.format.clone().unwrap_or_else(|| "best".to_string());
+    let extras = match extras_from_args(args) {
+        Ok(extras) => extras,
+        Err(e) => {
+            errln(format!("✘ {e}"));
+            return None;
+        }
+    };
     Some(Plan {
         url: url.clone(),
         engine,
@@ -115,6 +149,7 @@ fn plan_from_args(args: &Args) -> Option<Plan> {
         cookies_browser: args.cookies_browser.clone(),
         no_continue: args.no_continue,
         torrent: torrent::Choice::default(),
+        extras,
     })
 }
 
@@ -130,6 +165,7 @@ fn plans_from_args(args: &Args) -> Option<Vec<Plan>> {
             cookies_browser: plans[0].cookies_browser.clone(),
             no_continue: plans[0].no_continue,
             torrent: torrent::Choice::default(),
+            extras: plans[0].extras.clone(),
         });
     }
     Some(plans)
@@ -141,8 +177,9 @@ fn cli_command(
     no_continue: bool,
     batch: bool,
     choice: &torrent::Choice,
+    extras: &engines::RunExtras,
 ) -> Result<Vec<std::ffi::OsString>, String> {
-    let mut cmd = engines::build_for_run(job, tc, choice)?;
+    let mut cmd = engines::build_for_run_with(job, tc, choice, extras)?;
     let at = cmd.len().saturating_sub(2);
     if no_continue && job.engine == "yt-dlp" {
         cmd.insert(at, "--no-continue".into());
@@ -579,7 +616,7 @@ fn run_batch_job(
             return RunResult { code: 2, auth_hint: false };
         }
     };
-    let cmd = match cli_command(&job, tc, plan.no_continue, true, &plan.torrent) {
+    let cmd = match cli_command(&job, tc, plan.no_continue, true, &plan.torrent, &plan.extras) {
         Ok(cmd) => cmd,
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
@@ -600,6 +637,7 @@ fn run_batch_job(
         .env("PYTHONUTF8", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    snatch_rs::engines::prepend_bootstrap_path(&mut command);
     let (mut child, proc_job) = match snatch_rs::job_object::spawn(&mut command, false) {
         Ok(result) => result,
         Err(e) => {
@@ -1034,7 +1072,7 @@ fn collect(tc: &Toolchain, url: String, out_dir: &str, cookies_browser: Option<S
     let fmt = if engine == "yt-dlp" {
         match format_override { Some(format) => format.to_string(), None => ask_format()? }
     } else { "best".to_string() };
-    Some(Plan { url, engine, fmt, out_dir: out_dir.to_string(), cookies_browser, no_continue: false, torrent: torrent::Choice::default() })
+    Some(Plan { url, engine, fmt, out_dir: out_dir.to_string(), cookies_browser, no_continue: false, torrent: torrent::Choice::default(), extras: engines::RunExtras::default() })
 }
 
 fn main() -> std::process::ExitCode {
@@ -1072,8 +1110,13 @@ fn main() -> std::process::ExitCode {
                 return exit_code(2);
             }
             let mut failed = false;
-            for name in ["yt-dlp", "aria2c"] {
-                let result = if name == "yt-dlp" { install_yt_dlp(&dir) } else { install_aria2(&dir) };
+            for name in ["yt-dlp", "aria2c", "ffmpeg", "Deno"] {
+                let result = match name {
+                    "yt-dlp" => install_yt_dlp(&dir),
+                    "aria2c" => install_aria2(&dir),
+                    "ffmpeg" => install_ffmpeg(&dir),
+                    _ => install_deno(&dir),
+                };
                 match result {
                     Ok(path) => outln(format!("✔ {name}: {}", path.display())),
                     Err(e) => { errln(format!("✘ {name}: {e}")); failed = true; }
@@ -1188,6 +1231,16 @@ fn main() -> std::process::ExitCode {
         if plans.is_empty() {
             outln("Нечего скачивать.");
             continue;
+        }
+        let extras = match extras_from_args(&args) {
+            Ok(extras) => extras,
+            Err(e) => {
+                errln(format!("✘ {e}"));
+                return exit_code(2);
+            }
+        };
+        for plan in &mut plans {
+            plan.extras = extras.clone();
         }
         let code = if plans.len() == 1 {
             let result = download(&plans[0], &mut cfg, Some(&tc));
@@ -1520,6 +1573,7 @@ mod tests {
             cookies_browser: None,
             no_continue: false,
             torrent: torrent::Choice::default(),
+            extras: engines::RunExtras::default(),
         }
     }
 
@@ -1567,7 +1621,28 @@ mod tests {
             clear_history: false,
             install_tools: false,
             no_continue: false,
+            subs: false,
+            sub_langs: None,
+            playlist: false,
+            yt_dlp_args: None,
+            aria2_args: None,
         }
+    }
+
+    #[test]
+    fn plan_from_args_carries_run_extras_and_rejects_a_bad_quote() {
+        let mut args = args_with(Some("https://x"), Some("d"), None);
+        args.subs = true;
+        args.sub_langs = Some("ru,en".into());
+        args.playlist = true;
+        args.yt_dlp_args = Some("--limit-rate 5M".into());
+        let plan = plan_from_args(&args).unwrap();
+        assert!(plan.extras.subs);
+        assert_eq!(plan.extras.sub_langs, "ru,en");
+        assert!(plan.extras.playlist);
+        assert_eq!(plan.extras.extra_ytdlp, ["--limit-rate", "5M"]);
+        args.yt_dlp_args = Some("\"oops".into());
+        assert!(plan_from_args(&args).is_none());
     }
 
     #[test]
@@ -1651,7 +1726,7 @@ mod tests {
             fmt: "best".into(),
             cookies_browser: None,
         };
-        let cmd = cli_command(&job, &tc, false, true, &torrent::Choice::default()).unwrap();
+        let cmd = cli_command(&job, &tc, false, true, &torrent::Choice::default(), &engines::RunExtras::default()).unwrap();
         assert_eq!(cmd[cmd.len() - 2], "--");
         assert!(cmd.iter().any(|arg| arg == "--summary-interval=2"));
         std::fs::remove_dir_all(dir).ok();

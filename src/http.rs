@@ -1,4 +1,4 @@
-//! Size-bounded, cancellable HTTP reads for native media and torrent metadata.
+//! Size-bounded, cancellable HTTP reads for torrent metadata.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 

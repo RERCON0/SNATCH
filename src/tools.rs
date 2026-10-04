@@ -410,6 +410,13 @@ mod tests {
         std::env::set_var("LOCALAPPDATA", &dir);
         let exe = dir.join("my-yt-dlp.exe");
         std::fs::write(&exe, b"executable fixture").unwrap();
+        #[cfg(unix)]
+        {
+            // `find` requires the executable bit on Unix; fs::write's 0o644
+            // would make this test fail on Linux/macOS.
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::env::set_var("SNATCH_YT_DLP", &exe);
         assert_eq!(find("yt-dlp"), Some(exe.clone()));
         std::env::set_var("SNATCH_YT_DLP", dir.join("gone.exe"));

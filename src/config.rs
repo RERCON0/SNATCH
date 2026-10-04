@@ -7,9 +7,9 @@ use fs4::FileExt;
 
 pub const MAX_HISTORY: usize = 15;
 
-/// A real config.json is a few KB (15+15 history entries, a token). Anything
-/// past this is corrupt or planted and is ignored rather than read whole on
-/// every download (Config::load runs inside YM auth resolution).
+/// A real config.json is a few KB (15+15 history entries). Anything past
+/// this is corrupt or planted and is ignored rather than read whole on
+/// every download (Config::load runs on every start and before each run).
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Longest a save waits for another SNATCH process's config.lock. save() runs
@@ -187,6 +187,22 @@ pub fn sanitize(data: &Value) -> Config {
         theme_snapshot: Cell::new(bool_field(obj, "dark_mode", true)),
     }
 }
+/// History is a convenience list, not a credential store: the userinfo part
+/// of an authority (`https://user:token@host/...`) is dropped before a URL
+/// is remembered, so config.json never carries secrets. Running such a link
+/// from the history needs the credentials re-entered - safe by default.
+fn redact_credentials(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else { return url.to_string() };
+    let (authority, tail) = match rest.split_once('/') {
+        Some((authority, tail)) => (authority, format!("/{tail}")),
+        None => (rest, String::new()),
+    };
+    match authority.rsplit_once('@') {
+        Some((_, host)) => format!("{scheme}://{host}{tail}"),
+        None => url.to_string(),
+    }
+}
+
 fn dedup_front(list: Vec<String>, value: String) -> Vec<String> {
     let head = value.clone();
     let mut out = vec![value];
@@ -375,7 +391,8 @@ impl Config {
     }
 
     pub fn remember_url(&mut self, url: &str) {
-        self.urls = dedup_front(std::mem::take(&mut self.urls), url.to_string());
+        let url = redact_credentials(url);
+        self.urls = dedup_front(std::mem::take(&mut self.urls), url);
         self.url_dirty.set(true);
     }
 
@@ -688,6 +705,23 @@ mod tests {
         cfg.dark_mode = false;
         cfg.save_to(&p);
         assert!(!Config::load_from(&p).dark_mode);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn credentials_are_dropped_from_remembered_urls() {
+        let dir = std::env::temp_dir().join(format!("snatch-rs-redact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut cfg = Config::load_from(&p);
+        cfg.remember_url("https://user:token@host.tld/a.zip?x=1");
+        cfg.remember_url("https://token@host.tld/");
+        cfg.remember_url("https://host.tld/plain?a=b@c");
+        cfg.remember_url("magnet:?xt=urn:btih:abc");
+        assert_eq!(cfg.urls[3], "https://host.tld/a.zip?x=1");
+        assert_eq!(cfg.urls[2], "https://host.tld/");
+        assert_eq!(cfg.urls[1], "https://host.tld/plain?a=b@c");
+        assert_eq!(cfg.urls[0], "magnet:?xt=urn:btih:abc");
         std::fs::remove_dir_all(&dir).ok();
     }
 

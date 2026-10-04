@@ -15,6 +15,20 @@ const MAX_YT_DLP_BYTES: u64 = 256 * 1024 * 1024;
 // for this older release, so keep an independently pinned ZIP hash in source.
 const PINNED_ARIA2_ZIP: &str = "aria2-1.37.0-win-64bit-build1.zip";
 const PINNED_ARIA2_SHA256: &str = "67d015301eef0b612191212d564c5bb0a14b5b9c4796b76454276a4d28d9b288";
+// ffmpeg comes from the gyan.dev release builds (the canonical Windows
+// builds): a fixed HTTPS URL plus its official `.sha256` sidecar, fetched
+// first so a 100+ MB download is never started unverifiably.
+const FFMPEG_ARCHIVE_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+const FFMPEG_CHECKSUM_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip.sha256";
+const MAX_FFMPEG_ZIP_BYTES: u64 = 300 * 1024 * 1024;
+const MAX_FFMPEG_EXE_BYTES: u64 = 300 * 1024 * 1024;
+// Deno is yt-dlp's recommended JS runtime: YouTube now needs one to solve
+// its player challenges (nsig), and without it yt-dlp can fall back to
+// limited formats. The GitHub API asset carries a sha256 digest.
+const DENO_API: &str = "https://api.github.com/repos/denoland/deno/releases/latest";
+const DENO_ZIP_NAME: &str = "deno-x86_64-pc-windows-msvc.zip";
+const MAX_DENO_ZIP_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_DENO_EXE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Sanity cap for the extracted aria2c.exe (real one is a few MB). Without a
 /// limit, `io::copy` out of the zip would happily fill the disk from a
@@ -458,11 +472,206 @@ fn retry_transient<T>(mut attempt: impl FnMut() -> Result<T, DownloadFailure>) -
     unreachable!("last attempt always returns")
 }
 
-fn copy_limited(reader: impl Read, mut writer: impl Write, max: u64) -> Result<(), String> {
+fn copy_limited(label: &str, reader: impl Read, mut writer: impl Write, max: u64) -> Result<(), String> {
     let n = std::io::copy(&mut reader.take(max + 1), &mut writer)
         .map_err(|e| format!("сбой распаковки: {e}"))?;
-    if n > max { return Err(format!("aria2c.exe больше {max} байт — похоже на подмену или битый архив")); }
+    if n > max { return Err(format!("{label} больше {max} байт — похоже на подмену или битый архив")); }
     Ok(())
+}
+
+/// First bare 64-hex token of a checksum sidecar. gyan.dev's `.sha256` holds
+/// just the hash; some mirrors wrap it in "SHA256 (file) = <hash>".
+fn sha256_from_sidecar(text: &str) -> Option<String> {
+    text.split(|c: char| !c.is_ascii_hexdigit())
+        .find(|tok| tok.len() == 64)
+        .map(str::to_string)
+}
+
+fn deno_asset(release: &serde_json::Value) -> Result<(String, String), String> {
+    let asset = release["assets"].as_array()
+        .and_then(|assets| assets.iter().find(|a| a["name"].as_str() == Some(DENO_ZIP_NAME)))
+        .ok_or("в релизе Deno нет архива для Windows x64")?;
+    let size = asset["size"].as_u64().ok_or("у архива Deno нет размера в GitHub API")?;
+    if size == 0 || size > MAX_DENO_ZIP_BYTES {
+        return Err(format!("размер архива Deno ({size} байт) выходит за лимит"));
+    }
+    let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:"))
+        .ok_or("релиз Deno не публикует SHA-256 — установите Deno вручную")?;
+    if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Некорректная SHA-256 в метаданных Deno".into());
+    }
+    let url = asset["browser_download_url"].as_str().ok_or("у архива Deno нет URL")?;
+    let parsed = reqwest::Url::parse(url).map_err(|e| format!("некорректный URL Deno: {e}"))?;
+    if parsed.scheme() != "https" || parsed.host_str() != Some("github.com")
+        || parsed.username() != "" || parsed.password().is_some()
+        || !parsed.path().starts_with("/denoland/deno/releases/download/")
+        || !parsed.path().ends_with(&format!("/{DENO_ZIP_NAME}"))
+    {
+        return Err("архив Deno должен скачиваться с официального GitHub-релиза".into());
+    }
+    Ok((url.to_string(), digest.to_string()))
+}
+
+/// ffmpeg (+ffprobe) for yt-dlp: merging video+audio, mp3 extraction and
+/// subtitle embedding all go through it. Verified against the official
+/// sidecar from the same HTTPS host before the archive is trusted.
+pub fn install_ffmpeg(bin: &Path) -> Result<PathBuf, String> {
+    if !cfg!(windows) {
+        return Err("Автоустановка ffmpeg поддерживается только на Windows.".to_string());
+    }
+    let _lock = install_lock(bin, "ffmpeg")?;
+    match retry_transient(|| install_ffmpeg_inner(bin)) {
+        Ok(p) => Ok(p),
+        Err(f) => {
+            if !f.kind.keeps_part() {
+                remove_part(&bin.join("ffmpeg.zip.part"));
+                let _ = std::fs::remove_file(bin.join("ffmpeg.exe.part"));
+                let _ = std::fs::remove_file(bin.join("ffprobe.exe.part"));
+            }
+            Err(f.message)
+        }
+    }
+}
+
+fn install_ffmpeg_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
+    let c = client().map_err(DownloadFailure::permanent)?;
+    if std::io::stdout().is_terminal() {
+        crate::outln("⬇ Скачиваю ffmpeg…");
+    }
+    // Sidecar first: never fetch the huge zip just to learn it is not
+    // verifiable. Same host, HTTPS.
+    let resp = c.get(FFMPEG_CHECKSUM_URL).send()
+        .map_err(|e| DownloadFailure::transient(format!("ffmpeg sha256: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(DownloadFailure::from_http_status(resp.status().as_u16(), format!("ffmpeg sha256: HTTP {}", resp.status())));
+    }
+    let text = String::from_utf8(read_metadata(resp, "ffmpeg sha256")?)
+        .map_err(|e| DownloadFailure::permanent(format!("ffmpeg sha256 не UTF-8: {e}")))?;
+    let expected = sha256_from_sidecar(&text)
+        .ok_or_else(|| DownloadFailure::permanent("в ffmpeg .sha256 нет корректного хеша"))?;
+
+    let zip_path = bin.join("ffmpeg.zip.part");
+    download(&c, FFMPEG_ARCHIVE_URL, &zip_path, "ffmpeg (zip)", MAX_FFMPEG_ZIP_BYTES)?;
+    let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
+    if !got.eq_ignore_ascii_case(&expected) {
+        remove_part(&zip_path);
+        return Err(DownloadFailure::permanent("SHA-256 архива ffmpeg не совпала — установка остановлена"));
+    }
+
+    let dest = bin.join("ffmpeg.exe");
+    let tmp = bin.join("ffmpeg.exe.part");
+    let probe_tmp = bin.join("ffprobe.exe.part");
+    let extracted = (|| -> Result<(), String> {
+        let file = File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("битый zip: {e}"))?;
+        for (tool, tool_tmp) in [("ffmpeg.exe", &tmp), ("ffprobe.exe", &probe_tmp)] {
+            let idx = (0..archive.len())
+                .filter_map(|i| {
+                    archive.by_index(i).ok().and_then(|e| {
+                        let name = e.name().to_string();
+                        if !e.is_dir() && name.ends_with(tool) {
+                            Some((i, name.len()))
+                        } else {
+                            None
+                        }
+                    })
+                })
+                .min_by_key(|(_, len)| *len);
+            let Some((idx, _)) = idx else {
+                // ffprobe is optional (merge works without it); ffmpeg is not.
+                if tool == "ffprobe.exe" {
+                    continue;
+                }
+                return Err("внутри zip нет ffmpeg.exe".into());
+            };
+            {
+                let mut entry = archive.by_index(idx).map_err(|e| format!("не удалось прочитать zip: {e}"))?;
+                let mut out = File::create(tool_tmp)
+                    .map_err(|e| format!("не удалось создать {}: {e}", tool_tmp.display()))?;
+                copy_limited(tool, &mut entry, &mut out, MAX_FFMPEG_EXE_BYTES)?;
+            }
+        }
+        publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить ffmpeg.exe: {e}"))?;
+        if probe_tmp.is_file() {
+            publish_tool(&probe_tmp, &bin.join("ffprobe.exe"))
+                .map_err(|e| format!("не удалось установить ffprobe.exe: {e}"))?;
+        }
+        Ok(())
+    })();
+    remove_part(&zip_path);
+    if extracted.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&probe_tmp);
+    }
+    extracted.map_err(DownloadFailure::permanent)?;
+    Ok(dest)
+}
+
+/// Deno, yt-dlp's recommended JS runtime for YouTube's player challenges.
+pub fn install_deno(bin: &Path) -> Result<PathBuf, String> {
+    if !cfg!(windows) {
+        return Err("Автоустановка Deno поддерживается только на Windows.".to_string());
+    }
+    let _lock = install_lock(bin, "deno")?;
+    match retry_transient(|| install_deno_inner(bin)) {
+        Ok(p) => Ok(p),
+        Err(f) => {
+            if !f.kind.keeps_part() {
+                remove_part(&bin.join("deno.zip.part"));
+                let _ = std::fs::remove_file(bin.join("deno.exe.part"));
+            }
+            Err(f.message)
+        }
+    }
+}
+
+fn install_deno_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
+    let c = client().map_err(DownloadFailure::permanent)?;
+    recover_tool(&bin.join("deno.exe"))
+        .map_err(|e| DownloadFailure::transient(format!("восстановление deno: {e}")))?;
+    if std::io::stdout().is_terminal() {
+        crate::outln("⬇ Ищу свежий релиз Deno…");
+    }
+    let release = release_json(&c, DENO_API)?;
+    let (url, expected) = deno_asset(&release).map_err(DownloadFailure::permanent)?;
+
+    let zip_path = bin.join("deno.zip.part");
+    download(&c, &url, &zip_path, "Deno (zip)", MAX_DENO_ZIP_BYTES)?;
+    let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
+    if !got.eq_ignore_ascii_case(&expected) {
+        remove_part(&zip_path);
+        return Err(DownloadFailure::permanent("SHA-256 архива Deno не совпала — установка остановлена"));
+    }
+
+    let dest = bin.join("deno.exe");
+    let tmp = bin.join("deno.exe.part");
+    let extracted = (|| -> Result<(), String> {
+        let file = File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
+        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("битый zip: {e}"))?;
+        let idx = (0..archive.len())
+            .filter_map(|i| {
+                archive.by_index(i).ok().and_then(|e| {
+                    let name = e.name().to_string();
+                    (!e.is_dir() && name.ends_with("deno.exe")).then_some((i, name.len()))
+                })
+            })
+            .min_by_key(|(_, len)| *len)
+            .ok_or("внутри zip нет deno.exe")?
+            .0;
+        {
+            let mut entry = archive.by_index(idx).map_err(|e| format!("не удалось прочитать zip: {e}"))?;
+            let mut out = File::create(&tmp)
+                .map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
+            copy_limited("deno.exe", &mut entry, &mut out, MAX_DENO_EXE_BYTES)?;
+        }
+        publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить deno.exe: {e}"))
+    })();
+    remove_part(&zip_path);
+    if extracted.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    extracted.map_err(DownloadFailure::permanent)?;
+    Ok(dest)
 }
 
 /// One installer per tool at a time, across processes (the GUI's «обновить»
@@ -654,7 +863,7 @@ fn install_aria2_inner(bin: &Path) -> Result<PathBuf, DownloadFailure> {
                 archive.by_index(entry_idx).map_err(|e| format!("не удалось прочитать zip: {e}"))?;
             let mut out =
                 File::create(&tmp).map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
-            copy_limited(&mut entry, &mut out, MAX_ARIA2C_BYTES)?;
+            copy_limited("aria2c.exe", &mut entry, &mut out, MAX_ARIA2C_BYTES)?;
         }
         publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))
     })();
@@ -710,14 +919,42 @@ mod tests {
     }
 
     #[test]
+    fn ffmpeg_sidecar_parser_takes_the_hash_not_the_filename() {
+        let bare = "a".repeat(64);
+        assert_eq!(sha256_from_sidecar(&format!("{bare}\n")).unwrap(), bare);
+        let named = "b".repeat(64);
+        assert_eq!(
+            sha256_from_sidecar(&format!("SHA256 (ffmpeg-release-essentials.zip) = {named}")).unwrap(),
+            named
+        );
+        assert!(sha256_from_sidecar("no hash here").is_none());
+    }
+
+    #[test]
+    fn deno_release_requires_the_official_verified_windows_zip() {
+        let asset = |name: &str, size: u64, digest: serde_json::Value, url: &str| {
+            json!({"assets": [{"name": name, "size": size, "digest": digest,
+                "browser_download_url": url}]})
+        };
+        let hash = "c".repeat(64);
+        let good = format!("https://github.com/denoland/deno/releases/download/v2.9.7/{DENO_ZIP_NAME}");
+        assert_eq!(deno_asset(&asset(DENO_ZIP_NAME, 42630221, json!(format!("sha256:{hash}")), &good)).unwrap().1, hash);
+        assert!(deno_asset(&asset(DENO_ZIP_NAME, 42630221, serde_json::Value::Null, &good)).is_err());
+        assert!(deno_asset(&asset(DENO_ZIP_NAME, MAX_DENO_ZIP_BYTES + 1, json!(format!("sha256:{hash}")), &good)).is_err());
+        assert!(deno_asset(&asset(DENO_ZIP_NAME, 42630221, json!(format!("sha256:{hash}")),
+            "https://evil.example/deno.zip")).is_err());
+        assert!(deno_asset(&asset("deno-x86_64-apple-darwin.zip", 100, json!(format!("sha256:{hash}")), &good)).is_err());
+    }
+
+    #[test]
     fn bounded_extraction_rejects_more_than_the_limit() {
         // Exactly max+1 bytes must be written before the cap trips: if the
         // `take(max + 1)` bound regressed, all 5 input bytes would land.
         let mut out = Vec::new();
-        assert!(copy_limited(&b"12345"[..], &mut out, 4).is_err());
+        assert!(copy_limited("тест", &b"12345"[..], &mut out, 4).is_err());
         assert_eq!(out.len(), 5);
         let mut out = Vec::new();
-        copy_limited(&b"1234"[..], &mut out, 4).unwrap();
+        copy_limited("тест", &b"1234"[..], &mut out, 4).unwrap();
         assert_eq!(out, b"1234");
     }
 

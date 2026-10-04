@@ -16,7 +16,7 @@ use snatch_rs::engines::{
     self, detect_engine, is_unc_path, looks_like_auth, parse_progress, preflight_warning, validate_url, Job,
     COOKIES_BROWSERS, FORMATS,
 };
-use snatch_rs::setup::{install_aria2, install_yt_dlp};
+use snatch_rs::setup::{install_aria2, install_deno, install_ffmpeg, install_yt_dlp};
 use snatch_rs::tools::{bootstrap_dir, Toolchain};
 use snatch_rs::{job_object, torrent};
 use snatch_rs::ui::{clip, try_read_dirs_limited};
@@ -433,6 +433,12 @@ struct SnatchApp {
     out_dir: String,
     use_cookies: bool,
     cookies_browser: String,
+    /// yt-dlp extras; see `extras_from_fields` for how they reach build().
+    subs: bool,
+    sub_langs: String,
+    playlist: bool,
+    extra_ytdlp: String,
+    extra_aria2: String,
     cfg: Config,
     tc: Toolchain,
     /// Startup discovery may finish after an installer run; its stale result
@@ -903,12 +909,12 @@ fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     if resize_viewport {
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
             460.0,
-            640.0,
+            720.0,
         )));
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
         460.0,
-        520.0,
+        600.0,
     )));
 }
 
@@ -947,6 +953,24 @@ fn path_drive_letter(p: &Path) -> Option<u8> {
         },
         _ => None,
     }
+}
+
+/// Turns the GUI's option fields into the argv extras build() understands.
+/// A bad quote is reported instead of silently running with different flags.
+fn extras_from_fields(
+    subs: bool,
+    sub_langs: &str,
+    playlist: bool,
+    ytdlp: &str,
+    aria2: &str,
+) -> Result<engines::RunExtras, String> {
+    Ok(engines::RunExtras {
+        subs,
+        sub_langs: sub_langs.to_string(),
+        playlist,
+        extra_ytdlp: engines::split_cli_args(ytdlp)?,
+        extra_aria2: engines::split_cli_args(aria2)?,
+    })
 }
 
 impl SnatchApp {
@@ -993,6 +1017,11 @@ impl SnatchApp {
             out_dir,
             use_cookies: false,
             cookies_browser: "chrome".to_string(),
+            subs: false,
+            sub_langs: "ru,en".to_string(),
+            playlist: false,
+            extra_ytdlp: String::new(),
+            extra_aria2: String::new(),
             cfg,
             tc: Toolchain { yt_dlp: None, aria2c: None },
             setup_started: false,
@@ -1598,7 +1627,16 @@ impl SnatchApp {
                 return false;
             }
         };
-        let mut cmd = match engines::build_for_run(&job, &self.tc, &select) {
+        let extras = match extras_from_fields(
+            self.subs, &self.sub_langs, self.playlist, &self.extra_ytdlp, &self.extra_aria2,
+        ) {
+            Ok(extras) => extras,
+            Err(e) => {
+                self.set_status(StatusKind::Err, format!("«{label}»: {e}"));
+                return false;
+            }
+        };
+        let mut cmd = match engines::build_for_run_with(&job, &self.tc, &select, &extras) {
             Ok(cmd) => cmd,
             Err(e) => {
                 self.set_status(StatusKind::Err, format!("«{label}»: {e}"));
@@ -1645,6 +1683,7 @@ impl SnatchApp {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
+        engines::prepend_bootstrap_path(&mut command);
         let (mut child, proc_job) = match job_object::spawn(&mut command, true) {
             Ok(result) => result,
             Err(e) => {
@@ -1873,6 +1912,24 @@ impl SnatchApp {
                     }
                     Err(e) => {
                         let _ = tx.send(Msg::SetupLog(format!("aria2c: ОШИБКА {e}")));
+                        ok = false;
+                    }
+                }
+                match install_ffmpeg(&bin) {
+                    Ok(p) => {
+                        let _ = tx.send(Msg::SetupLog(format!("ffmpeg: {}", p.display())));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::SetupLog(format!("ffmpeg: ОШИБКА {e}")));
+                        ok = false;
+                    }
+                }
+                match install_deno(&bin) {
+                    Ok(p) => {
+                        let _ = tx.send(Msg::SetupLog(format!("Deno: {}", p.display())));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::SetupLog(format!("Deno: ОШИБКА {e}")));
                         ok = false;
                     }
                 }
@@ -2518,6 +2575,53 @@ impl SnatchApp {
         });
     }
 
+    /// yt-dlp extras: subtitles, playlists and free-form engine arguments.
+    fn ui_extras_row(&mut self, ui: &mut egui::Ui) {
+        let enabled = self.phase != Phase::Setup;
+        let engine = self.effective_engine();
+        ui.add_space(6.0);
+        tag_label(ui, "опции");
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(enabled && engine == "yt-dlp", |ui| {
+                ui.checkbox(&mut self.subs, "субтитры").on_hover_text(
+                    "Скачивать субтитры (ручные и автоматические) рядом с видео",
+                );
+                if self.subs {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.sub_langs)
+                            .font(field_font())
+                            .desired_width(70.0),
+                    )
+                    .on_hover_text("Языки субтитров, например ru,en");
+                }
+            });
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.checkbox(&mut self.playlist, "плейлист")
+                    .on_hover_text("Скачать плейлист целиком, а не одиночное видео");
+            });
+        });
+        ui.add_enabled_ui(enabled, |ui| {
+            ui.collapsing("доп. аргументы", |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("yt-dlp");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.extra_ytdlp)
+                            .font(field_font())
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("aria2c");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.extra_aria2)
+                            .font(field_font())
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+            });
+        });
+    }
+
     fn ui_run_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         // One block per concurrent job - up to MAX_CONCURRENT of these, each
         // with its own name/progress/cancel, so cancelling the second
@@ -2957,6 +3061,7 @@ impl eframe::App for SnatchApp {
                     self.ui_url_row(ui, ctx);
                     let opened = self.ui_engine_row(ui);
                     self.ui_cookies_row(ui);
+                    self.ui_extras_row(ui);
                     opened
                 })
                 .inner;
@@ -3083,8 +3188,8 @@ fn main() -> eframe::Result {
     }));
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([460.0, 640.0])
-        .with_min_inner_size([460.0, 520.0])
+        .with_inner_size([460.0, 720.0])
+        .with_min_inner_size([460.0, 600.0])
         .with_title("SNATCH — by rercon prod.");
     #[cfg(windows)]
     { viewport = viewport.with_decorations(false); }
@@ -3122,6 +3227,16 @@ mod tests {
 
     fn test_job(url: &str) -> Job {
         Job { engine: "yt-dlp".into(), url: url.into(), out_dir: std::env::temp_dir(), fmt: "best".into(), cookies_browser: None }
+    }
+
+    #[test]
+    fn gui_extras_split_args_and_reject_a_bad_quote() {
+        let e = extras_from_fields(true, "ru,en", true, "--limit-rate 5M", "").unwrap();
+        assert!(e.subs && e.playlist);
+        assert_eq!(e.sub_langs, "ru,en");
+        assert_eq!(e.extra_ytdlp, ["--limit-rate", "5M"]);
+        assert!(e.extra_aria2.is_empty());
+        assert!(extras_from_fields(false, "", false, "\"oops", "").is_err());
     }
 
     #[test]
@@ -3195,8 +3310,8 @@ mod tests {
             input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(native);
             let output = ctx.run(input, |ctx| pin_pixel_scale(ctx, true));
             let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
-            assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(460.0, 640.0))));
-            assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::MinInnerSize(size) if *size == egui::vec2(460.0, 520.0))));
+            assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(460.0, 720.0))));
+            assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::MinInnerSize(size) if *size == egui::vec2(460.0, 600.0))));
         }
     }
 

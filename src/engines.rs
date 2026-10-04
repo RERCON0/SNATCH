@@ -60,10 +60,15 @@ pub const ENGINE_LABELS: [(&str, &str); 2] = [
     ("aria2", "aria2c — прямые ссылки, torrent, magnet"),
 ];
 
-pub const FORMATS: [(&str, &str); 3] = [
+pub const FORMATS: [(&str, &str); 8] = [
     ("best", "Лучшее качество"),
+    ("2160p", "Видео до 2160p (4K)"),
+    ("1440p", "Видео до 1440p"),
     ("1080p", "Видео до 1080p"),
-    ("audio", "Только аудио (mp3)"),
+    ("720p", "Видео до 720p"),
+    ("480p", "Видео до 480p"),
+    ("audio", "Аудио — mp3 (перекодирование)"),
+    ("audio-src", "Аудио — исходное (m4a/opus, без перекодирования)"),
 ];
 
 const AUTH_HINTS: &[&str] = &[
@@ -604,10 +609,65 @@ pub fn expanduser(p: &Path) -> PathBuf {
 
 fn format_flags(fmt: &str) -> Vec<&'static str> {
     match fmt {
+        "2160p" => vec!["-f", "bv*[height<=2160]+ba/b[height<=2160]"],
+        "1440p" => vec!["-f", "bv*[height<=1440]+ba/b[height<=1440]"],
         "1080p" => vec!["-f", "bv*[height<=1080]+ba/b[height<=1080]"],
+        "720p" => vec!["-f", "bv*[height<=720]+ba/b[height<=720]"],
+        "480p" => vec!["-f", "bv*[height<=480]+ba/b[height<=480]"],
         "audio" => vec!["-x", "--audio-format", "mp3"],
+        // bestaudio in its original container: no ffmpeg re-encode.
+        "audio-src" => vec!["-f", "ba/b"],
         _ => vec![],
     }
+}
+
+/// Optional yt-dlp/aria2 behaviour carried in from the CLI/GUI. Deliberately
+/// not part of `Job`: locks, owner marks and pause/resume key on the job
+/// alone, so toggling these never changes a job's identity.
+#[derive(Clone, Default)]
+pub struct RunExtras {
+    /// Download subtitles next to the video (manual + automatic captions).
+    pub subs: bool,
+    /// yt-dlp `--sub-langs` value; empty means the "ru,en" default.
+    pub sub_langs: String,
+    /// Follow playlists instead of refusing them.
+    pub playlist: bool,
+    /// Extra yt-dlp arguments, already split into argv tokens.
+    pub extra_ytdlp: Vec<String>,
+    /// Extra aria2c arguments, placed before the `--` terminator.
+    pub extra_aria2: Vec<String>,
+}
+
+/// Splits a user-supplied "extra arguments" string into argv tokens: quotes
+/// group, whitespace separates, nothing is expanded. The tokens go straight
+/// to `Command::args` (no shell), so only what the user typed can run.
+pub fn split_cli_args(s: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut token = false;
+    for c in s.chars() {
+        if c == '\0' {
+            return Err("дополнительные аргументы содержат NUL".into());
+        }
+        match c {
+            '"' | '\'' => { quoted = !quoted; token = true; }
+            c if c.is_whitespace() && !quoted => {
+                if token || !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                    token = false;
+                }
+            }
+            c => { cur.push(c); token = true; }
+        }
+    }
+    if quoted {
+        return Err("незакрытая кавычка в дополнительных аргументах".into());
+    }
+    if token || !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
 }
 
 /// Absolute output directory without touching the filesystem (build() also
@@ -621,20 +681,40 @@ fn absolute_out_dir(out_dir: &Path) -> PathBuf {
     }
 }
 
-/// File name aria2 would derive from a URL path. No percent-decoding: aria2
-/// keeps sequences like %2F literal (its own traversal probe saved
-/// `..%2F..%2Fpwned.bin`), so the raw basename is what to compare against.
+/// File name aria2 saves a direct URL's payload under. aria2 takes the RAW
+/// last path segment and percent-decodes it (`My%20File.zip` lands as
+/// `My File.zip`, one pass only: `%2520` stays `%20`), but re-encodes the
+/// characters it must not put on disk: separators always (`%2f`/`%2F` both
+/// come back as `%2F`; its traversal probe saved `..%2F..%2Fpwned.bin`) and
+/// the Windows-illegal set (`%3A` stays `%3A`). Reproduce that order so the
+/// lock/origin records name the file aria2 actually writes; `build()` also
+/// pins the result with `-o` for direct downloads, so a server-supplied
+/// Content-Disposition name cannot make the file on disk differ either.
 fn url_basename(url: &str) -> String {
-    path_from_url(url)
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .trim()
-        .to_string()
+    let raw = path_from_url(url);
+    let raw = raw.rsplit(['/', '\\']).next().unwrap_or("").trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    let mut name = String::with_capacity(raw.len());
+    for c in percent_decode(raw).chars() {
+        match c {
+            '/' => name.push_str("%2F"),
+            '\\' => name.push_str("%5C"),
+            _ if (cfg!(windows) && "<>:\"|?*".contains(c)) || c.is_control() => {
+                name.push_str(&format!("%{:02X}", c as u32));
+            }
+            _ => name.push(c),
+        }
+    }
+    if name == "." || name == ".." {
+        return String::new();
+    }
+    name
 }
 
-/// Lock and ownership records live outside Downloads, shared by CLI/GUI and
-/// both editions of SNATCH. A bare .aria2 file does NOT establish that its
+/// Lock and ownership records live outside Downloads, shared by the CLI and
+/// the GUI. A bare .aria2 file does NOT establish that its
 /// source URL matches this job; aria2 -c can overwrite an unrelated partial.
 fn aria2_state_dir() -> Result<PathBuf, String> {
     config_dir().map(|p| p.join("aria2-locks"))
@@ -774,6 +854,10 @@ fn aria2_flags(owned_partial: bool) -> Vec<&'static str> {
 }
 
 pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
+    build_with(job, tc, &RunExtras::default())
+}
+
+pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<OsString>, String> {
     // Нативные движки не строят внешнюю команду; без этого guard'а они молча
     // ушли бы по yt-dlp-ветке (else ниже) и получили бы чужие флаги.
     if job.engine != "yt-dlp" && job.engine != "aria2" {
@@ -807,6 +891,18 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
         cmd.push("--no-conf".into());
         cmd.push("-d".into());
         cmd.push(out.clone().into_os_string());
+        // aria2 picks the saved name itself: the percent-decoded URL
+        // basename, or even the server's Content-Disposition. Pin it with -o
+        // so the name the lock/origin records were computed for is exactly
+        // the file aria2 writes - otherwise a foreign same-name pair slips
+        // past aria2_foreign_pair and aria2 continues a stranger's bytes.
+        if !is_bittorrent_input(&job.url) {
+            let name = url_basename(&job.url);
+            if !name.is_empty() {
+                cmd.push("-o".into());
+                cmd.push(name.into());
+            }
+        }
         // F1: a same-name file WITH a .aria2 control file is auto-continued by
         // aria2 even without -c, silently mixing two sources' bytes. Our own
         // partials carry an origin fingerprint; anything else must stop here.
@@ -831,6 +927,9 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
             cmd.push("--file-allocation=none".into());
             cmd.push("--auto-save-interval=1".into());
         }
+        for a in &extras.extra_aria2 {
+            cmd.push(a.clone().into());
+        }
         cmd.push("--".into());
         cmd.push(OsString::from(&job.url));
         return Ok(cmd);
@@ -840,7 +939,17 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
     cmd.push("--ignore-config".into());
     cmd.push("-P".into());
     cmd.push(out.clone().into_os_string());
-    cmd.push("--no-playlist".into());
+    cmd.push(OsString::from(if extras.playlist { "--yes-playlist" } else { "--no-playlist" }));
+    if extras.subs {
+        cmd.push("--write-subs".into());
+        cmd.push("--write-auto-subs".into());
+        cmd.push("--sub-langs".into());
+        let langs = if extras.sub_langs.trim().is_empty() { "ru,en" } else { extras.sub_langs.trim() };
+        cmd.push(langs.into());
+    }
+    for a in &extras.extra_ytdlp {
+        cmd.push(a.clone().into());
+    }
     if let Some(cb) = &job.cookies_browser {
         cmd.push("--cookies-from-browser".into());
         cmd.push(cb.into());
@@ -884,7 +993,16 @@ pub fn build(job: &Job, tc: &Toolchain) -> Result<Vec<OsString>, String> {
 ///
 /// [`Choice`]: crate::torrent::Choice
 pub fn build_for_run(job: &Job, tc: &Toolchain, choice: &crate::torrent::Choice) -> Result<Vec<OsString>, String> {
-    let mut cmd = build(job, tc)?;
+    build_for_run_with(job, tc, choice, &RunExtras::default())
+}
+
+pub fn build_for_run_with(
+    job: &Job,
+    tc: &Toolchain,
+    choice: &crate::torrent::Choice,
+    extras: &RunExtras,
+) -> Result<Vec<OsString>, String> {
+    let mut cmd = build_with(job, tc, extras)?;
     if job.engine != "aria2" || !is_bittorrent_input(&job.url) {
         return Ok(cmd);
     }
@@ -915,13 +1033,40 @@ pub fn build_for_run(job: &Job, tc: &Toolchain, choice: &crate::torrent::Choice)
 }
 
 pub fn preflight_warning(job: &Job) -> Vec<String> {
-    // ffmpeg presence does not change mid-process; probe PATH once per run.
+    // Helper presence does not change mid-process; probe once per run.
     static HAS_FFMPEG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let has_ffmpeg = *HAS_FFMPEG.get_or_init(|| which("ffmpeg").is_some());
-    preflight_warning_with_ffmpeg(job, job.engine == "yt-dlp" && has_ffmpeg)
+    static HAS_JS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let has_ffmpeg = *HAS_FFMPEG.get_or_init(|| bootstrap_or_path_exists("ffmpeg"));
+    let has_js = *HAS_JS.get_or_init(|| bootstrap_or_path_exists("deno"));
+    preflight_warning_with_ffmpeg(job, job.engine == "yt-dlp" && has_ffmpeg, job.engine == "yt-dlp" && has_js)
 }
 
-fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool) -> Vec<String> {
+/// True when the tool is in the private bin dir (setup installs ffmpeg and
+/// Deno there next to yt-dlp) or on PATH - the two places yt-dlp itself
+/// looks for them. `prepend_bootstrap_path` puts the same dir on the child's
+/// PATH, so what is detected here is also what yt-dlp will find.
+fn bootstrap_or_path_exists(name: &str) -> bool {
+    let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    which(name).is_some() || crate::tools::bootstrap_dir().is_ok_and(|b| b.join(&file).is_file())
+}
+
+/// The private bin dir must be on the child's PATH: yt-dlp finds ffmpeg and
+/// the JS runtime (Deno) only through PATH, not next to its own exe.
+pub fn prepend_bootstrap_path(command: &mut std::process::Command) {
+    let Ok(bin) = crate::tools::bootstrap_dir() else { return };
+    if !bin.is_dir() {
+        return;
+    }
+    let mut paths = vec![bin];
+    if let Some(current) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&current));
+    }
+    if let Ok(joined) = std::env::join_paths(paths) {
+        command.env("PATH", joined);
+    }
+}
+
+fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool, has_js: bool) -> Vec<String> {
     let mut warns = Vec::new();
     if job.engine != "yt-dlp" {
         if job.cookies_browser.is_some() {
@@ -933,13 +1078,22 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool) -> Vec<String> {
         if job.fmt != "best" {
             warns.push("Формат применим только к yt-dlp — для aria2 он проигнорирован.".to_string());
         }
-    } else if !has_ffmpeg {
-        if job.fmt == "audio" {
-            warns.push("Не найден ffmpeg — извлечение mp3 может не сработать.".to_string());
-        } else {
+    } else {
+        if !has_ffmpeg {
+            if job.fmt == "audio" {
+                warns.push("Не найден ffmpeg — извлечение mp3 может не сработать.".to_string());
+            } else {
+                warns.push(
+                    "Не найден ffmpeg — склейка видео и аудио недоступна, yt-dlp выберет \
+                      однодорожный формат (качество может быть ниже)."
+                        .to_string(),
+                );
+            }
+        }
+        if !has_js {
             warns.push(
-                "Не найден ffmpeg — склейка видео и аудио недоступна, yt-dlp выберет \
-                  однодорожный формат (качество может быть ниже)."
+                "Не найден JS-рантайм (Deno) — на YouTube часть форматов может быть \
+                  недоступна. Установите загрузчики кнопкой в GUI или `snatch --install-tools`."
                     .to_string(),
             );
         }
@@ -1202,7 +1356,7 @@ mod tests {
         for path in [r"\\127.0.0.1\snatch-test", r"\??\UNC\127.0.0.1\snatch-test"] {
             let job = Job { engine: "aria2".into(), url: "https://example.test/video.mp4".into(),
                 out_dir: path.into(), fmt: "best".into(), cookies_browser: None };
-            let warnings = preflight_warning_with_ffmpeg(&job, true);
+            let warnings = preflight_warning_with_ffmpeg(&job, true, true);
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains("UNC"));
         }
@@ -1291,6 +1445,63 @@ mod tests {
         assert!(s.contains(&"--auto-file-renaming=true".to_string()), "{s:?}");
         assert!(!preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
         std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn percent_encoded_names_are_decoded_like_aria2() {
+        // aria2 decodes the raw last segment once (`%20` -> space) but
+        // re-encodes separators (uppercase) and, on Windows, illegal chars.
+        assert_eq!(url_basename("https://h/b/My%20File.zip"), "My File.zip");
+        assert_eq!(url_basename("https://h/b/a%2fb.bin"), "a%2Fb.bin");
+        assert_eq!(url_basename("https://h/b/d%2520.bin"), "d%20.bin");
+        assert_eq!(url_basename("https://h/b/..%2F..%2Fpwned.bin"), "..%2F..%2Fpwned.bin");
+        assert_eq!(url_basename("https://h/b/"), "");
+        assert_eq!(url_basename("https://h/b/%2E%2E"), "");
+        #[cfg(windows)]
+        assert_eq!(url_basename("https://h/b/cv%3Aads.bin"), "cv%3Aads.bin");
+    }
+
+    #[test]
+    fn a_foreign_pair_under_an_encoded_name_is_caught_and_the_name_is_pinned() {
+        let out = tmp_out();
+        std::fs::create_dir_all(&out).unwrap();
+        let url = "https://h/b/My%20File.zip";
+        let name = "My File.zip";
+        std::fs::write(out.join(name), b"foreign").unwrap();
+        std::fs::write(out.join(format!("{name}.aria2")), b"ctl").unwrap();
+        assert_eq!(aria2_foreign_pair(url, &out).as_deref(), Some(name));
+        let job = Job {
+            engine: "aria2".into(), url: url.into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+        };
+        assert!(build(&job, &tc_aria2()).is_err());
+        assert!(preflight_warning(&job).iter().any(|w| w.contains("будет остановлена")));
+        std::fs::remove_file(out.join(format!("{name}.aria2"))).unwrap();
+
+        // Without the pair the download may start, but -o must pin the
+        // decoded name so lock/origin records and the file on disk agree.
+        let s = args_of(&build(&job, &tc_aria2()).unwrap());
+        let i = s.iter().position(|a| a == "-o").expect("-o missing");
+        assert_eq!(s[i + 1], name);
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn an_encoded_url_resumes_only_its_own_decoded_partial() {
+        let out = tmp_out();
+        let state = std::env::temp_dir().join(format!("snatch-owned-enc-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let url = "https://h/b/My%20File.zip";
+        let name = url_basename(url);
+        std::fs::write(out.join(&name), b"part").unwrap();
+        std::fs::write(out.join(format!("{name}.aria2")), b"ctl").unwrap();
+        assert!(!aria2_owned_partial_in(url, &out, &state));
+        std::fs::write(aria2_origin_path(&out, &name, &state), aria2_url_hash(url)).unwrap();
+        assert!(aria2_owned_partial_in(url, &out, &state));
+        assert!(!aria2_owned_partial_in("https://h/b/Other%20File.zip", &out, &state));
+        std::fs::remove_dir_all(&out).ok();
+        std::fs::remove_dir_all(&state).ok();
     }
 
     #[test]
@@ -1496,12 +1707,67 @@ mod tests {
     }
 
     #[test]
-    fn native_engine_is_not_dispatched_to_ytdlp() {
+    fn unknown_engine_is_not_dispatched_to_ytdlp() {
         let out = tmp_out();
-        let job = Job { engine: "native".into(), url: "https://example.test/x".into(),
+        let job = Job { engine: "unknown".into(), url: "https://example.test/x".into(),
             out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
         assert!(build(&job, &tc_ytdlp()).is_err());
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn formats_cover_caps_and_source_audio() {
+        let keys: Vec<&str> = FORMATS.iter().map(|(k, _)| *k).collect();
+        for k in ["best", "2160p", "1440p", "1080p", "720p", "480p", "audio", "audio-src"] {
+            assert!(keys.contains(&k), "{k}");
+        }
+        assert!(format_flags("720p").contains(&"bv*[height<=720]+ba/b[height<=720]"));
+        assert_eq!(format_flags("audio-src"), vec!["-f", "ba/b"]);
+        assert!(format_flags("audio").contains(&"mp3"));
+    }
+
+    #[test]
+    fn extra_args_split_like_a_simple_shell() {
+        assert_eq!(split_cli_args("--limit-rate 1M --retry-wait=2").unwrap(),
+                   vec!["--limit-rate", "1M", "--retry-wait=2"]);
+        assert_eq!(split_cli_args("--paths \"D:\\My Video\" ''").unwrap(),
+                   vec!["--paths", "D:\\My Video", ""]);
+        assert_eq!(split_cli_args("").unwrap(), Vec::<String>::new());
+        assert!(split_cli_args("\"unclosed").is_err());
+    }
+
+    #[test]
+    fn build_applies_run_extras() {
+        let out = tmp_out();
+        let job = Job { engine: "yt-dlp".into(), url: "https://youtu.be/x".into(),
+            out_dir: out.clone(), fmt: "720p".into(), cookies_browser: None };
+        let extras = RunExtras {
+            subs: true, sub_langs: "ru,en".into(), playlist: true,
+            extra_ytdlp: vec!["--limit-rate".into(), "5M".into()], extra_aria2: vec![],
+        };
+        let s = args_of(&build_with(&job, &tc_ytdlp(), &extras).unwrap());
+        assert!(s.contains(&"--yes-playlist".to_string()), "{s:?}");
+        assert!(!s.contains(&"--no-playlist".to_string()));
+        assert!(s.contains(&"--write-subs".to_string()));
+        let i = s.iter().position(|a| a == "--sub-langs").unwrap();
+        assert_eq!(s[i + 1], "ru,en");
+        assert!(s.windows(2).any(|w| w == ["--limit-rate", "5M"]));
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn build_places_extra_aria2_args_before_the_terminator() {
+        let out = tmp_out();
+        let job = Job { engine: "aria2".into(), url: "https://h/f.bin".into(),
+            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        let extras = RunExtras {
+            extra_aria2: vec!["--max-connection-per-server=4".into()], ..RunExtras::default()
+        };
+        let s = args_of(&build_with(&job, &tc_aria2(), &extras).unwrap());
+        let at = s.iter().position(|a| a == "--max-connection-per-server=4").unwrap();
+        let term = s.iter().position(|a| a == "--").unwrap();
+        assert!(at < term, "{s:?}");
+        std::fs::remove_dir_all(&out).ok();
     }
 
     #[test]
@@ -1628,10 +1894,11 @@ mod tests {
             fmt: "best".into(),
             cookies_browser: None,
         };
-        assert!(preflight_warning_with_ffmpeg(&job, false).iter().any(|w| w.contains("склейка")));
-        assert!(preflight_warning_with_ffmpeg(&job, true).is_empty());
+        assert!(preflight_warning_with_ffmpeg(&job, false, true).iter().any(|w| w.contains("склейка")));
+        assert!(preflight_warning_with_ffmpeg(&job, true, true).is_empty());
+        assert!(preflight_warning_with_ffmpeg(&job, true, false).iter().any(|w| w.contains("Deno")));
         let audio = Job { fmt: "audio".into(), ..job };
-        assert!(preflight_warning_with_ffmpeg(&audio, false).iter().any(|w| w.contains("mp3")));
+        assert!(preflight_warning_with_ffmpeg(&audio, false, true).iter().any(|w| w.contains("mp3")));
     }
 
     #[test]
