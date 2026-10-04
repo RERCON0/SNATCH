@@ -3027,8 +3027,8 @@ impl eframe::App for SnatchApp {
     }
 }
 
-// icons/icon-256.png is pre-shrunk from the same artwork as icon-app.ico
-// with a center-crop + Lanczos3 resize. Decoding and resizing the source at
+// icons/icon-256.png is exported from the same artwork as icon-app.ico
+// with a Lanczos3 resize. Decoding and resizing the source at
 // every startup would slow launch and bloat the executable.
 // egui::IconData wants a square with a side that's a multiple of 4; 256x256
 // is its documented recommendation. The crop/resize branch stays as a
