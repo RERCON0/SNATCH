@@ -79,6 +79,9 @@ fn trusted_redirect(initial: &reqwest::Url, next: &reqwest::Url) -> bool {
             )
         ),
         Some("www.gyan.dev" | "gyan.dev") => {
+            // The official archive currently redirects to /builds/packages/
+            // on this same host. A future CDN migration requires reviewing
+            // its exact origin; do not permit arbitrary GitHub repositories.
             matches!(next.host_str(), Some("www.gyan.dev" | "gyan.dev"))
         }
         _ => false,
@@ -264,14 +267,69 @@ fn unsatisfiable_total(resp: &reqwest::blocking::Response) -> Option<u64> {
         .ok()
 }
 
-/// Live installer progress for frontends without a terminal: which asset is
-/// being fetched and how many bytes are already on disk. `total` is `None`
-/// while the size is not known yet (release lookup, chunked body).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetupStage {
+    Preparing,
+    Downloading,
+    Verifying,
+    Extracting,
+    Installing,
+}
+
+impl SetupStage {
+    pub fn text(self) -> &'static str {
+        match self {
+            Self::Preparing => "подготовка…",
+            Self::Downloading => "скачивание…",
+            Self::Verifying => "проверяю контрольную сумму…",
+            Self::Extracting => "распаковываю…",
+            Self::Installing => "устанавливаю…",
+        }
+    }
+}
+
+/// Byte counts describe downloads only. Processing stages have no percentage:
+/// downloading 100% is not the same as completing checksum/extraction/install.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SetupProgress {
     pub label: String,
     pub done: u64,
     pub total: Option<u64>,
+    pub stage: SetupStage,
+}
+
+struct ProcessingProgress {
+    label: String,
+    bar: ProgressBar,
+}
+
+impl ProcessingProgress {
+    fn new(label: &str, report: &mut dyn FnMut(SetupProgress)) -> Self {
+        let progress = Self {
+            label: label.to_owned(),
+            bar: ProgressBar::new_spinner(),
+        };
+        progress.bar.enable_steady_tick(Duration::from_millis(100));
+        progress.set(SetupStage::Verifying, report);
+        progress
+    }
+
+    fn set(&self, stage: SetupStage, report: &mut dyn FnMut(SetupProgress)) {
+        self.bar
+            .set_message(format!("{}: {}", self.label, stage.text()));
+        report(SetupProgress {
+            label: self.label.clone(),
+            done: 0,
+            total: None,
+            stage,
+        });
+    }
+}
+
+impl Drop for ProcessingProgress {
+    fn drop(&mut self) {
+        self.bar.finish_and_clear();
+    }
 }
 
 fn download(
@@ -424,6 +482,7 @@ fn download_inner(
         label: label.to_string(),
         done: offset,
         total: known_total,
+        stage: SetupStage::Downloading,
     });
     let mut buf = [0u8; 65536];
     let mut written = offset;
@@ -450,6 +509,7 @@ fn download_inner(
                 label: label.to_string(),
                 done: written,
                 total: known_total,
+                stage: SetupStage::Downloading,
             });
         }
     }
@@ -458,6 +518,7 @@ fn download_inner(
         label: label.to_string(),
         done: written,
         total: known_total,
+        stage: SetupStage::Downloading,
     });
     Ok(())
 }
@@ -727,6 +788,7 @@ fn install_ffmpeg_inner(
         label: "ffmpeg".into(),
         done: 0,
         total: None,
+        stage: SetupStage::Preparing,
     });
     // Sidecar first: never fetch the huge zip just to learn it is not
     // verifiable. Same host, HTTPS.
@@ -755,6 +817,7 @@ fn install_ffmpeg_inner(
         MAX_FFMPEG_ZIP_BYTES,
         report,
     )?;
+    let processing = ProcessingProgress::new("ffmpeg", report);
     let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(&expected) {
         remove_part(&zip_path);
@@ -766,6 +829,7 @@ fn install_ffmpeg_inner(
     let dest = bin.join("ffmpeg.exe");
     let tmp = bin.join("ffmpeg.exe.part");
     let probe_tmp = bin.join("ffprobe.exe.part");
+    processing.set(SetupStage::Extracting, report);
     let extracted = (|| -> Result<(), String> {
         let file =
             File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
@@ -799,6 +863,7 @@ fn install_ffmpeg_inner(
                 copy_limited(tool, &mut entry, &mut out, MAX_FFMPEG_EXE_BYTES)?;
             }
         }
+        processing.set(SetupStage::Installing, report);
         publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить ffmpeg.exe: {e}"))?;
         if probe_tmp.is_file() {
             publish_tool(&probe_tmp, &bin.join("ffprobe.exe"))
@@ -855,6 +920,7 @@ fn install_deno_inner(
         label: "Deno".into(),
         done: 0,
         total: None,
+        stage: SetupStage::Preparing,
     });
     let release = release_json(&c, DENO_API)?;
     let (url, expected) = deno_asset(&release).map_err(DownloadFailure::permanent)?;
@@ -868,6 +934,7 @@ fn install_deno_inner(
         MAX_DENO_ZIP_BYTES,
         report,
     )?;
+    let processing = ProcessingProgress::new("Deno", report);
     let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(&expected) {
         remove_part(&zip_path);
@@ -878,6 +945,7 @@ fn install_deno_inner(
 
     let dest = bin.join("deno.exe");
     let tmp = bin.join("deno.exe.part");
+    processing.set(SetupStage::Extracting, report);
     let extracted = (|| -> Result<(), String> {
         let file =
             File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
@@ -900,6 +968,7 @@ fn install_deno_inner(
                 .map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
             copy_limited("deno.exe", &mut entry, &mut out, MAX_DENO_EXE_BYTES)?;
         }
+        processing.set(SetupStage::Installing, report);
         publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить deno.exe: {e}"))
     })();
     remove_part(&zip_path);
@@ -1023,6 +1092,7 @@ fn install_yt_dlp_inner(
         label: "yt-dlp.exe".into(),
         done: 0,
         total: None,
+        stage: SetupStage::Preparing,
     });
     // Resolve the mutable latest alias once, then use one immutable release
     // for both assets. Publishing a new release between GETs cannot mix them.
@@ -1052,6 +1122,7 @@ fn install_yt_dlp_inner(
         MAX_YT_DLP_BYTES,
         report,
     )?;
+    let processing = ProcessingProgress::new("yt-dlp.exe", report);
     let got = sha512_hex(&tmp).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(expected) {
         remove_part(&tmp);
@@ -1064,6 +1135,7 @@ fn install_yt_dlp_inner(
     // exe while downloading. A failed direct replacement keeps the verified
     // part + validator; the next installation rechecks its checksum and tries
     // again once the running download has finished.
+    processing.set(SetupStage::Installing, report);
     std::fs::rename(&tmp, &dest).map_err(|e| DownloadFailure {
         kind: FailureKind::Deferred,
         message: format!("не удалось установить yt-dlp.exe (возможно, он занят загрузкой; повторите установку после её завершения): {e}"),
@@ -1113,6 +1185,7 @@ fn install_aria2_inner(
         label: "aria2c".into(),
         done: 0,
         total: None,
+        stage: SetupStage::Preparing,
     });
     let release = release_json(&c, ARIA2_API)?;
     let (url, expected_sha256) = aria2_asset(&release).map_err(DownloadFailure::permanent)?;
@@ -1126,6 +1199,7 @@ fn install_aria2_inner(
         MAX_ARIA2_ZIP_BYTES,
         report,
     )?;
+    let processing = ProcessingProgress::new("aria2c", report);
     let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(&expected_sha256) {
         // The archive is unusable and must not be resumed later.
@@ -1137,6 +1211,7 @@ fn install_aria2_inner(
 
     let dest = bin.join("aria2c.exe");
     let tmp = bin.join("aria2c.exe.part");
+    processing.set(SetupStage::Extracting, report);
     let extracted = (|| -> Result<(), String> {
         let file =
             File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
@@ -1164,6 +1239,7 @@ fn install_aria2_inner(
                 .map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
             copy_limited("aria2c.exe", &mut entry, &mut out, MAX_ARIA2C_BYTES)?;
         }
+        processing.set(SetupStage::Installing, report);
         publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))
     })();
     // The archive file handle must be dropped before Windows lets us delete
@@ -1176,6 +1252,28 @@ fn install_aria2_inner(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn processing_stages_reset_download_counts_and_report_in_order() {
+        let mut events = Vec::new();
+        let mut report = |progress| events.push(progress);
+        {
+            let progress = ProcessingProgress::new("ffmpeg", &mut report);
+            progress.set(SetupStage::Extracting, &mut report);
+            progress.set(SetupStage::Installing, &mut report);
+        }
+        assert_eq!(
+            events.iter().map(|p| p.stage).collect::<Vec<_>>(),
+            [
+                SetupStage::Verifying,
+                SetupStage::Extracting,
+                SetupStage::Installing
+            ]
+        );
+        assert!(events
+            .iter()
+            .all(|p| p.label == "ffmpeg" && p.done == 0 && p.total.is_none()));
+    }
+
     #[test]
     fn installer_redirects_stay_on_official_https_origins() {
         let github = reqwest::Url::parse(

@@ -5,13 +5,12 @@
 <h1 align="center">SNATCH</h1>
 
 <p align="center">
-  <strong>Видео, музыка, файлы и торренты — по одной ссылке.<br>yt-dlp + aria2c, нативное окно и удобный терминал.</strong>
+  <strong>Лёгкий загрузчик видео, музыки, файлов и торрентов.<br>yt-dlp + aria2c, нативное окно и удобный терминал.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/RERCON0/SNATCH/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/SNATCH/actions/workflows/ci.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/RERCON0/SNATCH/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/SNATCH/actions/workflows/security.yml/badge.svg?branch=main"></a>
-  <a href="https://github.com/RERCON0/SNATCH/actions/workflows/dependency-watch.yml"><img alt="Dependency watch" src="https://github.com/RERCON0/SNATCH/actions/workflows/dependency-watch.yml/badge.svg?branch=main"></a>
   <a href="https://github.com/RERCON0/SNATCH/releases/latest"><img alt="Последний релиз" src="https://img.shields.io/github/v/release/RERCON0/SNATCH?color=8b5cf6"></a>
   <a href="https://github.com/RERCON0/SNATCH/releases"><img alt="Загрузки" src="https://img.shields.io/github/downloads/RERCON0/SNATCH/total?color=0ea5e9"></a>
   <a href="LICENSE"><img alt="GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2f855a"></a>
@@ -31,6 +30,9 @@
 Вставьте ссылку, выберите качество и папку — SNATCH подберёт загрузчик,
 покажет прогресс и запомнит историю. Видео и стримы скачивает yt-dlp;
 прямые ссылки, torrent и magnet — aria2c.
+
+Лёгкость — одна из главных идей SNATCH: Rust, нативный интерфейс без Electron
+и портативный запуск. Загрузчики устанавливаются отдельно, когда нужны.
 
 > [!NOTE]
 > CLI `snatch` и GUI `snatch-app` используют один движок и общие настройки.
@@ -59,6 +61,14 @@
 Скачайте Windows x64 ZIP из [Releases](https://github.com/RERCON0/SNATCH/releases), распакуйте и запустите
 `snatch-app.exe` или `snatch.exe`. Устанавливать сам SNATCH не нужно;
 CLI можно добавить в `PATH`.
+
+> [!IMPORTANT]
+> EXE пока не имеют Authenticode-подписи, поэтому Windows SmartScreen может
+> показать «Система Windows защитила ваш компьютер». Если архив скачан из
+> [официального Releases](https://github.com/RERCON0/SNATCH/releases) и вы доверяете
+> этой сборке, нажмите **«Подробнее» → «Выполнить в любом случае»**.
+> Подпись Ed25519 подтверждает пакет, но не убирает это предупреждение Windows.
+> Если кнопка запуска недоступна, не меняйте политики защиты ради установки.
 
 > [!TIP]
 > Загрузчики можно поставить из GUI кнопкой установки/обновления

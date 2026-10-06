@@ -19,6 +19,7 @@ use snatch_rs::engines::{
 };
 use snatch_rs::setup::{
     install_aria2_with, install_deno_with, install_ffmpeg_with, install_yt_dlp_with, SetupProgress,
+    SetupStage,
 };
 use snatch_rs::tools::{bootstrap_dir, Toolchain};
 use snatch_rs::ui::{clip, try_read_dirs_limited};
@@ -88,7 +89,7 @@ enum Msg {
     Done(u64, i32),
     SetupLog(String),
     /// Live installer progress: asset label, bytes done, total if known.
-    SetupProgress(String, u64, Option<u64>),
+    SetupProgress(SetupProgress),
     /// (успех, обновлённая цепочка инструментов - discover делается в том же
     /// фоновом потоке, а не на UI-потоке)
     SetupDone(bool, Toolchain),
@@ -497,7 +498,7 @@ struct SnatchApp {
     /// must never replace the toolchain found by SetupDone.
     setup_started: bool,
     /// Last installer progress line (see `setup_progress_text`).
-    setup_progress: Option<(String, u64, Option<u64>)>,
+    setup_progress: Option<SetupProgress>,
     phase: Phase,
     /// Currently running downloads, most recently started last. Up to
     /// MAX_CONCURRENT at once, matching the CLI's `-j` default.
@@ -820,17 +821,23 @@ fn accent_button(accent: egui::Color32, text: impl Into<String>) -> egui::Button
 /// One line of installer feedback: asset, downloaded bytes and a percent
 /// when the server declared a size. The old static "скачиваю…" gave no idea
 /// whether to wait a minute or ten.
-fn setup_progress_text(p: Option<&(String, u64, Option<u64>)>) -> String {
-    match p {
-        Some((label, done, Some(total))) if *total > 0 => format!(
-            "{label}: {} из {} ({:.0}%)",
-            torrent::human_size(*done),
-            torrent::human_size(*total),
-            *done as f64 * 100.0 / *total as f64,
+fn setup_progress_text(p: Option<&SetupProgress>) -> String {
+    let Some(p) = p else {
+        return "скачиваю yt-dlp, aria2c, ffmpeg и Deno…".to_string();
+    };
+    if p.stage != SetupStage::Downloading {
+        return format!("{}: {}", p.label, p.stage.text());
+    }
+    match p.total {
+        Some(total) if total > 0 => format!(
+            "{}: {} из {} ({:.0}%)",
+            p.label,
+            torrent::human_size(p.done),
+            torrent::human_size(total),
+            p.done as f64 * 100.0 / total as f64,
         ),
-        Some((label, done, _)) if *done > 0 => format!("{label}: {}", torrent::human_size(*done)),
-        Some((label, _, _)) => format!("{label}: подготовка…"),
-        None => "скачиваю yt-dlp, aria2c, ffmpeg и Deno…".to_string(),
+        _ if p.done > 0 => format!("{}: {}", p.label, torrent::human_size(p.done)),
+        _ => format!("{}: {}", p.label, p.stage.text()),
     }
 }
 
@@ -1450,8 +1457,8 @@ impl SnatchApp {
                 Msg::TorrentLog(id, line) => self.push_job_log(id, line),
                 Msg::Done(id, code) => self.finish_job(id, code, ctx),
                 Msg::SetupLog(line) => self.push_log(line),
-                Msg::SetupProgress(label, done, total) => {
-                    self.setup_progress = Some((label, done, total));
+                Msg::SetupProgress(progress) => {
+                    self.setup_progress = Some(progress);
                 }
                 Msg::ToolsReady(tc) => {
                     apply_initial_discovery(&mut self.tc, self.setup_started, tc)
@@ -2178,7 +2185,7 @@ impl SnatchApp {
         std::thread::spawn(move || {
             let tx_prog = tx.clone();
             let mut report = move |p: SetupProgress| {
-                let _ = tx_prog.send(Msg::SetupProgress(p.label, p.done, p.total));
+                let _ = tx_prog.send(Msg::SetupProgress(p));
             };
             let bin = match bootstrap_dir() {
                 Ok(bin) => bin,
@@ -3713,15 +3720,39 @@ mod tests {
 
     #[test]
     fn setup_progress_text_shows_bytes_percent_and_a_fallback() {
-        let p = (
-            "ffmpeg".to_string(),
-            50 * 1024 * 1024,
-            Some(100 * 1024 * 1024),
-        );
+        let p = SetupProgress {
+            label: "ffmpeg".to_string(),
+            done: 50 * 1024 * 1024,
+            total: Some(100 * 1024 * 1024),
+            stage: SetupStage::Downloading,
+        };
         let t = setup_progress_text(Some(&p));
         assert!(t.contains("ffmpeg") && t.contains("50%"), "{t}");
-        let p = ("yt-dlp.exe".to_string(), 1024, None);
+        let p = SetupProgress {
+            label: "yt-dlp.exe".to_string(),
+            done: 1024,
+            total: None,
+            stage: SetupStage::Downloading,
+        };
         assert!(setup_progress_text(Some(&p)).contains("yt-dlp.exe"));
+        for stage in [
+            SetupStage::Verifying,
+            SetupStage::Extracting,
+            SetupStage::Installing,
+        ] {
+            let p = SetupProgress {
+                stage,
+                done: 100,
+                total: Some(100),
+                ..p.clone()
+            };
+            let text = setup_progress_text(Some(&p));
+            assert!(text.contains(stage.text()), "{text}");
+            assert!(
+                !text.contains("100%"),
+                "processing still looks like a completed download: {text}"
+            );
+        }
         assert_eq!(
             setup_progress_text(None),
             "скачиваю yt-dlp, aria2c, ffmpeg и Deno…"
