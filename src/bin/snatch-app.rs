@@ -2470,6 +2470,7 @@ impl SnatchApp {
     fn ui_url_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         tag_label(ui, "ссылка");
         let mut toggle_hist = false;
+        #[cfg(windows)]
         let mut pick_torrent = false;
         ui.horizontal(|ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2514,8 +2515,6 @@ impl SnatchApp {
                 self.set_torrent_file(&path);
             }
         }
-        #[cfg(not(windows))]
-        let _ = pick_torrent;
         if toggle_hist {
             self.show_url_history = !self.show_url_history;
         }
@@ -3384,6 +3383,10 @@ impl eframe::App for SnatchApp {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show_terminal(ui, |ui| {
+            #[cfg(not(windows))]
+            if ui.button(if self.dark_mode { "Светлая тема" } else { "Тёмная тема" }).clicked() {
+                self.toggle_theme(ctx);
+            }
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
                 // Убираем только переносы: trim() съедает ведущий пробел

@@ -37,6 +37,9 @@ cargo audit --deny yanked --deny unsound
 python scripts/release.py keygen --private-key "$env:LOCALAPPDATA\MyFork\release-signing\fork-private.pem" --public-key .\release\fork-public.pem
 ```
 
+Перед сборкой своего форка замените доверенный `release/public-key.pem` новым
+публичным ключом и опубликуйте его отпечаток в документации форка.
+
 ## Сборка
 
 ```powershell
