@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use snatch_rs::scrollbar::ScrollAreaExt;
 
 use snatch_rs::config::{home_dir, Config};
 use snatch_rs::engines::{
@@ -402,7 +403,7 @@ fn torrent_tree_rows(
     egui::ScrollArea::vertical()
         .max_height(380.0)
         .auto_shrink([false, true])
-        .show_rows(ui, row_h, view.rows.len(), |ui, range| {
+        .show_terminal_rows(ui, row_h, view.rows.len(), |ui, range| {
             for row in &view.rows[range] {
                 let (expanded, selection) = torrent_tree_row(ui, tree, selected, row, row_h);
                 view.rows_dirty |= expanded;
@@ -2715,7 +2716,7 @@ impl SnatchApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
-                    .show(ui, |ui| {
+                    .show_terminal(ui, |ui| {
                         ui.label(
                             egui::RichText::new(self.log_cache.as_str())
                                 .monospace()
@@ -2855,7 +2856,7 @@ impl SnatchApp {
                 egui::ScrollArea::vertical()
                     .max_height(300.0)
                     .auto_shrink([false, false])
-                    .show(ui, |ui| {
+                    .show_terminal(ui, |ui| {
                         if let Some(parent) = cur.parent() {
                             if ui.selectable_label(false, "↑ Наверх").clicked() {
                                 navigate = Some(parent.to_path_buf());
@@ -3382,7 +3383,7 @@ impl eframe::App for SnatchApp {
                     egui::vec2(width, ui.available_height()),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show_terminal(ui, |ui| {
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
                 // Убираем только переносы: trim() съедает ведущий пробел

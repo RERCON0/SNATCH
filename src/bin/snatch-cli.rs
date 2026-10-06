@@ -1109,6 +1109,7 @@ fn ask_format() -> Option<String> {
 enum DirEntryChoice {
     Select(PathBuf),
     Up,
+    Drive(PathBuf),
     More(usize),
     Down(PathBuf),
 }
@@ -1126,6 +1127,7 @@ impl fmt::Display for DirEntryChoice {
                 )
             }
             DirEntryChoice::Up => write!(f, "↑ Наверх"),
+            DirEntryChoice::Drive(p) => write!(f, "💽 Диск {}", p.display()),
             // Honest wording: the list is alphabetical and the tail is never
             // rendered - "поднимитесь выше" could not reveal it.
             DirEntryChoice::More(n) => write!(
@@ -1156,7 +1158,15 @@ fn browse_dir(start: PathBuf) -> Option<String> {
     loop {
         let all_dirs = safe_read_dirs(&current);
         let shown = all_dirs.len().min(MAX_BROWSE_ENTRIES);
-        let mut choices = vec![DirEntryChoice::Select(current.clone()), DirEntryChoice::Up];
+        let mut choices = vec![DirEntryChoice::Select(current.clone())];
+        if current.parent().is_some() {
+            choices.push(DirEntryChoice::Up);
+        }
+        choices.extend(
+            snatch_rs::ui::drive_roots()
+                .into_iter()
+                .map(DirEntryChoice::Drive),
+        );
         choices.extend(all_dirs[..shown].iter().cloned().map(DirEntryChoice::Down));
         if all_dirs.len() > MAX_BROWSE_ENTRIES {
             choices.push(DirEntryChoice::More(all_dirs.len()));
@@ -1176,7 +1186,7 @@ fn browse_dir(start: PathBuf) -> Option<String> {
                 }
             }
             DirEntryChoice::More(_) => {}
-            DirEntryChoice::Down(p) => current = p,
+            DirEntryChoice::Down(p) | DirEntryChoice::Drive(p) => current = p,
         }
     }
 }

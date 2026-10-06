@@ -33,7 +33,7 @@ fn is_executable(p: &Path) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        return meta.permissions().mode() & 0o111 != 0;
+        meta.permissions().mode() & 0o111 != 0
     }
     #[cfg(not(unix))]
     true

@@ -307,12 +307,31 @@ def build(output: Path, private_key: Path) -> dict:
              "--target-dir", str(target)], capture=False, timeout=2400)
         built = target / TARGET / "release"
         payload = {name: (built / name).read_bytes() for name in ("snatch.exe", "snatch-app.exe")}
-        payload.update({"README.md": (ROOT / "README.md").read_bytes(),
+        payload.update({"README.md": release_readme(version, source["commit"]),
                         "LICENSE": (ROOT / "LICENSE").read_bytes(),
                         "FONT-LICENSE.txt": (ROOT / "fonts/OFL-notice.txt").read_bytes()})
         if source_state() != source:
             raise ValueError("Source checkout changed during compilation")
         return package(payload, source, toolchain, version, private_key, PUBLIC_KEY, output)
+
+
+def release_readme(version: str, commit: str) -> bytes:
+    base = "https://github.com/RERCON0/SNATCH/tree/" + commit
+    return (f"# SNATCH {version} — Windows x64\n\n"
+            "Запустите snatch-app.exe для GUI или snatch.exe в терминале.\n"
+            "Инструменты: кнопка установки/обновления в GUI или snatch --install-tools.\n"
+            "Папка инструментов: %LOCALAPPDATA%\\snatch\\bin.\n"
+            "В выборе папки CLI выберите нужный диск, затем папку; также доступен -o.\n\n"
+            'Пример: snatch "https://host/file.zip" -y -o "D:\\Downloads"\n\n'
+            "Перед запуском проверьте подпись из доверенного checkout:\n"
+            "python scripts/release.py verify <путь-к-этому-ZIP>\n"
+            "Не берите доверенный ключ только из самого проверяемого архива.\n\n"
+            f"Исходники и полная документация: {base}\n"
+            f"Проверка подписи: {base}/docs/RELEASING.md\n"
+            f"Справка CLI: {base}/docs/CLI.md\n"
+            "LICENSE: GNU GPL v3.0 or later; FONT-LICENSE.txt: Cascadia Mono / SIL OFL.\n"
+            "Подпись Ed25519 охватывает манифест и хеши всех файлов ZIP.\n"
+            "Authenticode-подпись EXE не заявляется.\n").encode("utf-8")
 
 
 def keygen(private: Path, public: Path) -> None:

@@ -2,6 +2,7 @@ pub mod config;
 pub mod engines;
 mod http;
 pub mod job_object;
+pub mod scrollbar;
 pub mod setup;
 pub mod tools;
 pub mod torrent;

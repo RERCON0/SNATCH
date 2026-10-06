@@ -1,5 +1,24 @@
 use std::path::{Path, PathBuf};
 
+/// OS drive mask only: never probe every root, including unavailable mappings.
+#[cfg(windows)]
+pub fn drive_roots() -> Vec<PathBuf> {
+    extern "system" {
+        fn GetLogicalDrives() -> u32;
+    }
+    // SAFETY: this Win32 query has no arguments or caller-owned pointers.
+    let mask = unsafe { GetLogicalDrives() };
+    (0..26u8)
+        .filter(|i| (mask >> i) & 1 == 1)
+        .map(|i| PathBuf::from(format!("{}:\\", (b'A' + i) as char)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn drive_roots() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// Invisible format characters that can disguise text: bidi embeddings,
 /// overrides and isolates (U+202E turns "Track \u{202E}3pm.exe" into what
 /// reads as "Track exe.mp3"), directional marks, zero-width space / word
