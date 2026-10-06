@@ -66,9 +66,15 @@ pub fn safe_read_dirs_limited(path: &Path, examine_limit: usize) -> (Vec<PathBuf
     try_read_dirs_limited(path, examine_limit).unwrap_or_default()
 }
 
-pub fn try_read_dirs_limited(path: &Path, examine_limit: usize) -> std::io::Result<(Vec<PathBuf>, bool)> {
+pub fn try_read_dirs_limited(
+    path: &Path,
+    examine_limit: usize,
+) -> std::io::Result<(Vec<PathBuf>, bool)> {
     if crate::engines::is_unc_path(path) {
-        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "Сетевая UNC-папка не поддерживается"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Сетевая UNC-папка не поддерживается",
+        ));
     }
     let mut truncated = false;
     let mut out: Vec<PathBuf> = Vec::new();
@@ -96,13 +102,19 @@ pub fn try_read_dirs_limited(path: &Path, examine_limit: usize) -> std::io::Resu
             if !ft.is_dir() {
                 continue;
             }
-            if !entry.metadata().map(|m| meta_hidden_or_system(&m)).unwrap_or(false) {
+            if !entry
+                .metadata()
+                .map(|m| meta_hidden_or_system(&m))
+                .unwrap_or(false)
+            {
                 out.push(entry.path());
             }
         }
     }
     out.sort_by_cached_key(|p| {
-        p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default()
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
     });
     Ok((out, truncated))
 }
@@ -124,15 +136,30 @@ mod tests {
         assert_eq!(clip("abcdef", 4), "abc…");
         assert_eq!(clip("abc", 10), "abc");
         assert_eq!(clip("  spaced  ", 20), "spaced");
-        assert_eq!(clip("name\x1b]0;fake title\x07.zip", 80), "name ]0;fake title .zip");
+        assert_eq!(
+            clip("name\x1b]0;fake title\x07.zip", 80),
+            "name ]0;fake title .zip"
+        );
     }
 
     #[test]
     fn clip_drops_invisible_bidi_and_format_characters() {
         // U+202E would display "Track \u{202E}3pm.exe" as "Track exe.mp3".
         assert_eq!(clip("Track \u{202E}3pm.exe", 80), "Track 3pm.exe");
-        for c in ['\u{200E}', '\u{200F}', '\u{2066}', '\u{2069}', '\u{FEFF}', '\u{00AD}', '\u{200B}',
-            '\u{034F}', '\u{206A}', '\u{FFF9}', '\u{1BCA0}', '\u{E0020}'] {
+        for c in [
+            '\u{200E}',
+            '\u{200F}',
+            '\u{2066}',
+            '\u{2069}',
+            '\u{FEFF}',
+            '\u{00AD}',
+            '\u{200B}',
+            '\u{034F}',
+            '\u{206A}',
+            '\u{FFF9}',
+            '\u{1BCA0}',
+            '\u{E0020}',
+        ] {
             assert_eq!(clip(&format!("a{c}b"), 80), "ab", "U+{:04X}", c as u32);
         }
         // ZWJ is part of emoji sequences and some scripts: kept.

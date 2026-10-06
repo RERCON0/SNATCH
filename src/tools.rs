@@ -157,7 +157,9 @@ pub fn find(name: &str) -> Option<PathBuf> {
     }
 
     if let Ok(managed) = bootstrap_path(name) {
-        if is_executable(&managed) { return Some(managed); }
+        if is_executable(&managed) {
+            return Some(managed);
+        }
         // A crashed swap can leave only the recovery copy.
         if cfg!(windows) && name == "aria2c" && is_executable(&managed.with_extension("exe.old")) {
             return Some(managed);
@@ -182,45 +184,65 @@ pub fn try_lock_for_spawn(program: &Path) -> Result<Option<std::fs::File>, Strin
     lock_for_spawn_within(program, std::time::Duration::ZERO)
 }
 
-fn lock_for_spawn_within(program: &Path, wait: std::time::Duration) -> Result<Option<std::fs::File>, String> {
+fn lock_for_spawn_within(
+    program: &Path,
+    wait: std::time::Duration,
+) -> Result<Option<std::fs::File>, String> {
     use fs4::FileExt;
-    let Some(parent) = program.parent() else { return Ok(None) };
+    let Some(parent) = program.parent() else {
+        return Ok(None);
+    };
     let tool = match program.file_name().and_then(|n| n.to_str()) {
         Some("aria2c.exe") => "aria2c",
         Some("yt-dlp.exe") => "yt-dlp",
         _ => return Ok(None),
     };
-    if crate::engines::is_unc_path(program) { return Err("Сетевой путь загрузчика не поддерживается".into()); }
+    if crate::engines::is_unc_path(program) {
+        return Err("Сетевой путь загрузчика не поддерживается".into());
+    }
     let path = parent.join(format!("{tool}.install.lock"));
     let managed = bootstrap_dir().is_ok_and(|dir| dir == parent);
-    let recovering = tool == "aria2c" && !program.exists() && program.with_extension("exe.old").is_file();
+    let recovering =
+        tool == "aria2c" && !program.exists() && program.with_extension("exe.old").is_file();
     // Managed spawns create/open the stable inode atomically, including the
     // first-install and manually removed lock cases. External tools need no
     // writable adjacent file unless an installer already owns that lock.
     let lock = match crate::config::open_lock_file(&path, managed || recovering) {
         Ok(lock) => lock,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !managed && !recovering => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !managed && !recovering => {
+            return Ok(None)
+        }
         Err(e) => return Err(format!("блокировка запуска {tool}: {e}")),
     };
     let deadline = std::time::Instant::now() + wait;
     loop {
         match FileExt::try_lock(&lock) {
             Ok(()) => break,
-            Err(fs4::TryLockError::WouldBlock) if std::time::Instant::now() < deadline =>
-                std::thread::sleep(std::time::Duration::from_millis(25)),
-            Err(e) => return Err(format!("{tool} устанавливается; повторите запуск после установки ({e})")),
+            Err(fs4::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "{tool} устанавливается; повторите запуск после установки ({e})"
+                ))
+            }
         }
     }
     if tool == "aria2c" && !program.exists() {
         let old = program.with_extension("exe.old");
-        if old.is_file() { std::fs::rename(old, program).map_err(|e| format!("восстановление aria2c: {e}"))?; }
+        if old.is_file() {
+            std::fs::rename(old, program).map_err(|e| format!("восстановление aria2c: {e}"))?;
+        }
     }
     Ok(Some(lock))
 }
 
 impl Toolchain {
     pub fn discover() -> Self {
-        Self { yt_dlp: find("yt-dlp"), aria2c: find("aria2c") }
+        Self {
+            yt_dlp: find("yt-dlp"),
+            aria2c: find("aria2c"),
+        }
     }
 
     // Shared by both binaries. The GUI has its own proactive "не найдены
@@ -229,9 +251,17 @@ impl Toolchain {
     // aria2c is missing and the user picks that engine) - so the message
     // can't presuppose a GUI button the terminal doesn't have.
     pub fn require(&self, name: &str) -> Result<PathBuf, String> {
-        let path = if name == "yt-dlp" { self.yt_dlp.clone() } else { self.aria2c.clone() };
+        let path = if name == "yt-dlp" {
+            self.yt_dlp.clone()
+        } else {
+            self.aria2c.clone()
+        };
         path.ok_or_else(|| {
-            let pkg = if name == "aria2c" { "aria2.aria2" } else { "yt-dlp.yt-dlp" };
+            let pkg = if name == "aria2c" {
+                "aria2.aria2"
+            } else {
+                "yt-dlp.yt-dlp"
+            };
             let env_hint = env_override(name)
                 .map(|e| format!(" или задайте путь через переменную окружения {e}"))
                 .unwrap_or_default();
@@ -276,7 +306,10 @@ mod tests {
 
     #[test]
     fn require_raises_when_missing() {
-        let tc = Toolchain { yt_dlp: None, aria2c: None };
+        let tc = Toolchain {
+            yt_dlp: None,
+            aria2c: None,
+        };
         let err = tc.require("yt-dlp").unwrap_err();
         assert!(err.contains("winget install"));
         assert!(err.contains("SNATCH_YT_DLP"));
@@ -284,8 +317,14 @@ mod tests {
 
     #[test]
     fn require_returns_path() {
-        let tc = Toolchain { yt_dlp: Some(PathBuf::from("/usr/bin/yt-dlp")), aria2c: None };
-        assert_eq!(tc.require("yt-dlp").unwrap(), PathBuf::from("/usr/bin/yt-dlp"));
+        let tc = Toolchain {
+            yt_dlp: Some(PathBuf::from("/usr/bin/yt-dlp")),
+            aria2c: None,
+        };
+        assert_eq!(
+            tc.require("yt-dlp").unwrap(),
+            PathBuf::from("/usr/bin/yt-dlp")
+        );
     }
 
     #[test]
@@ -298,40 +337,59 @@ mod tests {
         assert!(!is_executable(&exe));
         std::fs::remove_file(&exe).unwrap();
         std::fs::write(exe.with_extension("exe.old"), b"previous build").unwrap();
-        let lock = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(dir.join("aria2c.install.lock")).unwrap();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("aria2c.install.lock"))
+            .unwrap();
         FileExt::try_lock(&lock).unwrap();
-        assert!(try_lock_for_spawn(&exe).is_err(), "installer must exclude recovery and spawn");
+        assert!(
+            try_lock_for_spawn(&exe).is_err(),
+            "installer must exclude recovery and spawn"
+        );
         assert!(!exe.exists());
         drop(lock);
         let guard = try_lock_for_spawn(&exe).unwrap();
         assert_eq!(std::fs::read(exe).unwrap(), b"previous build");
-        drop(guard); std::fs::remove_dir_all(dir).ok();
+        drop(guard);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn missing_install_lock_does_not_skip_backup_recovery() {
-        let dir = std::env::temp_dir().join(format!("snatch-missing-install-lock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "snatch-missing-install-lock-{}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("aria2c.exe");
         std::fs::write(exe.with_extension("exe.old"), b"previous build").unwrap();
         let guard = try_lock_for_spawn(&exe).unwrap();
         assert!(dir.join("aria2c.install.lock").is_file());
         assert_eq!(std::fs::read(exe).unwrap(), b"previous build");
-        drop(guard); std::fs::remove_dir_all(dir).ok();
+        drop(guard);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[cfg(windows)]
     #[test]
     fn a_locked_recovery_copy_is_preserved_and_can_be_restored_on_retry() {
         use std::os::windows::fs::OpenOptionsExt;
-        let dir = std::env::temp_dir().join(format!("snatch-tool-locked-old-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("snatch-tool-locked-old-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("aria2c.exe");
         let old = exe.with_extension("exe.old");
         std::fs::write(&old, b"previous build").unwrap();
         std::fs::write(dir.join("aria2c.install.lock"), b"").unwrap();
         // Deny delete/rename while still permitting ordinary reads.
-        let reader = std::fs::OpenOptions::new().read(true).share_mode(1).open(&old).unwrap();
+        let reader = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(1)
+            .open(&old)
+            .unwrap();
         let error = try_lock_for_spawn(&exe).unwrap_err();
         assert!(error.contains("восстановление aria2c"), "{error}");
         assert_eq!(std::fs::read(&old).unwrap(), b"previous build");
@@ -358,7 +416,8 @@ mod tests {
     fn env_override_missing_file_falls_back_to_which() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _restore = EnvRestore::capture(&["PATH", "LOCALAPPDATA", "SNATCH_YT_DLP"]);
-        let dir = std::env::temp_dir().join(format!("snatch-rs-tools-fallback-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("snatch-rs-tools-fallback-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let real_exe = dir.join(exe_name("yt-dlp"));
         std::fs::write(&real_exe, b"executable fixture").unwrap();
@@ -385,8 +444,10 @@ mod tests {
     #[test]
     fn nothing_found_returns_none() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let _restore = EnvRestore::capture(&["PATH", "LOCALAPPDATA", "SNATCH_YT_DLP", "SNATCH_ARIA2C"]);
-        let dir = std::env::temp_dir().join(format!("snatch-rs-tools-empty-{}", std::process::id()));
+        let _restore =
+            EnvRestore::capture(&["PATH", "LOCALAPPDATA", "SNATCH_YT_DLP", "SNATCH_ARIA2C"]);
+        let dir =
+            std::env::temp_dir().join(format!("snatch-rs-tools-empty-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::remove_var("SNATCH_YT_DLP");
         std::env::remove_var("SNATCH_ARIA2C");

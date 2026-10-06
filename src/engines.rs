@@ -14,17 +14,21 @@ use crate::ui::clip;
 // --seed-time=0: without it aria2c finishes the download and then keeps
 // seeding until ratio 1.0 (its default) - the process never exits, the GUI
 // sits in "Running" at 100% forever and the CLI never returns the terminal.
-pub const ARIA2_RESUME: &[&str] =
-    &["-c", "--max-tries=10", "--retry-wait=2", "--auto-file-renaming=false", "--seed-time=0"];
+pub const ARIA2_RESUME: &[&str] = &[
+    "-c",
+    "--max-tries=10",
+    "--retry-wait=2",
+    "--auto-file-renaming=false",
+    "--seed-time=0",
+];
 pub const ARIA2_WORKERS: &[&str] = &["-x", "16", "-s", "16", "-k", "1M"];
 
 pub const FILE_EXT: &[&str] = &[
-    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst", ".lz4", ".iso",
-    ".exe", ".msi", ".msix", ".appx", ".apk", ".deb", ".rpm", ".dmg", ".pkg",
-    ".whl", ".jar", ".bin", ".img", ".pdf", ".epub", ".fb2", ".txt", ".csv",
-    ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".ts", ".m4v",
-    ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wav",
-    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".zst", ".lz4", ".iso", ".exe", ".msi",
+    ".msix", ".appx", ".apk", ".deb", ".rpm", ".dmg", ".pkg", ".whl", ".jar", ".bin", ".img",
+    ".pdf", ".epub", ".fb2", ".txt", ".csv", ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv",
+    ".ts", ".m4v", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".wav", ".jpg", ".jpeg", ".png",
+    ".webp", ".gif",
 ];
 
 pub const ALLOWED_SCHEMES: &[&str] = &["http", "https", "ftp"];
@@ -41,7 +45,9 @@ pub fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
     let needle = needle.as_bytes();
     !needle.is_empty()
         && needle.len() <= hay.len()
-        && hay.windows(needle.len()).any(|w| w.eq_ignore_ascii_case(needle))
+        && hay
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 pub fn aria2_missing_control(line: &str) -> bool {
@@ -56,7 +62,10 @@ pub const COOKIES_BROWSERS: &[&str] = &[
 ];
 
 pub const ENGINE_LABELS: [(&str, &str); 2] = [
-    ("yt-dlp", "yt-dlp — видео и стримы (YouTube и ещё тысячи сайтов)"),
+    (
+        "yt-dlp",
+        "yt-dlp — видео и стримы (YouTube и ещё тысячи сайтов)",
+    ),
     ("aria2", "aria2c — прямые ссылки, torrent, magnet"),
 ];
 
@@ -68,7 +77,10 @@ pub const FORMATS: [(&str, &str); 8] = [
     ("720p", "Видео до 720p"),
     ("480p", "Видео до 480p"),
     ("audio", "Аудио — mp3 (перекодирование)"),
-    ("audio-src", "Аудио — исходное (m4a/opus, без перекодирования)"),
+    (
+        "audio-src",
+        "Аудио — исходное (m4a/opus, без перекодирования)",
+    ),
 ];
 
 const AUTH_HINTS: &[&str] = &[
@@ -96,9 +108,12 @@ pub fn looks_like_auth(line: &str) -> bool {
     // Without this, a filename or URI merely containing e.g. "forbidden"
     // ("https://host/forbidden-songs.mp3" echoed in an unrelated failure)
     // flips the auth heuristic and the app nags about browser cookies.
-    let dominated = contains_ignore_ascii_case(line, "error")
-        || contains_ignore_ascii_case(line, "warning");
-    dominated && AUTH_HINTS.iter().any(|p| contains_ignore_ascii_case(line, p))
+    let dominated =
+        contains_ignore_ascii_case(line, "error") || contains_ignore_ascii_case(line, "warning");
+    dominated
+        && AUTH_HINTS
+            .iter()
+            .any(|p| contains_ignore_ascii_case(line, p))
 }
 
 /// aria2's progress summary starts the line; finding `[#` anywhere would
@@ -107,7 +122,8 @@ fn aria2_summary(line: &str) -> Option<&str> {
     let line = line.trim_start();
     let summary = &line[..=line.find(']')?];
     let (gid, rest) = summary.strip_prefix("[#")?.split_once(' ')?;
-    if gid.is_empty() || !gid.bytes().all(|b| b.is_ascii_hexdigit())
+    if gid.is_empty()
+        || !gid.bytes().all(|b| b.is_ascii_hexdigit())
         || !rest.split_whitespace().next()?.contains('/')
     {
         return None;
@@ -150,26 +166,42 @@ pub fn aria2_stat(line: &str) -> Option<String> {
     if let Some(start) = line.find("[FileAlloc:") {
         let alloc = line[start..].split(']').next()?.split_whitespace().nth(1)?;
         if !alloc.ends_with("(100%)") {
-            return Some(format!("{percent}% · {amount} · выделение места {}", alloc.replace('(', " (")));
+            return Some(format!(
+                "{percent}% · {amount} · выделение места {}",
+                alloc.replace('(', " (")
+            ));
         }
     }
     let field = |key: &str| {
-        summary.split_whitespace().find_map(|part| part.strip_prefix(key))
-            .unwrap_or("–").trim_end_matches(']')
+        summary
+            .split_whitespace()
+            .find_map(|part| part.strip_prefix(key))
+            .unwrap_or("–")
+            .trim_end_matches(']')
     };
     let dl = field("DL:");
     let peers = field("CN:");
     let seeds = field("SD:");
-    Some(format!("{percent}% · {amount} · ↓{dl}/с · сиды {seeds} · соединения {peers}"))
+    Some(format!(
+        "{percent}% · {amount} · ↓{dl}/с · сиды {seeds} · соединения {peers}"
+    ))
 }
 
 pub fn aria2_name_from_file(line: &str) -> Option<String> {
     let file = line.strip_prefix("FILE:")?.trim();
     let multi_file = file.ends_with("more)");
-    let path = if multi_file { file.rsplit_once(" (")?.0 } else { file };
+    let path = if multi_file {
+        file.rsplit_once(" (")?.0
+    } else {
+        file
+    };
     let mut parts = path.rsplit(['/', '\\']);
     let file = parts.next()?.trim();
-    let name = if multi_file { parts.next().unwrap_or(file) } else { file };
+    let name = if multi_file {
+        parts.next().unwrap_or(file)
+    } else {
+        file
+    };
     (!name.is_empty()).then(|| name.to_string())
 }
 
@@ -177,7 +209,10 @@ pub fn aria2_name_from_file(line: &str) -> Option<String> {
 /// real name only arrives once aria2 reads its metadata) - shared by the
 /// CLI's batch display and the GUI's per-job row/log-prefix label.
 pub fn batch_name(url: &str) -> String {
-    if let Some(hash) = url.split_once("btih:").map(|(_, s)| s.split('&').next().unwrap_or(s)) {
+    if let Some(hash) = url
+        .split_once("btih:")
+        .map(|(_, s)| s.split('&').next().unwrap_or(s))
+    {
         return format!("magnet {}", clip(hash, 12));
     }
     let path = url.split(['?', '#']).next().unwrap_or(url);
@@ -189,7 +224,10 @@ pub fn batch_name(url: &str) -> String {
     // yt-dlp's own "Destination:" line (see ytdlp_title_from_line).
     const GENERIC_SEGMENTS: &[&str] = &["watch", "embed", "player", "index.html", "index.php", ""];
     if GENERIC_SEGMENTS.contains(&segment) {
-        if let Some(query) = url.split_once('?').map(|(_, q)| q.split('#').next().unwrap_or(q)) {
+        if let Some(query) = url
+            .split_once('?')
+            .map(|(_, q)| q.split('#').next().unwrap_or(q))
+        {
             for pair in query.split('&') {
                 if let Some((key, val)) = pair.split_once('=') {
                     if (key == "v" || key == "id") && !val.is_empty() {
@@ -199,7 +237,11 @@ pub fn batch_name(url: &str) -> String {
             }
         }
     }
-    if segment.is_empty() { "загрузка".to_string() } else { segment.to_string() }
+    if segment.is_empty() {
+        "загрузка".to_string()
+    } else {
+        segment.to_string()
+    }
 }
 
 /// Pull the real media title out of a yt-dlp stdout line, once it announces
@@ -211,10 +253,9 @@ pub fn ytdlp_title_from_line(line: &str) -> Option<String> {
         rest
     } else if let Some(rest) = line.strip_prefix("[download] ") {
         rest.strip_suffix(" has already been downloaded")?
-    } else if let Some(rest) = line.strip_prefix("[Merger] Merging formats into \"") {
-        rest.strip_suffix('"')?
     } else {
-        return None;
+        let rest = line.strip_prefix("[Merger] Merging formats into \"")?;
+        rest.strip_suffix('"')?
     };
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
@@ -258,7 +299,9 @@ pub fn sanitize_child_output(text: &str) -> Cow<'_, str> {
             match chars.next() {
                 Some('[') => {
                     for ch in chars.by_ref() {
-                        if ('@'..='~').contains(&ch) { break; }
+                        if ('@'..='~').contains(&ch) {
+                            break;
+                        }
                     }
                 }
                 Some(']') => {
@@ -284,7 +327,9 @@ fn relay_stdout(mut reader: impl Read, mut writer: impl Write) -> std::io::Resul
     let mut line = Vec::new();
     loop {
         let n = reader.read(&mut chunk)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         for &b in &chunk[..n] {
             if b == b'\n' || b == b'\r' {
                 writer.write_all(sanitize_child_output(&decode_child_bytes(&line)).as_bytes())?;
@@ -323,11 +368,21 @@ fn cp1251_to_utf8(bytes: &[u8]) -> String {
             0xC0..=0xFF => char::from_u32(0x0410 + b as u32 - 0xC0).unwrap_or('\u{FFFD}'),
             // The rest of 0xA0-0xBF mostly matches Latin-1, but cp1251
             // differs on these bytes (e.g. 0xB3 is Ukrainian "і", not "³").
-            0xA1 => '\u{040E}', 0xA2 => '\u{045E}', 0xA3 => '\u{0408}',
-            0xA5 => '\u{0490}', 0xAA => '\u{0404}', 0xAF => '\u{0407}',
-            0xB2 => '\u{0406}', 0xB3 => '\u{0456}', 0xB4 => '\u{0491}',
-            0xB9 => '\u{2116}', 0xBA => '\u{0454}', 0xBC => '\u{0458}',
-            0xBD => '\u{0405}', 0xBE => '\u{0455}', 0xBF => '\u{0457}',
+            0xA1 => '\u{040E}',
+            0xA2 => '\u{045E}',
+            0xA3 => '\u{0408}',
+            0xA5 => '\u{0490}',
+            0xAA => '\u{0404}',
+            0xAF => '\u{0407}',
+            0xB2 => '\u{0406}',
+            0xB3 => '\u{0456}',
+            0xB4 => '\u{0491}',
+            0xB9 => '\u{2116}',
+            0xBA => '\u{0454}',
+            0xBC => '\u{0458}',
+            0xBD => '\u{0405}',
+            0xBE => '\u{0455}',
+            0xBF => '\u{0457}',
             _ => char::from(b),
         };
         out.push(c);
@@ -461,7 +516,9 @@ fn valid_xt_value(v: &str) -> bool {
         return false;
     }
     let rest = &v[4..];
-    let Some(i) = rest.find(':') else { return false };
+    let Some(i) = rest.find(':') else {
+        return false;
+    };
     let scheme = &rest[..i];
     if scheme.is_empty() || !scheme.chars().all(|c| c.is_ascii_alphanumeric()) {
         return false;
@@ -653,16 +710,28 @@ pub fn split_cli_args(s: &str) -> Result<Vec<String>, String> {
             return Err("дополнительные аргументы содержат NUL".into());
         }
         match quote {
-            Some(q) if c == q => { quote = None; token = true; }
-            Some(_) => { cur.push(c); token = true; }
-            None if c == '"' || c == '\'' => { quote = Some(c); token = true; }
+            Some(q) if c == q => {
+                quote = None;
+                token = true;
+            }
+            Some(_) => {
+                cur.push(c);
+                token = true;
+            }
+            None if c == '"' || c == '\'' => {
+                quote = Some(c);
+                token = true;
+            }
             None if c.is_whitespace() => {
                 if token || !cur.is_empty() {
                     out.push(std::mem::take(&mut cur));
                     token = false;
                 }
             }
-            None => { cur.push(c); token = true; }
+            None => {
+                cur.push(c);
+                token = true;
+            }
         }
     }
     if quote.is_some() {
@@ -681,14 +750,31 @@ pub fn split_cli_args(s: &str) -> Result<Vec<String>, String> {
 /// else is rejected, because the lock/origin records were computed for
 /// SNATCH's own pins (name, dir, `-c`, config, input files).
 const ARIA2_EXTRA_LONG: &[&str] = &[
-    "max-connection-per-server", "split", "min-split-size",
-    "max-download-limit", "max-overall-download-limit",
-    "max-upload-limit", "max-overall-upload-limit",
-    "max-tries", "retry-wait", "timeout", "connect-timeout",
-    "lowest-speed-limit", "max-file-not-found",
-    "all-proxy", "http-proxy", "https-proxy", "ftp-proxy", "no-proxy",
-    "all-proxy-user", "all-proxy-passwd", "http-user", "http-passwd",
-    "header", "user-agent", "referer",
+    "max-connection-per-server",
+    "split",
+    "min-split-size",
+    "max-download-limit",
+    "max-overall-download-limit",
+    "max-upload-limit",
+    "max-overall-upload-limit",
+    "max-tries",
+    "retry-wait",
+    "timeout",
+    "connect-timeout",
+    "lowest-speed-limit",
+    "max-file-not-found",
+    "all-proxy",
+    "http-proxy",
+    "https-proxy",
+    "ftp-proxy",
+    "no-proxy",
+    "all-proxy-user",
+    "all-proxy-passwd",
+    "http-user",
+    "http-passwd",
+    "header",
+    "user-agent",
+    "referer",
     "load-cookies",
 ];
 const ARIA2_EXTRA_SHORT: &[char] = &['x', 's', 'k', 'j', 'm', 't', 'u', 'U'];
@@ -709,7 +795,10 @@ fn aria2_extra_allowed(arg: &str) -> bool {
         return matches.next().is_some() && matches.next().is_none();
     }
     if let Some(rest) = arg.strip_prefix('-') {
-        return rest.chars().next().is_some_and(|c| ARIA2_EXTRA_SHORT.contains(&c));
+        return rest
+            .chars()
+            .next()
+            .is_some_and(|c| ARIA2_EXTRA_SHORT.contains(&c));
     }
     false
 }
@@ -810,11 +899,22 @@ pub(crate) fn ntfs_case_key(s: &str) -> String {
 fn aria2_target_key(out: &Path, name: &str) -> String {
     let canonical = std::fs::canonicalize(out).unwrap_or_else(|_| out.to_path_buf());
     let path = canonical.to_string_lossy();
-    let key = if cfg!(windows) { ntfs_case_key(&path) } else { path.into_owned() };
+    let key = if cfg!(windows) {
+        ntfs_case_key(&path)
+    } else {
+        path.into_owned()
+    };
     let mut hash = Sha256::new();
     hash.update(key.as_bytes());
     hash.update([0]);
-    hash.update(if cfg!(windows) { ntfs_case_key(name) } else { name.to_string() }.as_bytes());
+    hash.update(
+        if cfg!(windows) {
+            ntfs_case_key(name)
+        } else {
+            name.to_string()
+        }
+        .as_bytes(),
+    );
     format!("{:x}", hash.finalize())
 }
 
@@ -848,7 +948,9 @@ fn aria2_owned_partial(url: &str, out: &Path) -> bool {
 fn aria2_foreign_target(url: &str, out: &Path) -> bool {
     let name = url_basename(url);
     ALLOWED_SCHEMES.contains(&scheme_of(url).as_str())
-        && !name.is_empty() && out.join(name).exists() && !aria2_owned_partial(url, out)
+        && !name.is_empty()
+        && out.join(name).exists()
+        && !aria2_owned_partial(url, out)
 }
 
 /// F1 (audit 4): a foreign pair - same-name file plus a `.aria2` control file
@@ -867,7 +969,7 @@ fn aria2_foreign_pair(url: &str, out: &Path) -> Option<String> {
     (out.join(&name).is_file()
         && out.join(format!("{name}.aria2")).is_file()
         && !aria2_owned_partial(url, out))
-        .then_some(name)
+    .then_some(name)
 }
 
 /// Hold the OS lock from before build() until the child process exits. The
@@ -875,45 +977,64 @@ fn aria2_foreign_pair(url: &str, out: &Path) -> Option<String> {
 /// Stable lock files are never deleted, or another process could lock a new
 /// inode while an earlier download still holds the old one.
 pub fn lock_aria2_target(job: &Job, wait: bool) -> Result<Option<std::fs::File>, String> {
-    if job.engine != "aria2" || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) { return Ok(None); }
+    if job.engine != "aria2" || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) {
+        return Ok(None);
+    }
     lock_aria2_target_in(job, wait, &aria2_state_dir()?)
 }
 
-fn lock_aria2_target_in(job: &Job, wait: bool, state_dir: &Path) -> Result<Option<std::fs::File>, String> {
+fn lock_aria2_target_in(
+    job: &Job,
+    wait: bool,
+    state_dir: &Path,
+) -> Result<Option<std::fs::File>, String> {
     if job.engine != "aria2" || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) {
         return Ok(None);
     }
     let name = url_basename(&job.url);
-    if name.is_empty() { return Ok(None); }
+    if name.is_empty() {
+        return Ok(None);
+    }
     let out = absolute_out_dir(&job.out_dir);
     if is_unc_path(&out) || is_unc_path(state_dir) {
         return Err("Сетевая UNC-папка не подходит для загрузки или блокировок aria2".into());
     }
     std::fs::create_dir_all(&out).map_err(|e| format!("папка загрузки aria2: {e}"))?;
-    if canonical_is_unc(&std::fs::canonicalize(&out).map_err(|e| format!("папка загрузки aria2: {e}"))?) {
+    if canonical_is_unc(
+        &std::fs::canonicalize(&out).map_err(|e| format!("папка загрузки aria2: {e}"))?,
+    ) {
         return Err("Папка загрузки aria2 ведёт на сетевой UNC-путь".into());
     }
     std::fs::create_dir_all(state_dir).map_err(|e| format!("папка блокировок aria2: {e}"))?;
     let key = aria2_target_key(&out, &name);
-    let lock = std::fs::OpenOptions::new().create(true).read(true).write(true)
-        .truncate(false).open(state_dir.join(format!("{key}.lock")))
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(state_dir.join(format!("{key}.lock")))
         .map_err(|e| format!("блокировка aria2: {e}"))?;
     if wait {
         FileExt::lock(&lock).map_err(|e| format!("блокировка aria2: {e}"))?;
     } else {
         match FileExt::try_lock(&lock) {
-            Ok(()) => {},
-            Err(TryLockError::WouldBlock) => return Err(format!(
-                "Файл «{name}» уже скачивается в эту папку — повторите после завершения"
-            )),
+            Ok(()) => {}
+            Err(TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "Файл «{name}» уже скачивается в эту папку — повторите после завершения"
+                ))
+            }
             Err(TryLockError::Error(e)) => return Err(format!("блокировка aria2: {e}")),
         }
     }
     // Claim only an empty slot. Never certify an existing file or .aria2 as
     // ours just because the URL currently points at the same basename.
     if !out.join(&name).exists() && !out.join(format!("{name}.aria2")).exists() {
-        std::fs::write(aria2_origin_path(&out, &name, state_dir), aria2_url_hash(&job.url))
-            .map_err(|e| format!("метка докачки aria2: {e}"))?;
+        std::fs::write(
+            aria2_origin_path(&out, &name, state_dir),
+            aria2_url_hash(&job.url),
+        )
+        .map_err(|e| format!("метка докачки aria2: {e}"))?;
     }
     Ok(Some(lock))
 }
@@ -926,7 +1047,8 @@ fn aria2_flags(owned_partial: bool) -> Vec<&'static str> {
         ARIA2_RESUME.to_vec()
     } else {
         ARIA2_RESUME
-            .iter().copied()
+            .iter()
+            .copied()
             .filter(|f| *f != "-c" && *f != "--auto-file-renaming=false")
             .chain(std::iter::once("--auto-file-renaming=true"))
             .collect()
@@ -1020,12 +1142,20 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
     cmd.push("--ignore-config".into());
     cmd.push("-P".into());
     cmd.push(out.clone().into_os_string());
-    cmd.push(OsString::from(if extras.playlist { "--yes-playlist" } else { "--no-playlist" }));
+    cmd.push(OsString::from(if extras.playlist {
+        "--yes-playlist"
+    } else {
+        "--no-playlist"
+    }));
     if extras.subs {
         cmd.push("--write-subs".into());
         cmd.push("--write-auto-subs".into());
         cmd.push("--sub-langs".into());
-        let langs = if extras.sub_langs.trim().is_empty() { "ru,en" } else { extras.sub_langs.trim() };
+        let langs = if extras.sub_langs.trim().is_empty() {
+            "ru,en"
+        } else {
+            extras.sub_langs.trim()
+        };
         cmd.push(langs.into());
     }
     for a in &extras.extra_ytdlp {
@@ -1055,8 +1185,12 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
             cmd.push(aria2c.as_os_str().to_os_string());
             cmd.push("--external-downloader-args".into());
             cmd.push(
-                format!("{} {} --no-conf", aria2_flags(false).join(" "), ARIA2_WORKERS.join(" "))
-                    .into(),
+                format!(
+                    "{} {} --no-conf",
+                    aria2_flags(false).join(" "),
+                    ARIA2_WORKERS.join(" ")
+                )
+                .into(),
             );
         }
     }
@@ -1073,7 +1207,11 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
 /// from the `--summary-interval` console output instead.)
 ///
 /// [`Choice`]: crate::torrent::Choice
-pub fn build_for_run(job: &Job, tc: &Toolchain, choice: &crate::torrent::Choice) -> Result<Vec<OsString>, String> {
+pub fn build_for_run(
+    job: &Job,
+    tc: &Toolchain,
+    choice: &crate::torrent::Choice,
+) -> Result<Vec<OsString>, String> {
     build_for_run_with(job, tc, choice, &RunExtras::default())
 }
 
@@ -1119,7 +1257,11 @@ pub fn preflight_warning(job: &Job) -> Vec<String> {
     static HAS_JS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let has_ffmpeg = *HAS_FFMPEG.get_or_init(|| bootstrap_or_path_exists("ffmpeg"));
     let has_js = *HAS_JS.get_or_init(|| bootstrap_or_path_exists("deno"));
-    preflight_warning_with_ffmpeg(job, job.engine == "yt-dlp" && has_ffmpeg, job.engine == "yt-dlp" && has_js)
+    preflight_warning_with_ffmpeg(
+        job,
+        job.engine == "yt-dlp" && has_ffmpeg,
+        job.engine == "yt-dlp" && has_js,
+    )
 }
 
 /// True when the tool is in the private bin dir (setup installs ffmpeg and
@@ -1127,14 +1269,20 @@ pub fn preflight_warning(job: &Job) -> Vec<String> {
 /// looks for them. `prepend_bootstrap_path` puts the same dir on the child's
 /// PATH, so what is detected here is also what yt-dlp will find.
 fn bootstrap_or_path_exists(name: &str) -> bool {
-    let file = if cfg!(windows) { format!("{name}.exe") } else { name.to_string() };
+    let file = if cfg!(windows) {
+        format!("{name}.exe")
+    } else {
+        name.to_string()
+    };
     which(name).is_some() || crate::tools::bootstrap_dir().is_ok_and(|b| b.join(&file).is_file())
 }
 
 /// The private bin dir must be on the child's PATH: yt-dlp finds ffmpeg and
 /// the JS runtime (Deno) only through PATH, not next to its own exe.
 pub fn prepend_bootstrap_path(command: &mut std::process::Command) {
-    let Ok(bin) = crate::tools::bootstrap_dir() else { return };
+    let Ok(bin) = crate::tools::bootstrap_dir() else {
+        return;
+    };
     if !bin.is_dir() {
         return;
     }
@@ -1157,7 +1305,8 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool, has_js: bool) -> V
             );
         }
         if job.fmt != "best" {
-            warns.push("Формат применим только к yt-dlp — для aria2 он проигнорирован.".to_string());
+            warns
+                .push("Формат применим только к yt-dlp — для aria2 он проигнорирован.".to_string());
         }
     } else {
         if !has_ffmpeg {
@@ -1206,11 +1355,20 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool, has_js: bool) -> V
 
 pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
     let Some(program) = cmd.first() else {
-        return RunResult { code: 127, auth_hint: false };
+        return RunResult {
+            code: 127,
+            auth_hint: false,
+        };
     };
     let install_guard = match crate::tools::lock_for_spawn(Path::new(program)) {
         Ok(guard) => guard,
-        Err(e) => { crate::errln(e); return RunResult { code: 127, auth_hint: false }; }
+        Err(e) => {
+            crate::errln(e);
+            return RunResult {
+                code: 127,
+                auth_hint: false,
+            };
+        }
     };
     let mut command = Command::new(program);
     command
@@ -1226,7 +1384,10 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
         Ok(result) => result,
         Err(e) => {
             crate::errln(format!("✘ Защита дерева загрузчика: {e}"));
-            return RunResult { code: 127, auth_hint: false };
+            return RunResult {
+                code: 127,
+                auth_hint: false,
+            };
         }
     };
     drop(install_guard);
@@ -1262,14 +1423,19 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
         Ok(status) => status.code().unwrap_or(130),
         Err(_) => 127,
     };
-    if let Some(job) = &proc_job { job.terminate(); }
+    if let Some(job) = &proc_job {
+        job.terminate();
+    }
     match stdout_thread.join() {
-        Ok(Ok(())) => {},
+        Ok(Ok(())) => {}
         Ok(Err(e)) => crate::errln(format!("⚠ Не удалось передать вывод загрузчика: {e}")),
         Err(_) => crate::errln("⚠ Поток stdout загрузчика завершился с паникой"),
     }
     let auth_hint = stderr_thread.join().unwrap_or_else(|_| {
-        crate::errln("⚠ Поток stderr загрузчика завершился с паникой; подсказка авторизации недоступна"); false
+        crate::errln(
+            "⚠ Поток stderr загрузчика завершился с паникой; подсказка авторизации недоступна",
+        );
+        false
     });
     RunResult { code, auth_hint }
 }
@@ -1294,11 +1460,17 @@ mod tests {
     }
 
     fn tc_ytdlp() -> Toolchain {
-        Toolchain { yt_dlp: Some(PathBuf::from("yt-dlp")), aria2c: None }
+        Toolchain {
+            yt_dlp: Some(PathBuf::from("yt-dlp")),
+            aria2c: None,
+        }
     }
 
     fn tc_aria2() -> Toolchain {
-        Toolchain { yt_dlp: None, aria2c: Some(PathBuf::from("aria2c")) }
+        Toolchain {
+            yt_dlp: None,
+            aria2c: Some(PathBuf::from("aria2c")),
+        }
     }
 
     const MAGNET_OK: &str = "magnet:?xt=urn:btih:73510898AF9039563184FAFE9CB0F186DE6AAA4";
@@ -1310,7 +1482,10 @@ mod tests {
             "https://example.com/v.mp4"
         );
         assert_eq!(validate_url(&format!("  {MAGNET_OK} ")).unwrap(), MAGNET_OK);
-        assert_eq!(validate_url("ftp://host/file.zip").unwrap(), "ftp://host/file.zip");
+        assert_eq!(
+            validate_url("ftp://host/file.zip").unwrap(),
+            "ftp://host/file.zip"
+        );
     }
 
     #[test]
@@ -1345,7 +1520,12 @@ mod tests {
 
     #[test]
     fn validate_rejects_unsupported_schemes() {
-        for bad in ["file:///etc/passwd", "ws://host/x", "sftp://host/x", "ftps://host/x"] {
+        for bad in [
+            "file:///etc/passwd",
+            "ws://host/x",
+            "sftp://host/x",
+            "ftps://host/x",
+        ] {
             assert!(validate_url(bad).is_err(), "{bad}");
         }
     }
@@ -1369,7 +1549,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("a.torrent");
         std::fs::write(&f, b"d4:infod0:e").unwrap();
-        assert_eq!(validate_url(f.to_str().unwrap()).unwrap(), f.to_str().unwrap());
+        assert_eq!(
+            validate_url(f.to_str().unwrap()).unwrap(),
+            f.to_str().unwrap()
+        );
         let missing = dir.join("missing.torrent");
         assert!(validate_url(missing.to_str().unwrap()).is_err());
         std::fs::remove_dir_all(&dir).ok();
@@ -1408,26 +1591,39 @@ mod tests {
             // changing the process-wide current working directory.
             let out = std::env::current_exe().unwrap();
             let out = out.parent().unwrap();
-            assert_eq!(aria2_target_key(out, "ΚΑΛΟΣ"), aria2_target_key(out, "καλοσ"));
+            assert_eq!(
+                aria2_target_key(out, "ΚΑΛΟΣ"),
+                aria2_target_key(out, "καλοσ")
+            );
         }
     }
 
     #[cfg(windows)]
     #[test]
     fn ntfs_sigma_aliases_share_a_key_for_the_same_actual_file() {
-        let dir = tmp_out(); std::fs::create_dir_all(&dir).unwrap();
+        let dir = tmp_out();
+        std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("ΚΑΛΟΣ.mp3"), b"same file").unwrap();
         for name in ["καλοσ.mp3", "ΚΑΛΟΣ.mp3"] {
             assert_eq!(std::fs::read(dir.join(name)).unwrap(), b"same file");
-            assert_eq!(aria2_target_key(&dir, name), aria2_target_key(&dir, "ΚΑΛΟΣ.mp3"));
+            assert_eq!(
+                aria2_target_key(&dir, name),
+                aria2_target_key(&dir, "ΚΑΛΟΣ.mp3")
+            );
         }
         if dir.join("καλος.mp3").exists() {
-            assert_eq!(aria2_target_key(&dir, "καλος.mp3"), aria2_target_key(&dir, "ΚΑΛΟΣ.mp3"));
+            assert_eq!(
+                aria2_target_key(&dir, "καλος.mp3"),
+                aria2_target_key(&dir, "ΚΑΛΟΣ.mp3")
+            );
         } else {
             // This volume distinguishes final sigma. Do not merge two
             // different files' .origin records merely by linguistic folding.
             std::fs::write(dir.join("καλος.mp3"), b"different file").unwrap();
-            assert_ne!(aria2_target_key(&dir, "καλος.mp3"), aria2_target_key(&dir, "ΚΑΛΟΣ.mp3"));
+            assert_ne!(
+                aria2_target_key(&dir, "καλος.mp3"),
+                aria2_target_key(&dir, "ΚΑΛΟΣ.mp3")
+            );
         }
         std::fs::remove_dir_all(dir).ok();
     }
@@ -1435,8 +1631,13 @@ mod tests {
     #[test]
     fn preflight_rejects_unc_before_collision_probes() {
         for path in [r"\\127.0.0.1\snatch-test", r"\??\UNC\127.0.0.1\snatch-test"] {
-            let job = Job { engine: "aria2".into(), url: "https://example.test/video.mp4".into(),
-                out_dir: path.into(), fmt: "best".into(), cookies_browser: None };
+            let job = Job {
+                engine: "aria2".into(),
+                url: "https://example.test/video.mp4".into(),
+                out_dir: path.into(),
+                fmt: "best".into(),
+                cookies_browser: None,
+            };
             let warnings = preflight_warning_with_ffmpeg(&job, true, true);
             assert_eq!(warnings.len(), 1);
             assert!(warnings[0].contains("UNC"));
@@ -1454,7 +1655,10 @@ mod tests {
         };
         let err = build(&job, &tc_ytdlp()).unwrap_err();
         assert!(err.contains("UNC"), "{err}");
-        let job = Job { out_dir: PathBuf::from("//evil.com/share"), ..job };
+        let job = Job {
+            out_dir: PathBuf::from("//evil.com/share"),
+            ..job
+        };
         let err = build(&job, &tc_ytdlp()).unwrap_err();
         assert!(err.contains("UNC"), "{err}");
     }
@@ -1464,11 +1668,16 @@ mod tests {
         // '#' is legal in local filenames; it must not truncate the suffix.
         assert_eq!(detect_engine("S01 #2.torrent"), "aria2");
         assert_eq!(detect_engine("movie.meta4"), "aria2");
-        assert_eq!(detect_engine(r"C:\Torrents\[DL] Cuphead #1.torrent"), "aria2");
+        assert_eq!(
+            detect_engine(r"C:\Torrents\[DL] Cuphead #1.torrent"),
+            "aria2"
+        );
     }
 
     fn args_of(cmd: &[OsString]) -> Vec<String> {
-        cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect()
+        cmd.iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
@@ -1482,15 +1691,22 @@ mod tests {
         let job = Job {
             engine: "aria2".into(),
             url: "https://host/file.bin".into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
         };
         let s = args_of(&build(&job, &tc_aria2()).unwrap());
         assert!(!s.contains(&"-c".to_string()), "{s:?}");
-        assert!(s.contains(&"--auto-file-renaming=true".to_string()), "{s:?}");
+        assert!(
+            s.contains(&"--auto-file-renaming=true".to_string()),
+            "{s:?}"
+        );
         assert!(s.contains(&"--max-tries=10".to_string()), "{s:?}");
         assert!(s.contains(&"--seed-time=0".to_string()), "{s:?}");
         assert_eq!(std::fs::read(out.join("file.bin")).unwrap(), b"old data");
-        assert!(preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+        assert!(preflight_warning(&job)
+            .iter()
+            .any(|w| w.contains("не будет перезаписан")));
 
         // A stray .aria2 is not proof of ownership: it could be another URL's.
         // aria2 auto-continues such a file+control pair EVEN WITHOUT -c
@@ -1499,14 +1715,22 @@ mod tests {
         std::fs::write(out.join("file.bin.aria2"), b"ctl").unwrap();
         let err = build(&job, &tc_aria2()).unwrap_err();
         assert!(err.contains("докачки"), "{err}");
-        assert!(preflight_warning(&job).iter().any(|w| w.contains("будет остановлена")));
-        let as_ytdlp = Job { engine: "yt-dlp".into(), ..job.clone() };
+        assert!(preflight_warning(&job)
+            .iter()
+            .any(|w| w.contains("будет остановлена")));
+        let as_ytdlp = Job {
+            engine: "yt-dlp".into(),
+            ..job.clone()
+        };
         assert!(build(&as_ytdlp, &tc_both()).is_err());
         std::fs::remove_file(out.join("file.bin.aria2")).unwrap();
 
         // yt-dlp's external-downloader branch gets the collision-safe args too.
         let s = args_of(&build(&as_ytdlp, &tc_both()).unwrap());
-        let i = s.iter().position(|a| a == "--external-downloader-args").unwrap();
+        let i = s
+            .iter()
+            .position(|a| a == "--external-downloader-args")
+            .unwrap();
         let args = &s[i + 1];
         assert!(args.contains("--auto-file-renaming=true"), "{args}");
         assert!(!args.contains("-c "), "{args}");
@@ -1519,12 +1743,19 @@ mod tests {
         let job = Job {
             engine: "aria2".into(),
             url: "https://host/fresh.bin".into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
         };
         let s = args_of(&build(&job, &tc_aria2()).unwrap());
         assert!(!s.contains(&"-c".to_string()), "{s:?}");
-        assert!(s.contains(&"--auto-file-renaming=true".to_string()), "{s:?}");
-        assert!(!preflight_warning(&job).iter().any(|w| w.contains("не будет перезаписан")));
+        assert!(
+            s.contains(&"--auto-file-renaming=true".to_string()),
+            "{s:?}"
+        );
+        assert!(!preflight_warning(&job)
+            .iter()
+            .any(|w| w.contains("не будет перезаписан")));
         std::fs::remove_dir_all(&out).ok();
     }
 
@@ -1535,7 +1766,10 @@ mod tests {
         assert_eq!(url_basename("https://h/b/My%20File.zip"), "My File.zip");
         assert_eq!(url_basename("https://h/b/a%2fb.bin"), "a%2Fb.bin");
         assert_eq!(url_basename("https://h/b/d%2520.bin"), "d%20.bin");
-        assert_eq!(url_basename("https://h/b/..%2F..%2Fpwned.bin"), "..%2F..%2Fpwned.bin");
+        assert_eq!(
+            url_basename("https://h/b/..%2F..%2Fpwned.bin"),
+            "..%2F..%2Fpwned.bin"
+        );
         assert_eq!(url_basename("https://h/b/"), "");
         assert_eq!(url_basename("https://h/b/%2E%2E"), "");
         #[cfg(windows)]
@@ -1552,11 +1786,16 @@ mod tests {
         std::fs::write(out.join(format!("{name}.aria2")), b"ctl").unwrap();
         assert_eq!(aria2_foreign_pair(url, &out).as_deref(), Some(name));
         let job = Job {
-            engine: "aria2".into(), url: url.into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+            engine: "aria2".into(),
+            url: url.into(),
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
         };
         assert!(build(&job, &tc_aria2()).is_err());
-        assert!(preflight_warning(&job).iter().any(|w| w.contains("будет остановлена")));
+        assert!(preflight_warning(&job)
+            .iter()
+            .any(|w| w.contains("будет остановлена")));
         std::fs::remove_file(out.join(format!("{name}.aria2"))).unwrap();
 
         // Without the pair the download may start, but -o must pin the
@@ -1580,7 +1819,11 @@ mod tests {
         assert!(!aria2_owned_partial_in(url, &out, &state));
         std::fs::write(aria2_origin_path(&out, &name, &state), aria2_url_hash(url)).unwrap();
         assert!(aria2_owned_partial_in(url, &out, &state));
-        assert!(!aria2_owned_partial_in("https://h/b/Other%20File.zip", &out, &state));
+        assert!(!aria2_owned_partial_in(
+            "https://h/b/Other%20File.zip",
+            &out,
+            &state
+        ));
         std::fs::remove_dir_all(&out).ok();
         std::fs::remove_dir_all(&state).ok();
     }
@@ -1589,23 +1832,38 @@ mod tests {
     fn aria2_lock_claims_only_an_empty_target_and_requires_the_same_source_to_resume() {
         let out = tmp_out();
         let state = out.join("state");
-        let job = Job { engine: "aria2".into(), url: "https://one.example/file.bin".into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        let job = Job {
+            engine: "aria2".into(),
+            url: "https://one.example/file.bin".into(),
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
         let lock = lock_aria2_target_in(&job, false, &state).unwrap().unwrap();
-        assert!(lock_aria2_target_in(&job, false, &state).is_err(), "concurrent jobs must not share a basename");
+        assert!(
+            lock_aria2_target_in(&job, false, &state).is_err(),
+            "concurrent jobs must not share a basename"
+        );
         std::fs::write(out.join("file.bin"), b"partial").unwrap();
         std::fs::write(out.join("file.bin.aria2"), b"control").unwrap();
         assert!(aria2_owned_partial_in(&job.url, &out, &state));
         assert!(aria2_flags(true).contains(&"-c"));
         drop(lock);
 
-        let other = Job { url: "https://other.example/file.bin".into(), ..job };
-        let lock = lock_aria2_target_in(&other, false, &state).unwrap().unwrap();
+        let other = Job {
+            url: "https://other.example/file.bin".into(),
+            ..job
+        };
+        let lock = lock_aria2_target_in(&other, false, &state)
+            .unwrap()
+            .unwrap();
         assert!(!aria2_owned_partial_in(&other.url, &out, &state));
         assert!(!aria2_flags(false).contains(&"-c"));
         drop(lock);
-        assert!(aria2_owned_partial_in("https://one.example/file.bin", &out, &state),
-            "a foreign URL must not re-claim the existing partial");
+        assert!(
+            aria2_owned_partial_in("https://one.example/file.bin", &out, &state),
+            "a foreign URL must not re-claim the existing partial"
+        );
         std::fs::remove_dir_all(&out).ok();
     }
 
@@ -1665,9 +1923,15 @@ mod tests {
             cookies_browser: None,
         };
         let cmd = build(&job, &tc_aria2()).unwrap();
-        let s: Vec<String> = cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cmd
+            .iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(s[1], "--no-conf");
-        assert_eq!(s[s.iter().position(|x| x == "-d").unwrap() + 1], out.to_string_lossy());
+        assert_eq!(
+            s[s.iter().position(|x| x == "-d").unwrap() + 1],
+            out.to_string_lossy()
+        );
         assert_eq!(s[s.len() - 2], "--");
         assert_eq!(s[s.len() - 1], "magnet:?xt=1");
         assert!(s.contains(&"--max-tries=10".to_string()));
@@ -1685,11 +1949,16 @@ mod tests {
         let job = Job {
             engine: "aria2".into(),
             url: r"C:\Torrents\[DL] Cuphead [RUS + ENG].torrent".into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None,
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
         };
         let bt = build(&job, &tc_aria2()).unwrap();
         assert!(bt.iter().any(|a| a == "--auto-save-interval=1"));
-        let direct = Job { url: "https://host/file.zip".into(), ..job };
+        let direct = Job {
+            url: "https://host/file.zip".into(),
+            ..job
+        };
         let http = build(&direct, &tc_aria2()).unwrap();
         assert!(!http.iter().any(|a| a == "--auto-save-interval=1"));
         assert!(!http.iter().any(|a| a == "--file-allocation=none"));
@@ -1707,7 +1976,10 @@ mod tests {
             cookies_browser: None,
         };
         let cmd = build(&job, &tc_both()).unwrap();
-        let s: Vec<String> = cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cmd
+            .iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
         assert!(s.contains(&"--ignore-config".to_string()));
         assert!(s.contains(&"--no-playlist".to_string()));
         assert!(!s.contains(&"--external-downloader".to_string()));
@@ -1726,7 +1998,10 @@ mod tests {
             cookies_browser: None,
         };
         let cmd = build(&job, &tc_both()).unwrap();
-        let s: Vec<String> = cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cmd
+            .iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
         let i = s.iter().position(|x| x == "--external-downloader").unwrap();
         assert_eq!(s[i + 1], "aria2c");
         assert!(s[i + 3].contains("--no-conf"));
@@ -1744,7 +2019,10 @@ mod tests {
             cookies_browser: None,
         };
         let cmd = build(&job, &tc_ytdlp()).unwrap();
-        let s: Vec<String> = cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cmd
+            .iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
         assert!(!s.contains(&"--external-downloader".to_string()));
         std::fs::remove_dir_all(&out).ok();
     }
@@ -1772,7 +2050,10 @@ mod tests {
         let result = build(&job, &tc_ytdlp());
         std::env::set_current_dir(&prev_cwd).unwrap();
         let cmd = result.unwrap();
-        let s: Vec<String> = cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cmd
+            .iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
         let value = &s[s.iter().position(|x| x == "-P").unwrap() + 1];
         assert!(!value.starts_with('-'), "{value:?}");
         assert!(Path::new(value).is_absolute(), "{value:?}");
@@ -1782,7 +2063,13 @@ mod tests {
     #[test]
     fn build_missing_tool() {
         let out = tmp_out();
-        let job = Job { engine: "yt-dlp".into(), url: "https://x".into(), out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        let job = Job {
+            engine: "yt-dlp".into(),
+            url: "https://x".into(),
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
         assert!(build(&job, &tc_aria2()).is_err());
         std::fs::remove_dir_all(&out).ok();
     }
@@ -1790,8 +2077,13 @@ mod tests {
     #[test]
     fn unknown_engine_is_not_dispatched_to_ytdlp() {
         let out = tmp_out();
-        let job = Job { engine: "unknown".into(), url: "https://example.test/x".into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        let job = Job {
+            engine: "unknown".into(),
+            url: "https://example.test/x".into(),
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
         assert!(build(&job, &tc_ytdlp()).is_err());
         assert!(!out.exists());
     }
@@ -1799,7 +2091,16 @@ mod tests {
     #[test]
     fn formats_cover_caps_and_source_audio() {
         let keys: Vec<&str> = FORMATS.iter().map(|(k, _)| *k).collect();
-        for k in ["best", "2160p", "1440p", "1080p", "720p", "480p", "audio", "audio-src"] {
+        for k in [
+            "best",
+            "2160p",
+            "1440p",
+            "1080p",
+            "720p",
+            "480p",
+            "audio",
+            "audio-src",
+        ] {
             assert!(keys.contains(&k), "{k}");
         }
         assert!(format_flags("720p").contains(&"bv*[height<=720]+ba/b[height<=720]"));
@@ -1809,10 +2110,14 @@ mod tests {
 
     #[test]
     fn extra_args_split_like_a_simple_shell() {
-        assert_eq!(split_cli_args("--limit-rate 1M --retry-wait=2").unwrap(),
-                   vec!["--limit-rate", "1M", "--retry-wait=2"]);
-        assert_eq!(split_cli_args("--paths \"D:\\My Video\" ''").unwrap(),
-                   vec!["--paths", "D:\\My Video", ""]);
+        assert_eq!(
+            split_cli_args("--limit-rate 1M --retry-wait=2").unwrap(),
+            vec!["--limit-rate", "1M", "--retry-wait=2"]
+        );
+        assert_eq!(
+            split_cli_args("--paths \"D:\\My Video\" ''").unwrap(),
+            vec!["--paths", "D:\\My Video", ""]
+        );
         assert_eq!(split_cli_args("").unwrap(), Vec::<String>::new());
         assert!(split_cli_args("\"unclosed").is_err());
     }
@@ -1820,11 +2125,19 @@ mod tests {
     #[test]
     fn build_applies_run_extras() {
         let out = tmp_out();
-        let job = Job { engine: "yt-dlp".into(), url: "https://youtu.be/x".into(),
-            out_dir: out.clone(), fmt: "720p".into(), cookies_browser: None };
+        let job = Job {
+            engine: "yt-dlp".into(),
+            url: "https://youtu.be/x".into(),
+            out_dir: out.clone(),
+            fmt: "720p".into(),
+            cookies_browser: None,
+        };
         let extras = RunExtras {
-            subs: true, sub_langs: "ru,en".into(), playlist: true,
-            extra_ytdlp: vec!["--limit-rate".into(), "5M".into()], extra_aria2: vec![],
+            subs: true,
+            sub_langs: "ru,en".into(),
+            playlist: true,
+            extra_ytdlp: vec!["--limit-rate".into(), "5M".into()],
+            extra_aria2: vec![],
         };
         let s = args_of(&build_with(&job, &tc_ytdlp(), &extras).unwrap());
         assert!(s.contains(&"--yes-playlist".to_string()), "{s:?}");
@@ -1838,24 +2151,47 @@ mod tests {
 
     #[test]
     fn quotes_do_not_leak_across_each_other() {
-        assert_eq!(split_cli_args("--paths \"D:\\Bob's Files\"").unwrap(),
-                   vec!["--paths", "D:\\Bob's Files"]);
-        assert_eq!(split_cli_args("'it \"quotes\" too'").unwrap(),
-                   vec!["it \"quotes\" too"]);
+        assert_eq!(
+            split_cli_args("--paths \"D:\\Bob's Files\"").unwrap(),
+            vec!["--paths", "D:\\Bob's Files"]
+        );
+        assert_eq!(
+            split_cli_args("'it \"quotes\" too'").unwrap(),
+            vec!["it \"quotes\" too"]
+        );
     }
 
     #[test]
     fn aria2_extras_are_whitelisted_not_blacklisted() {
         let out = tmp_out();
-        let job = Job { engine: "aria2".into(), url: "https://h/f.bin".into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        let job = Job {
+            engine: "aria2".into(),
+            url: "https://h/f.bin".into(),
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
         // aria2c resolves unambiguous prefixes, so abbreviations of
         // identity-changing flags must be refused alongside full names.
-        for bad in [vec!["-o"], vec!["-oX"], vec!["--out=evil.bin"], vec!["--ou=evil.bin"],
-                    vec!["-d/tmp"], vec!["-c"], vec!["--conti=true"], vec!["--allow-overw=true"],
-                    vec!["--conf-path=x"], vec!["-i"], vec!["--input-file=x"], vec!["-T"],
-                    vec!["-M"], vec!["-Z"], vec!["--max-o=1"], vec!["--save-cookies=x"],
-                    vec!["https://evil.example/x"]] {
+        for bad in [
+            vec!["-o"],
+            vec!["-oX"],
+            vec!["--out=evil.bin"],
+            vec!["--ou=evil.bin"],
+            vec!["-d/tmp"],
+            vec!["-c"],
+            vec!["--conti=true"],
+            vec!["--allow-overw=true"],
+            vec!["--conf-path=x"],
+            vec!["-i"],
+            vec!["--input-file=x"],
+            vec!["-T"],
+            vec!["-M"],
+            vec!["-Z"],
+            vec!["--max-o=1"],
+            vec!["--save-cookies=x"],
+            vec!["https://evil.example/x"],
+        ] {
             let extras = RunExtras {
                 extra_aria2: bad.iter().map(|s| s.to_string()).collect(),
                 ..RunExtras::default()
@@ -1863,10 +2199,18 @@ mod tests {
             assert!(build_with(&job, &tc_aria2(), &extras).is_err(), "{bad:?}");
         }
         // `=`/attached and space-separated values are both accepted.
-        for ok in [vec!["-x16"], vec!["-x", "16"], vec!["--max-tries=3"], vec!["--max-tries", "3"],
-                   vec!["--max-download-l=1M"], vec!["--user-agent=Foo"],
-                   vec!["--header", "A: b"], vec!["--referer=http://x"],
-                   vec!["--connect-timeout", "5"], vec!["--all-proxy=http://127.0.0.1:8080"]] {
+        for ok in [
+            vec!["-x16"],
+            vec!["-x", "16"],
+            vec!["--max-tries=3"],
+            vec!["--max-tries", "3"],
+            vec!["--max-download-l=1M"],
+            vec!["--user-agent=Foo"],
+            vec!["--header", "A: b"],
+            vec!["--referer=http://x"],
+            vec!["--connect-timeout", "5"],
+            vec!["--all-proxy=http://127.0.0.1:8080"],
+        ] {
             let extras = RunExtras {
                 extra_aria2: ok.iter().map(|s| s.to_string()).collect(),
                 ..RunExtras::default()
@@ -1874,7 +2218,10 @@ mod tests {
             assert!(build_with(&job, &tc_aria2(), &extras).is_ok(), "{ok:?}");
         }
         // A flag left without its value must say so, not blame the value.
-        let extras = RunExtras { extra_aria2: vec!["--max-tries".into()], ..RunExtras::default() };
+        let extras = RunExtras {
+            extra_aria2: vec!["--max-tries".into()],
+            ..RunExtras::default()
+        };
         let err = build_with(&job, &tc_aria2(), &extras).unwrap_err();
         assert!(err.contains("значение"), "{err}");
         std::fs::remove_dir_all(&out).ok();
@@ -1883,13 +2230,22 @@ mod tests {
     #[test]
     fn build_places_extra_aria2_args_before_the_terminator() {
         let out = tmp_out();
-        let job = Job { engine: "aria2".into(), url: "https://h/f.bin".into(),
-            out_dir: out.clone(), fmt: "best".into(), cookies_browser: None };
+        let job = Job {
+            engine: "aria2".into(),
+            url: "https://h/f.bin".into(),
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
         let extras = RunExtras {
-            extra_aria2: vec!["--max-connection-per-server=4".into()], ..RunExtras::default()
+            extra_aria2: vec!["--max-connection-per-server=4".into()],
+            ..RunExtras::default()
         };
         let s = args_of(&build_with(&job, &tc_aria2(), &extras).unwrap());
-        let at = s.iter().position(|a| a == "--max-connection-per-server=4").unwrap();
+        let at = s
+            .iter()
+            .position(|a| a == "--max-connection-per-server=4")
+            .unwrap();
         let term = s.iter().position(|a| a == "--").unwrap();
         assert!(at < term, "{s:?}");
         std::fs::remove_dir_all(&out).ok();
@@ -1941,7 +2297,10 @@ mod tests {
             cookies_browser: None,
         };
         let cmd = build(&job, &tc_ytdlp()).unwrap();
-        let s: Vec<String> = cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect();
+        let s: Vec<String> = cmd
+            .iter()
+            .map(|x| x.to_string_lossy().into_owned())
+            .collect();
         assert!(s.contains(&"bv*[height<=1080]+ba/b[height<=1080]".to_string()));
         std::fs::remove_dir_all(&out).ok();
     }
@@ -1949,8 +2308,12 @@ mod tests {
     #[test]
     fn build_cookies_browser_valid() {
         let out = tmp_out();
-        for value in ["chrome", "Chrome", "chrome:Profile 1", "firefox+keyring:prof::C:\\container"]
-        {
+        for value in [
+            "chrome",
+            "Chrome",
+            "chrome:Profile 1",
+            "firefox+keyring:prof::C:\\container",
+        ] {
             let job = Job {
                 engine: "yt-dlp".into(),
                 url: "https://youtube.com/watch?v=1".into(),
@@ -1959,8 +2322,14 @@ mod tests {
                 cookies_browser: Some(value.into()),
             };
             let cmd = build(&job, &tc_ytdlp()).unwrap();
-            let s: Vec<String> = cmd.iter().map(|x| x.to_string_lossy().into_owned()).collect();
-            let i = s.iter().position(|x| x == "--cookies-from-browser").unwrap();
+            let s: Vec<String> = cmd
+                .iter()
+                .map(|x| x.to_string_lossy().into_owned())
+                .collect();
+            let i = s
+                .iter()
+                .position(|x| x == "--cookies-from-browser")
+                .unwrap();
             assert_eq!(s[i + 1], value);
         }
         std::fs::remove_dir_all(&out).ok();
@@ -2019,11 +2388,20 @@ mod tests {
             fmt: "best".into(),
             cookies_browser: None,
         };
-        assert!(preflight_warning_with_ffmpeg(&job, false, true).iter().any(|w| w.contains("склейка")));
+        assert!(preflight_warning_with_ffmpeg(&job, false, true)
+            .iter()
+            .any(|w| w.contains("склейка")));
         assert!(preflight_warning_with_ffmpeg(&job, true, true).is_empty());
-        assert!(preflight_warning_with_ffmpeg(&job, true, false).iter().any(|w| w.contains("Deno")));
-        let audio = Job { fmt: "audio".into(), ..job };
-        assert!(preflight_warning_with_ffmpeg(&audio, false, true).iter().any(|w| w.contains("mp3")));
+        assert!(preflight_warning_with_ffmpeg(&job, true, false)
+            .iter()
+            .any(|w| w.contains("Deno")));
+        let audio = Job {
+            fmt: "audio".into(),
+            ..job
+        };
+        assert!(preflight_warning_with_ffmpeg(&audio, false, true)
+            .iter()
+            .any(|w| w.contains("mp3")));
     }
 
     #[test]
@@ -2063,16 +2441,26 @@ mod tests {
             parse_progress("[download]  42.3% of    9.99MiB at  1.2MiB/s ETA 00:05"),
             0.423,
         );
-        close(parse_progress("[#50e13e 880KiB/0.9MiB(88%) CN:1 DL:812KiB]"), 0.88);
+        close(
+            parse_progress("[#50e13e 880KiB/0.9MiB(88%) CN:1 DL:812KiB]"),
+            0.88,
+        );
         close(parse_progress("[download] 100% of 1MiB"), 1.0);
         assert_eq!(parse_progress("[download] Destination: file"), None);
         assert_eq!(parse_progress("ERROR: Unsupported URL"), None);
         // a percentage inside a title/path is not progress
-        assert_eq!(parse_progress("[download] Destination: C:\\v\\Progress (100%).mp4"), None);
-        let title_with_aria2_marker = "[download] Destination: C:\\v\\Clip [#abc123 1MiB/2MiB(88%)].mp4";
+        assert_eq!(
+            parse_progress("[download] Destination: C:\\v\\Progress (100%).mp4"),
+            None
+        );
+        let title_with_aria2_marker =
+            "[download] Destination: C:\\v\\Clip [#abc123 1MiB/2MiB(88%)].mp4";
         assert_eq!(parse_progress(title_with_aria2_marker), None);
         assert_eq!(aria2_stat(title_with_aria2_marker), None);
-        assert_eq!(parse_progress("  [#50e13e 880KiB/0.9MiB(88%) CN:1]"), Some(0.88));
+        assert_eq!(
+            parse_progress("  [#50e13e 880KiB/0.9MiB(88%) CN:1]"),
+            Some(0.88)
+        );
         assert_eq!(parse_progress("[#50e13e 880KiB/0.9MiB(oops%) CN:1]"), None);
         assert_eq!(aria2_stat("prefix [#50e13e 880KiB/0.9MiB(88%) CN:1]"), None);
         assert_eq!(parse_progress("[Merger] Merging (50%) something"), None);
@@ -2080,14 +2468,21 @@ mod tests {
 
     #[test]
     fn aria2_status_distinguishes_allocation_from_download() {
-        let allocating = "[#bc1f6e 0B/6.8GiB(0%) CN:0 SD:0 DL:0B] [FileAlloc:#bc1f6e 1.1GiB/3.3GiB(33%)]";
-        assert_eq!(aria2_stat(allocating).as_deref(),
-            Some("0% · 0B/6.8GiB · выделение места 1.1GiB/3.3GiB (33%)"));
+        let allocating =
+            "[#bc1f6e 0B/6.8GiB(0%) CN:0 SD:0 DL:0B] [FileAlloc:#bc1f6e 1.1GiB/3.3GiB(33%)]";
+        assert_eq!(
+            aria2_stat(allocating).as_deref(),
+            Some("0% · 0B/6.8GiB · выделение места 1.1GiB/3.3GiB (33%)")
+        );
         let downloading = "[#25017a 361MiB/6.8GiB(5%) CN:30 SD:5 DL:4.1MiB ETA:26m46s]";
-        assert_eq!(aria2_stat(downloading).as_deref(),
-            Some("5% · 361MiB/6.8GiB · ↓4.1MiB/с · сиды 5 · соединения 30"));
-        assert_eq!(aria2_name_from_file("FILE: C:/Downloads/Cuphead_1.3.9/setup.bin (7more)").as_deref(),
-            Some("Cuphead_1.3.9"));
+        assert_eq!(
+            aria2_stat(downloading).as_deref(),
+            Some("5% · 361MiB/6.8GiB · ↓4.1MiB/с · сиды 5 · соединения 30")
+        );
+        assert_eq!(
+            aria2_name_from_file("FILE: C:/Downloads/Cuphead_1.3.9/setup.bin (7more)").as_deref(),
+            Some("Cuphead_1.3.9")
+        );
     }
 
     #[test]
@@ -2095,7 +2490,9 @@ mod tests {
         let detail = "Exception: [RequestGroup.cc:436] errorCode=13 File C:/Downloads/Cuphead exists, but a control file(*.aria2) does not exist.";
         assert!(aria2_missing_control(detail));
         assert!(!aria2_missing_control("errorCode=13 permission denied"));
-        assert!(!aria2_missing_control("control file(*.aria2) does not exist"));
+        assert!(!aria2_missing_control(
+            "control file(*.aria2) does not exist"
+        ));
     }
 
     #[test]
@@ -2112,8 +2509,14 @@ mod tests {
 
     #[test]
     fn decode_child_bytes_utf8_passthrough() {
-        assert_eq!(decode_child_bytes(b"plain ascii\n").as_ref(), "plain ascii\n");
-        assert_eq!(decode_child_bytes("UTF-8 строка — ok".as_bytes()).as_ref(), "UTF-8 строка — ok");
+        assert_eq!(
+            decode_child_bytes(b"plain ascii\n").as_ref(),
+            "plain ascii\n"
+        );
+        assert_eq!(
+            decode_child_bytes("UTF-8 строка — ok".as_bytes()).as_ref(),
+            "UTF-8 строка — ok"
+        );
     }
 
     #[test]
@@ -2138,13 +2541,15 @@ mod tests {
         let source = b"[download] 10%\r\x1b]0;FAKE\x07[download] 20%\x1b[31m\n";
         let mut output = Vec::new();
         relay_stdout(&source[..], &mut output).unwrap();
-        assert_eq!(String::from_utf8(output).unwrap(), "[download] 10%\r[download] 20%\n");
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "[download] 10%\r[download] 20%\n"
+        );
     }
 
     #[test]
     fn run_missing_binary_127() {
-        let cmd: Vec<OsString> =
-            vec!["definitely-not-a-real-binary-xyz".into(), "arg".into()];
+        let cmd: Vec<OsString> = vec!["definitely-not-a-real-binary-xyz".into(), "arg".into()];
         assert_eq!(run(&cmd, false).code, 127);
     }
 
@@ -2152,7 +2557,10 @@ mod tests {
     fn run_captures_auth_hint() {
         let exe = if cfg!(windows) { "cmd.exe" } else { "sh" };
         let args: Vec<&str> = if cfg!(windows) {
-            vec!["/C", "echo ERROR: Sign in to confirm you're not a bot 1>&2 & exit /b 1"]
+            vec![
+                "/C",
+                "echo ERROR: Sign in to confirm you're not a bot 1>&2 & exit /b 1",
+            ]
         } else {
             vec!["-c", "echo 'ERROR: Sign in to confirm' >&2; exit 1"]
         };
@@ -2180,23 +2588,32 @@ mod tests {
 
     #[test]
     fn batch_name_uses_query_id_for_generic_route_segments() {
-        assert_eq!(batch_name("https://youtube.com/watch?v=dQw4w9WgXcQ"), "dQw4w9WgXcQ");
+        assert_eq!(
+            batch_name("https://youtube.com/watch?v=dQw4w9WgXcQ"),
+            "dQw4w9WgXcQ"
+        );
         assert_eq!(batch_name("https://youtu.be/dQw4w9WgXcQ"), "dQw4w9WgXcQ");
         assert_eq!(batch_name("https://example.com/embed?id=abc123"), "abc123");
-        assert_eq!(batch_name("https://example.com/some-video-title"), "some-video-title");
+        assert_eq!(
+            batch_name("https://example.com/some-video-title"),
+            "some-video-title"
+        );
         assert_eq!(batch_name("https://example.com/watch"), "watch");
     }
 
     #[test]
     fn batch_name_still_handles_magnets() {
-        let name = batch_name("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Foo");
+        let name =
+            batch_name("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Foo");
         assert!(name.starts_with("magnet "));
     }
 
     #[test]
     fn ytdlp_title_from_line_reads_destination_and_merger_lines() {
         assert_eq!(
-            ytdlp_title_from_line("[download] Destination: C:\\out\\Rick Astley - Never Gonna Give You Up.mp4"),
+            ytdlp_title_from_line(
+                "[download] Destination: C:\\out\\Rick Astley - Never Gonna Give You Up.mp4"
+            ),
             Some("Rick Astley - Never Gonna Give You Up".to_string())
         );
         assert_eq!(
@@ -2208,7 +2625,9 @@ mod tests {
             None
         );
         assert_eq!(
-            ytdlp_title_from_line("[download] /out/Already Downloaded.mp4 has already been downloaded"),
+            ytdlp_title_from_line(
+                "[download] /out/Already Downloaded.mp4 has already been downloaded"
+            ),
             Some("Already Downloaded".to_string())
         );
         assert_eq!(ytdlp_title_from_line("[download]  42.0% of 10.00MiB"), None);

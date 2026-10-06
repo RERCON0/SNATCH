@@ -1,0 +1,12 @@
+* text=auto
+*.rs text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+Cargo.lock text eol=lf
+.gitignore text eol=lf
+*.md text eol=lf
+*.pem text eol=lf
+*.ico binary
+*.png binary
+*.ttf binary

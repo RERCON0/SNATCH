@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: Rust and signature tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      CARGO_TERM_COLOR: always
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13.15"
+      - name: Install Linux build libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y libx11-dev libxi-dev libxrandr-dev libxcursor-dev libgl1-mesa-dev libudev-dev libwayland-dev libxkbcommon-dev
+      - name: Install pinned Rust components
+        run: rustup toolchain install 1.99.0 --profile minimal --component rustfmt,clippy
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check all targets without warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test CLI, GUI and shared engine
+        run: cargo test --locked --all-targets
+      - name: Test signed package verification and tamper rejection
+        run: python -m unittest discover -s scripts -p "test_*.py" -v
+      - name: Build release executables
+        if: runner.os == 'Windows'
+        run: cargo build --locked --release --bins --target x86_64-pc-windows-msvc
+      - name: Check architecture, subsystem, ASLR, DEP and static CRT
+        if: runner.os == 'Windows'
+        run: python scripts/release.py check-binaries target/x86_64-pc-windows-msvc/release
+      - name: Record unsigned candidate revision
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          git rev-parse HEAD | Set-Content -Encoding utf8 dist/source-commit.txt
+          Get-FileHash target/x86_64-pc-windows-msvc/release/snatch.exe, target/x86_64-pc-windows-msvc/release/snatch-app.exe | Format-List | Out-File -Encoding utf8 dist/SHA256.txt
+      - name: Upload unsigned CI candidates
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: snatch-windows-x64-unsigned-${{ github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            target/x86_64-pc-windows-msvc/release/snatch.exe
+            target/x86_64-pc-windows-msvc/release/snatch-app.exe
+            dist/source-commit.txt
+            dist/SHA256.txt

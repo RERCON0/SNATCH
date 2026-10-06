@@ -131,8 +131,15 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
     // A torrent aria2 cannot read still exits 0 with "Exception: ..." on
     // stdout, and that message may quote attacker-controlled text shaped
     // like a listing: never parse such output as one.
-    if let Some(line) = output.lines().map(str::trim).find(|l| l.starts_with("Exception:")) {
-        return Err(format!("aria2 не смог прочитать торрент: {}", crate::ui::clip(line, 160)));
+    if let Some(line) = output
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("Exception:"))
+    {
+        return Err(format!(
+            "aria2 не смог прочитать торрент: {}",
+            crate::ui::clip(line, 160)
+        ));
     }
     let mut name = String::new();
     let mut total = 0u64;
@@ -182,13 +189,24 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
                     return Err("слишком много файлов для списка — скачайте торрент целиком".into());
                 }
                 let clean = path.strip_prefix("./").unwrap_or(path);
-                components += clean.split('/').filter(|s| !s.is_empty()).count().min(MAX_TREE_DEPTH);
+                components += clean
+                    .split('/')
+                    .filter(|s| !s.is_empty())
+                    .count()
+                    .min(MAX_TREE_DEPTH);
                 if components > MAX_TREE_COMPONENTS {
-                    return Err("слишком сложное дерево файлов для списка — скачайте торрент целиком".into());
+                    return Err(
+                        "слишком сложное дерево файлов для списка — скачайте торрент целиком"
+                            .into(),
+                    );
                 }
                 // Drop the leading "<name>/" that aria2 adds to every path.
                 let clean = clean.strip_prefix(&format!("{name}/")).unwrap_or(clean);
-                files.push(FileEntry { index, path: clean.to_string(), size: 0 });
+                files.push(FileEntry {
+                    index,
+                    path: clean.to_string(),
+                    size: 0,
+                });
             }
         }
     }
@@ -200,9 +218,13 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
             return Err("подозрительный список файлов (непоследовательные индексы)".into());
         }
     }
-    let summed = files.iter().try_fold(0u64, |sum, file| sum.checked_add(file.size))
+    let summed = files
+        .iter()
+        .try_fold(0u64, |sum, file| sum.checked_add(file.size))
         .ok_or("размеры в списке файлов переполняют u64")?;
-    if total == 0 { total = summed; }
+    if total == 0 {
+        total = summed;
+    }
     Ok(TorrentInfo { name, total, files })
 }
 
@@ -211,14 +233,19 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
 pub fn parse_size(text: &str) -> Option<u64> {
     if let Some(open) = text.find('(') {
         if let Some(close) = text[open..].find(')') {
-            let exact: String = text[open + 1..open + close].chars().filter(|c| c.is_ascii_digit()).collect();
+            let exact: String = text[open + 1..open + close]
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect();
             if let Ok(n) = exact.parse::<u64>() {
                 return Some(n);
             }
         }
     }
     let text = text.trim();
-    let split = text.find(|c: char| !c.is_ascii_digit() && c != '.').unwrap_or(text.len());
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
     let (num, unit) = text.split_at(split);
     let num: f64 = num.parse().ok()?;
     let mult = match unit.trim().to_ascii_lowercase().as_str() {
@@ -229,7 +256,9 @@ pub fn parse_size(text: &str) -> Option<u64> {
         _ => 1.0,
     };
     let value = num * mult;
-    if !value.is_finite() || value < 0.0 || value >= u64::MAX as f64 { return None; }
+    if !value.is_finite() || value < 0.0 || value >= u64::MAX as f64 {
+        return None;
+    }
     Some(value as u64)
 }
 
@@ -298,17 +327,26 @@ impl Drop for TempDir {
 /// "snatch-torrent-<pid>-<seq>-<nanos>" names, only real directories (never
 /// a symlink), never this process's own.
 fn sweep_stale_temp_dirs(base: &Path, max_age: Duration) {
-    let Ok(entries) = std::fs::read_dir(base) else { return };
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
     let own = std::process::id().to_string();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(TEMP_PREFIX)) else { continue };
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(TEMP_PREFIX)) else {
+            continue;
+        };
         let parts: Vec<&str> = rest.split('-').collect();
-        let ours = parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        let ours = parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
         if !ours || parts[0] == own {
             continue;
         }
-        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
         if !meta.is_dir() {
             continue;
         }
@@ -321,7 +359,9 @@ fn sweep_stale_temp_dirs(base: &Path, max_age: Duration) {
             .filter_map(|f| f.metadata().ok()?.modified().ok())
             .chain(meta.modified().ok())
             .max();
-        let idle = newest.and_then(|m| m.elapsed().ok()).is_some_and(|age| age > max_age);
+        let idle = newest
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > max_age);
         if idle {
             let _ = std::fs::remove_dir_all(entry.path());
         }
@@ -350,7 +390,12 @@ enum Waited {
 }
 
 /// Polls `child` until it exits; cancellation, read failure or timeout reaps it.
-fn wait_child(child: &mut Child, timeout: Duration, cancel: &AtomicBool, pipe_failed: Option<&AtomicBool>) -> Waited {
+fn wait_child(
+    child: &mut Child,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    pipe_failed: Option<&AtomicBool>,
+) -> Waited {
     fn reap(child: &mut Child) {
         let _ = child.kill();
         let _ = child.wait();
@@ -388,12 +433,19 @@ enum Source {
     Fetched(Meta),
 }
 
-fn resolve(aria2c: &Path, input: &str, timeout: Duration, cancel: &AtomicBool) -> Result<Source, String> {
+fn resolve(
+    aria2c: &Path,
+    input: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Source, String> {
     let path = Path::new(input);
     // Before is_file(): even probing \\host\share performs SMB auth against
     // that host (NetNTLMv2 leak) - same rule as engines::build.
     if crate::engines::is_unc_path(path) {
-        return Err("сетевой UNC-путь не поддерживается — скопируйте .torrent на этот компьютер".into());
+        return Err(
+            "сетевой UNC-путь не поддерживается — скопируйте .torrent на этот компьютер".into(),
+        );
     }
     if path.is_file() {
         return Ok(Source::Local(path.to_path_buf()));
@@ -410,7 +462,12 @@ fn resolve(aria2c: &Path, input: &str, timeout: Duration, cancel: &AtomicBool) -
 
 /// Metadata-only aria2 run: fetches just the .torrent from the swarm into a
 /// private temp dir and exits on its own.
-fn fetch_magnet(aria2c: &Path, magnet: &str, timeout: Duration, cancel: &AtomicBool) -> Result<Meta, String> {
+fn fetch_magnet(
+    aria2c: &Path,
+    magnet: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Meta, String> {
     let dir = TempDir::new()?;
     let mut command = Command::new(aria2c);
     command
@@ -435,7 +492,8 @@ fn fetch_magnet(aria2c: &Path, magnet: &str, timeout: Duration, cancel: &AtomicB
     }
     // The dir is private and fresh, so the only .torrent in it is ours
     // ("<infohash>.torrent").
-    let path = find_torrent(dir.path()).ok_or_else(|| "не удалось получить метаданные торрента из роя".to_string())?;
+    let path = find_torrent(dir.path())
+        .ok_or_else(|| "не удалось получить метаданные торрента из роя".to_string())?;
     Ok(Meta(Arc::new(FetchedTorrent { path, _dir: dir })))
 }
 
@@ -449,9 +507,24 @@ fn fetch_http(url: &str, cancel: &AtomicBool) -> Result<Meta, String> {
         .user_agent(concat!("snatch/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|e| e.to_string())?;
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-    let bytes = runtime.block_on(crate::http::get_bytes(&client, url, MAX_TORRENT_BYTES, cancel))
-        .map_err(|e| if e == "__cancelled__" { CANCELLED.into() } else { e })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    let bytes = runtime
+        .block_on(crate::http::get_bytes(
+            &client,
+            url,
+            MAX_TORRENT_BYTES,
+            cancel,
+        ))
+        .map_err(|e| {
+            if e == "__cancelled__" {
+                CANCELLED.into()
+            } else {
+                e
+            }
+        })?;
     if !bytes.starts_with(b"d") {
         return Err("по ссылке не торрент-файл".into());
     }
@@ -463,22 +536,34 @@ fn fetch_http(url: &str, cancel: &AtomicBool) -> Result<Meta, String> {
 
 fn find_torrent(dir: &Path) -> Option<PathBuf> {
     // `extension() == "torrent"` also skips a half-written "x.torrent__temp".
-    std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).find(|p| {
-        p.extension().is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
-    })
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("torrent"))
+        })
 }
 
 /// List the files of a magnet / .torrent (local or http(s)) via
 /// `aria2c --show-files`. Magnets need metadata from the swarm first, so
 /// this can take a while: it is bounded by `timeout` and stops (killing its
 /// aria2c) as soon as `cancel` is set.
-pub fn show_files(aria2c: &Path, input: &str, timeout: Duration, cancel: &AtomicBool) -> Result<Listing, String> {
+pub fn show_files(
+    aria2c: &Path,
+    input: &str,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> Result<Listing, String> {
     let source = resolve(aria2c, input, timeout, cancel)?;
     let local = match &source {
         Source::Local(path) => path.as_path(),
         Source::Fetched(meta) => meta.path(),
     };
-    if cancel.load(Ordering::Relaxed) { return Err(CANCELLED.into()); }
+    if cancel.load(Ordering::Relaxed) {
+        return Err(CANCELLED.into());
+    }
     if std::fs::metadata(local).map_err(|e| e.to_string())?.len() > MAX_TORRENT_BYTES {
         return Err("слишком большой торрент для списка — скачайте его целиком".into());
     }
@@ -491,12 +576,26 @@ pub fn show_files(aria2c: &Path, input: &str, timeout: Duration, cancel: &Atomic
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let (child, proc_job) = spawn_hidden(command)?;
-    let (stdout, stderr) = collect_listing(child, proc_job, timeout, cancel,
-        (MAX_LISTING_BYTES, MAX_STDERR_BYTES))?;
+    let (stdout, stderr) = collect_listing(
+        child,
+        proc_job,
+        timeout,
+        cancel,
+        (MAX_LISTING_BYTES, MAX_STDERR_BYTES),
+    )?;
     let info = parse_show_files(&String::from_utf8_lossy(&stdout)).map_err(|e| {
         let stderr = String::from_utf8_lossy(&stderr);
-        let hint = stderr.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
-        if hint.is_empty() { e } else { format!("{e} ({})", crate::ui::clip(hint, 160)) }
+        let hint = stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        if hint.is_empty() {
+            e
+        } else {
+            format!("{e} ({})", crate::ui::clip(hint, 160))
+        }
     })?;
     let meta = match source {
         Source::Local(_) => None,
@@ -505,8 +604,13 @@ pub fn show_files(aria2c: &Path, input: &str, timeout: Duration, cancel: &Atomic
     Ok(Listing { info, meta })
 }
 
-fn collect_listing(mut child: Child, proc_job: Option<job_object::Job>,
-    timeout: Duration, cancel: &AtomicBool, limits: (u64, u64)) -> Result<(Vec<u8>, Vec<u8>), String> {
+fn collect_listing(
+    mut child: Child,
+    proc_job: Option<job_object::Job>,
+    timeout: Duration,
+    cancel: &AtomicBool,
+    limits: (u64, u64),
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     // Drain both pipes on reader threads: a torrent with hundreds of files
     // makes --show-files write far more than the OS pipe buffer, and waiting
     // for exit without reading would deadlock the child mid-write (the UI
@@ -517,22 +621,32 @@ fn collect_listing(mut child: Child, proc_job: Option<job_object::Job>,
     let out_failed = pipe_failed.clone();
     let out_thread = std::thread::spawn(move || {
         let result = read_listing(&mut stdout_pipe, limits.0);
-        if result.is_err() { out_failed.store(true, Ordering::Release); }
+        if result.is_err() {
+            out_failed.store(true, Ordering::Release);
+        }
         result
     });
     let err_failed = pipe_failed.clone();
     let err_thread = std::thread::spawn(move || {
         let result = read_listing(&mut stderr_pipe, limits.1);
-        if result.is_err() { err_failed.store(true, Ordering::Release); }
+        if result.is_err() {
+            err_failed.store(true, Ordering::Release);
+        }
         result
     });
     // Closing an overflowing pipe alone does not make a child exit: it may
     // ignore write errors and keep the other pipe open. Stop without waiting
     // for the metadata timeout, and retain the reader's actual size/I/O error.
     let waited = wait_child(&mut child, timeout, cancel, Some(&pipe_failed));
-    if let Some(job) = &proc_job { job.terminate(); }
-    let stdout = out_thread.join().unwrap_or_else(|_| Err("поток списка файлов завершился с ошибкой".into()));
-    let stderr = err_thread.join().unwrap_or_else(|_| Err("поток диагностики завершился с ошибкой".into()));
+    if let Some(job) = &proc_job {
+        job.terminate();
+    }
+    let stdout = out_thread
+        .join()
+        .unwrap_or_else(|_| Err("поток списка файлов завершился с ошибкой".into()));
+    let stderr = err_thread
+        .join()
+        .unwrap_or_else(|_| Err("поток диагностики завершился с ошибкой".into()));
     match waited {
         Waited::Exited => {}
         Waited::TimedOut => return Err("aria2c не выдал список файлов (таймаут)".into()),
@@ -546,8 +660,13 @@ fn collect_listing(mut child: Child, proc_job: Option<job_object::Job>,
 
 fn read_listing(reader: impl Read, max: u64) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
-    reader.take(max + 1).read_to_end(&mut bytes).map_err(|e| format!("чтение списка: {e}"))?;
-    if bytes.len() as u64 > max { return Err("слишком большой список файлов торрента — скачайте всё".into()); }
+    reader
+        .take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("чтение списка: {e}"))?;
+    if bytes.len() as u64 > max {
+        return Err("слишком большой список файлов торрента — скачайте всё".into());
+    }
     Ok(bytes)
 }
 
@@ -589,7 +708,12 @@ pub struct TreeView {
 
 impl Default for TreeView {
     fn default() -> Self {
-        Self { rows: Vec::new(), rows_dirty: true, selection_dirty: true, selected: 0 }
+        Self {
+            rows: Vec::new(),
+            rows_dirty: true,
+            selection_dirty: true,
+            selected: 0,
+        }
     }
 }
 
@@ -604,11 +728,18 @@ impl TreeView {
                 (a + node.selection.0, b + node.selection.1)
             })
         }
-        fn flatten(nodes: &[TorrNode], depth: usize, prefix: &mut Vec<usize>, rows: &mut Vec<TreeRow>) {
+        fn flatten(
+            nodes: &[TorrNode],
+            depth: usize,
+            prefix: &mut Vec<usize>,
+            rows: &mut Vec<TreeRow>,
+        ) {
             for (i, node) in nodes.iter().enumerate() {
                 prefix.push(i);
                 rows.push((prefix.clone(), depth));
-                if node.file.is_none() && node.expanded { flatten(&node.children, depth + 1, prefix, rows); }
+                if node.file.is_none() && node.expanded {
+                    flatten(&node.children, depth + 1, prefix, rows);
+                }
                 prefix.pop();
             }
         }
@@ -690,14 +821,22 @@ impl Level {
             Some(key) => key.clone(),
             None => {
                 let key = self.free_key(name);
-                self.entries
-                    .insert(key.clone(), TreeEntry::Dir { size: 0, children: Level::default() });
+                self.entries.insert(
+                    key.clone(),
+                    TreeEntry::Dir {
+                        size: 0,
+                        children: Level::default(),
+                    },
+                );
                 self.dir_for.insert(name.to_string(), key.clone());
                 key
             }
         };
         match self.entries.get_mut(&key) {
-            Some(TreeEntry::Dir { size: total, children }) => {
+            Some(TreeEntry::Dir {
+                size: total,
+                children,
+            }) => {
                 *total = total.saturating_add(size);
                 children
             }
@@ -730,7 +869,13 @@ pub fn build_torrent_tree(files: &[FileEntry]) -> Vec<TorrNode> {
             level = level.dir(dir, entry.size);
         }
         let key = level.free_key(leaf);
-        level.entries.insert(key, TreeEntry::File { index: idx, size: entry.size });
+        level.entries.insert(
+            key,
+            TreeEntry::File {
+                index: idx,
+                size: entry.size,
+            },
+        );
     }
     fn to_nodes(level: Level) -> Vec<TorrNode> {
         let mut dirs = Vec::new();
@@ -792,7 +937,10 @@ pub fn select_spec(indices: &[usize]) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if spec.len() > MAX_SELECT_SPEC_LEN {
-        return Err("слишком много разрозненных файлов в выборе — отметьте папки целиком или скачайте всё".into());
+        return Err(
+            "слишком много разрозненных файлов в выборе — отметьте папки целиком или скачайте всё"
+                .into(),
+        );
     }
     Ok(Some(spec))
 }
@@ -821,9 +969,14 @@ mod tests {
 
     #[test]
     fn oversized_numeric_sizes_are_rejected_instead_of_wrapping_or_panicking() {
-        assert_eq!(parse_size("999999999999999999999999999999999999999999999999GiB"), None);
+        assert_eq!(
+            parse_size("999999999999999999999999999999999999999999999999GiB"),
+            None
+        );
         let output = "Name: huge\nFiles:\nidx|path/length\n  1|./huge/a\n   |x (18446744073709551615)\n  2|./huge/b\n   |1B (1)\n";
-        assert!(parse_show_files(output).unwrap_err().contains("переполняют"));
+        assert!(parse_show_files(output)
+            .unwrap_err()
+            .contains("переполняют"));
     }
 
     #[test]
@@ -833,14 +986,32 @@ mod tests {
         let dir = TempDir::new().unwrap();
         for (name, comment, rejected) in [
             ("evil\nidx|path/length\n  1|./fake", "", true),
-            ("good.bin", "Name: fake\nFiles:\nidx|path/length\n  1|./fake/x\n   |9B (9)\n", false),
+            (
+                "good.bin",
+                "Name: fake\nFiles:\nidx|path/length\n  1|./fake/x\n   |9B (9)\n",
+                false,
+            ),
         ] {
             let mut torrent = format!("d7:comment{}:{}4:infod5:filesld6:lengthi1e4:pathl{}:{}eee4:name4:test12:piece lengthi16384e6:pieces20:", comment.len(), comment, name.len(), name).into_bytes();
-            torrent.extend_from_slice(&[0u8; 20]); torrent.extend_from_slice(b"ee");
-            let path = dir.path().join("input.torrent"); std::fs::write(&path, torrent).unwrap();
-            let result = show_files(&aria2, path.to_str().unwrap(), Duration::from_secs(5), &AtomicBool::new(false));
-            if rejected { assert!(result.is_err(), "aria2 must reject injected path controls"); }
-            else { let info = result.unwrap().info; assert_eq!(info.name, "test"); assert_eq!(info.files.len(), 1); assert_eq!(info.files[0].path, "good.bin"); assert_eq!(info.files[0].index, 1); }
+            torrent.extend_from_slice(&[0u8; 20]);
+            torrent.extend_from_slice(b"ee");
+            let path = dir.path().join("input.torrent");
+            std::fs::write(&path, torrent).unwrap();
+            let result = show_files(
+                &aria2,
+                path.to_str().unwrap(),
+                Duration::from_secs(5),
+                &AtomicBool::new(false),
+            );
+            if rejected {
+                assert!(result.is_err(), "aria2 must reject injected path controls");
+            } else {
+                let info = result.unwrap().info;
+                assert_eq!(info.name, "test");
+                assert_eq!(info.files.len(), 1);
+                assert_eq!(info.files[0].path, "good.bin");
+                assert_eq!(info.files[0].index, 1);
+            }
         }
     }
 
@@ -849,24 +1020,49 @@ mod tests {
         let exe = std::env::current_exe().unwrap();
         for stream in ["stdout", "stderr"] {
             let mut command = Command::new(&exe);
-            command.args(["--exact", "torrent::tests::listing_overflow_fixture", "--nocapture"])
+            command
+                .args([
+                    "--exact",
+                    "torrent::tests::listing_overflow_fixture",
+                    "--nocapture",
+                ])
                 .env("SNATCH_LISTING_OVERFLOW_FIXTURE", stream)
-                .current_dir(exe.parent().unwrap()).stdout(Stdio::piped()).stderr(Stdio::piped());
+                .current_dir(exe.parent().unwrap())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             let (child, job) = job_object::spawn(&mut command, true).unwrap();
             let began = Instant::now();
-            let error = collect_listing(child, job, Duration::from_secs(2), &AtomicBool::new(false), (1024, 1024)).unwrap_err();
-            assert!(error.contains("слишком большой список"), "{stream}: {error}");
-            assert!(began.elapsed() < Duration::from_secs(1), "overflow must stop the process before its timeout");
+            let error = collect_listing(
+                child,
+                job,
+                Duration::from_secs(2),
+                &AtomicBool::new(false),
+                (1024, 1024),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("слишком большой список"),
+                "{stream}: {error}"
+            );
+            assert!(
+                began.elapsed() < Duration::from_secs(1),
+                "overflow must stop the process before its timeout"
+            );
         }
     }
 
     #[test]
     fn listing_overflow_fixture() {
         use std::io::Write;
-        let Ok(stream) = std::env::var("SNATCH_LISTING_OVERFLOW_FIXTURE") else { return };
+        let Ok(stream) = std::env::var("SNATCH_LISTING_OVERFLOW_FIXTURE") else {
+            return;
+        };
         let bytes = [b'x'; 4096];
-        if stream == "stderr" { let _ = std::io::stderr().write_all(&bytes); }
-        else { let _ = std::io::stdout().write_all(&bytes); }
+        if stream == "stderr" {
+            let _ = std::io::stderr().write_all(&bytes);
+        } else {
+            let _ = std::io::stdout().write_all(&bytes);
+        }
         // Deliberately ignore write errors and stay alive, holding the other
         // pipe open. Only the monitor's overflow stop should end this fixture.
         std::thread::sleep(Duration::from_secs(30));
@@ -877,14 +1073,28 @@ mod tests {
         assert_eq!(read_listing(&b"1234"[..], 4).unwrap(), b"1234");
         assert!(read_listing(&b"12345"[..], 4).is_err());
         let mut text = "Name: huge\nidx|path/length\n".to_string();
-        for i in 1..=MAX_LISTED_FILES + 1 { text.push_str(&format!("{i}|./huge/f{i}\n |1 (1)\n")); }
-        assert!(parse_show_files(&text).unwrap_err().contains("слишком много"));
+        for i in 1..=MAX_LISTED_FILES + 1 {
+            text.push_str(&format!("{i}|./huge/f{i}\n |1 (1)\n"));
+        }
+        assert!(parse_show_files(&text)
+            .unwrap_err()
+            .contains("слишком много"));
     }
 
     #[test]
     fn picker_cache_rebuilds_only_on_expansion_or_selection() {
-        let files = vec![FileEntry { index: 1, path: "folder/a".into(), size: 1 },
-            FileEntry { index: 2, path: "folder/b".into(), size: 2 }];
+        let files = vec![
+            FileEntry {
+                index: 1,
+                path: "folder/a".into(),
+                size: 1,
+            },
+            FileEntry {
+                index: 2,
+                path: "folder/b".into(),
+                size: 2,
+            },
+        ];
         let mut tree = build_torrent_tree(&files);
         let mut selected = vec![true, true];
         let mut view = TreeView::default();
@@ -893,11 +1103,17 @@ mod tests {
         assert_eq!(tree[0].selection, (2, 2));
         let ptr = view.rows[0].0.as_ptr();
         view.prepare(&mut tree, &selected);
-        assert_eq!(ptr, view.rows[0].0.as_ptr(), "navigation must reuse row paths");
-        tree[0].expanded = true; view.rows_dirty = true;
+        assert_eq!(
+            ptr,
+            view.rows[0].0.as_ptr(),
+            "navigation must reuse row paths"
+        );
+        tree[0].expanded = true;
+        view.rows_dirty = true;
         view.prepare(&mut tree, &selected);
         assert_eq!(view.rows.len(), 3);
-        selected[0] = false; view.selection_dirty = true;
+        selected[0] = false;
+        view.selection_dirty = true;
         view.prepare(&mut tree, &selected);
         assert_eq!(tree[0].selection, (1, 2));
         assert_eq!(view.selected, 1);
@@ -912,18 +1128,24 @@ mod tests {
         let (release, wait) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut bytes = [0u8; 4096]; let _ = socket.read(&mut bytes).unwrap();
-            ready.send(()).unwrap(); wait.recv().unwrap();
-            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nde").ok();
+            let mut bytes = [0u8; 4096];
+            let _ = socket.read(&mut bytes).unwrap();
+            ready.send(()).unwrap();
+            wait.recv().unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nde")
+                .ok();
         });
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         let worker = std::thread::spawn(move || fetch_http(&url, &flag));
         rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        let began = Instant::now(); cancel.store(true, Ordering::SeqCst);
+        let began = Instant::now();
+        cancel.store(true, Ordering::SeqCst);
         assert!(worker.join().unwrap().is_err());
         assert!(began.elapsed() < Duration::from_secs(1));
-        release.send(()).unwrap(); server.join().unwrap();
+        release.send(()).unwrap();
+        server.join().unwrap();
     }
 
     /// Captured verbatim from `aria2c --show-files test.torrent` (1.37.0).
@@ -990,10 +1212,18 @@ idx|path/length
         std::fs::write(&file, b"d4:infod0:e").unwrap();
         let input = file.to_string_lossy().into_owned();
         // aria2c is never started for a local file.
-        let source = resolve(Path::new("aria2c-not-needed"), &input, METADATA_TIMEOUT, &AtomicBool::new(false));
+        let source = resolve(
+            Path::new("aria2c-not-needed"),
+            &input,
+            METADATA_TIMEOUT,
+            &AtomicBool::new(false),
+        );
         assert!(matches!(source, Ok(Source::Local(ref p)) if *p == file));
         drop(source);
-        assert!(file.is_file(), "the user's own .torrent must survive the listing");
+        assert!(
+            file.is_file(),
+            "the user's own .torrent must survive the listing"
+        );
     }
 
     #[test]
@@ -1022,8 +1252,14 @@ idx|path/length
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("hash.torrent");
         std::fs::write(&path, b"d").unwrap();
-        let meta = Meta(Arc::new(FetchedTorrent { path: path.clone(), _dir: dir }));
-        let paused = Choice { files: Some(vec![1]), meta: Some(meta.clone()) };
+        let meta = Meta(Arc::new(FetchedTorrent {
+            path: path.clone(),
+            _dir: dir,
+        }));
+        let paused = Choice {
+            files: Some(vec![1]),
+            meta: Some(meta.clone()),
+        };
         drop(meta);
         assert!(path.is_file());
         drop(paused);
@@ -1036,7 +1272,10 @@ idx|path/length
         let path = dir.path().join("hash.torrent");
         std::fs::write(&path, b"d").unwrap();
         let out = dir.path().join("out");
-        let meta = Meta(Arc::new(FetchedTorrent { path: path.clone(), _dir: dir }));
+        let meta = Meta(Arc::new(FetchedTorrent {
+            path: path.clone(),
+            _dir: dir,
+        }));
         let job = crate::engines::Job {
             engine: "aria2".into(),
             url: "magnet:?xt=urn:btih:c01abfff06149cb74765dca1b5226003eeb4e877".into(),
@@ -1044,11 +1283,21 @@ idx|path/length
             fmt: "best".into(),
             cookies_browser: None,
         };
-        let tc = crate::tools::Toolchain { yt_dlp: None, aria2c: Some(PathBuf::from("aria2c")) };
-        let choice = Choice { files: Some(vec![3, 1, 3]), meta: Some(meta) };
+        let tc = crate::tools::Toolchain {
+            yt_dlp: None,
+            aria2c: Some(PathBuf::from("aria2c")),
+        };
+        let choice = Choice {
+            files: Some(vec![3, 1, 3]),
+            meta: Some(meta),
+        };
         let cmd = crate::engines::build_for_run(&job, &tc, &choice).unwrap();
         assert_eq!(cmd[cmd.len() - 2], "--");
-        assert_eq!(cmd.last().unwrap(), path.as_os_str(), "aria2 must download what was listed");
+        assert_eq!(
+            cmd.last().unwrap(),
+            path.as_os_str(),
+            "aria2 must download what was listed"
+        );
         assert!(cmd.iter().any(|a| a == "--select-file=1,3"));
         // Metadata gone (temp cleaner during a long pause): fall back to the
         // magnet itself, aria2 fetches it again.
@@ -1057,11 +1306,20 @@ idx|path/length
         assert_eq!(cmd.last().unwrap(), job.url.as_str());
         // An http(s) .torrent may have changed since the pick: the old
         // indices must not be applied to whatever it serves now.
-        let http = crate::engines::Job { url: "https://example.com/release.torrent".into(), ..job };
+        let http = crate::engines::Job {
+            url: "https://example.com/release.torrent".into(),
+            ..job
+        };
         let err = crate::engines::build_for_run(&http, &tc, &choice).unwrap_err();
         assert!(err.contains("выберите файлы заново"), "{err}");
-        let all = Choice { files: None, ..choice };
-        assert!(crate::engines::build_for_run(&http, &tc, &all).is_ok(), "all files need no indices");
+        let all = Choice {
+            files: None,
+            ..choice
+        };
+        assert!(
+            crate::engines::build_for_run(&http, &tc, &all).is_ok(),
+            "all files need no indices"
+        );
     }
 
     #[test]
@@ -1080,9 +1338,14 @@ idx|path/length
             "//attacker/share/x.torrent",
             r"\??\UNC\attacker\share\x.torrent",
         ] {
-            let err = resolve(Path::new("aria2c"), input, METADATA_TIMEOUT, &AtomicBool::new(false))
-                .err()
-                .expect("UNC must be refused");
+            let err = resolve(
+                Path::new("aria2c"),
+                input,
+                METADATA_TIMEOUT,
+                &AtomicBool::new(false),
+            )
+            .err()
+            .expect("UNC must be refused");
             assert!(err.contains("UNC"), "{input}: {err}");
         }
     }
@@ -1091,10 +1354,16 @@ idx|path/length
     fn select_spec_folds_runs_into_ranges() {
         assert_eq!(select_spec(&[]).unwrap(), None);
         assert_eq!(select_spec(&[3, 1, 3]).unwrap().as_deref(), Some("1,3"));
-        assert_eq!(select_spec(&[8, 1, 2, 3, 5, 7]).unwrap().as_deref(), Some("1-3,5,7-8"));
+        assert_eq!(
+            select_spec(&[8, 1, 2, 3, 5, 7]).unwrap().as_deref(),
+            Some("1-3,5,7-8")
+        );
         // 10 000 files, one unticked: tiny instead of ~49 000 chars.
         let all_but_one: Vec<usize> = (1..=10_000).filter(|&i| i != 9_999).collect();
-        assert_eq!(select_spec(&all_but_one).unwrap().as_deref(), Some("1-9998,10000"));
+        assert_eq!(
+            select_spec(&all_but_one).unwrap().as_deref(),
+            Some("1-9998,10000")
+        );
         // Thousands of scattered single files cannot fit a command line.
         let scattered: Vec<usize> = (1..=40_000).step_by(2).collect();
         assert!(select_spec(&scattered).is_err());
@@ -1129,7 +1398,10 @@ idx|path/length
         let torrent = live.join("hash.torrent");
         std::fs::write(&torrent, b"d").unwrap();
         let set_mtime = |t: SystemTime| {
-            let file = std::fs::OpenOptions::new().write(true).open(&torrent).unwrap();
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&torrent)
+                .unwrap();
             file.set_modified(t).unwrap();
         };
         // A recently used file keeps its whole dir, even past `max_age` of
@@ -1137,10 +1409,16 @@ idx|path/length
         set_mtime(SystemTime::now() + Duration::from_secs(3600));
         std::thread::sleep(Duration::from_millis(20));
         sweep_stale_temp_dirs(base.path(), Duration::ZERO);
-        assert!(torrent.is_file(), "a recently used .torrent must survive the sweep");
+        assert!(
+            torrent.is_file(),
+            "a recently used .torrent must survive the sweep"
+        );
         // touch() (every job start/resume) is what moves that time forward.
         set_mtime(SystemTime::now() - Duration::from_secs(24 * 3600));
-        let meta = Meta(Arc::new(FetchedTorrent { path: torrent.clone(), _dir: TempDir(live.clone()) }));
+        let meta = Meta(Arc::new(FetchedTorrent {
+            path: torrent.clone(),
+            _dir: TempDir(live.clone()),
+        }));
         let before = SystemTime::now() - Duration::from_secs(1);
         meta.touch();
         assert!(std::fs::metadata(&torrent).unwrap().modified().unwrap() >= before);
@@ -1149,16 +1427,34 @@ idx|path/length
     #[test]
     #[ignore = "needs real aria2c + a torrent; set SNATCH_ARIA2C and SNATCH_TEST_TORRENT"]
     fn show_files_drains_large_listings() {
-        let Ok(aria2c) = std::env::var("SNATCH_ARIA2C") else { return };
-        let Ok(input) = std::env::var("SNATCH_TEST_TORRENT") else { return };
+        let Ok(aria2c) = std::env::var("SNATCH_ARIA2C") else {
+            return;
+        };
+        let Ok(input) = std::env::var("SNATCH_TEST_TORRENT") else {
+            return;
+        };
         let started = std::time::Instant::now();
-        let listing = show_files(Path::new(&aria2c), &input, Duration::from_secs(30), &AtomicBool::new(false)).unwrap();
+        let listing = show_files(
+            Path::new(&aria2c),
+            &input,
+            Duration::from_secs(30),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         // The user's own file is only read.
         assert!(Path::new(&input).is_file());
         // Hundreds of files = far more output than one pipe buffer; the old
         // read-after-exit code deadlocked here until the timeout.
-        assert!(listing.info.files.len() > 100, "files: {}", listing.info.files.len());
-        assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
+        assert!(
+            listing.info.files.len() > 100,
+            "files: {}",
+            listing.info.files.len()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }
 
@@ -1167,7 +1463,11 @@ mod tree_tests {
     use super::*;
 
     fn file(index: usize, path: &str, size: u64) -> FileEntry {
-        FileEntry { index, path: path.into(), size }
+        FileEntry {
+            index,
+            path: path.into(),
+            size,
+        }
     }
 
     #[test]
@@ -1206,7 +1506,10 @@ mod tree_tests {
         // "dup.txt" and "dup.txt (2)" are both present and selectable, and
         // the file named "data" gets disambiguated from a dir of that name.
         let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
-        assert!(names.contains(&"dup.txt") && names.contains(&"dup.txt (2)"), "{names:?}");
+        assert!(
+            names.contains(&"dup.txt") && names.contains(&"dup.txt (2)"),
+            "{names:?}"
+        );
         let root_leaves = tree.iter().filter(|n| n.file.is_some()).count();
         assert_eq!(root_leaves, 3);
         // Both files of the renamed folder share ONE renamed folder.
@@ -1229,7 +1532,11 @@ mod tree_tests {
                 let files = [file(1, &path, 7), file(2, "top.txt", 1)];
                 let tree = build_torrent_tree(&files);
                 fn depth(nodes: &[TorrNode]) -> usize {
-                    nodes.iter().map(|n| 1 + depth(&n.children)).max().unwrap_or(0)
+                    nodes
+                        .iter()
+                        .map(|n| 1 + depth(&n.children))
+                        .max()
+                        .unwrap_or(0)
                 }
                 let mut selected = vec![true; files.len()];
                 assert_eq!(tree[0].selected_count(&selected), (1, 1));
@@ -1248,7 +1555,11 @@ mod tree_tests {
         let started = std::time::Instant::now();
         let tree = build_torrent_tree(&files);
         // Quadratic re-probing took ~5 s for 8 000 names even optimised.
-        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
         assert_eq!(tree.len(), 20_000);
         assert!(tree.iter().any(|n| n.name == "a.bin (20000)"));
     }

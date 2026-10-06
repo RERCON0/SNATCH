@@ -1,6 +1,6 @@
 [package]
 name = "snatch-rs"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2021"
 build = "build.rs"
 description = "SNATCH — native GUI download app (yt-dlp + aria2c) for the terminal-shy"
@@ -27,7 +27,7 @@ fs4 = "1.1"
 # (see Cargo.lock) - declaring it directly just lets our own code call it too,
 # for cropping/resizing the bundled app icon into egui::IconData.
 image = { version = "0.25", default-features = false, features = ["png"] }
-indicatif = "0.17"
+indicatif = "0.18"
 inquire = "0.9"
 # default-features off: drops the HTTP/2 stack (h2); charset/encoding_rs is not
 # needed either - every endpoint we call is UTF-8 (JSON API, XML with

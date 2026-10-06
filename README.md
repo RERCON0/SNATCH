@@ -1,20 +1,36 @@
-# SNATCH
+<p align="center">
+  <img src="icons/icon-app.png" width="112" alt="Логотип SNATCH">
+</p>
 
-Ultimate-комбайн для скачивания: **yt-dlp + aria2c** в одном инструменте. Две формы — терминальный CLI (`snatch`) и оконное GUI-приложение (`snatch-app`), обе на Rust, без Python и общей зависимости на интерпретатор.
+<h1 align="center">SNATCH</h1>
 
-Вставляете ссылку — SNATCH сам определяет, чем её качать (yt-dlp для видео и стримов, aria2c для прямых ссылок, torrent и magnet), спрашивает формат и папку, показывает прогресс и запоминает историю.
+<p align="center">
+  <strong>Видео, музыка, файлы и торренты — по одной ссылке.<br>yt-dlp + aria2c, нативное окно и удобный терминал.</strong>
+</p>
 
-```
- ____    __  __  ______  ______  ____     __  __
-/\  _`\ /\ \/\ \/\  _  \/\__  _\/\  _`\  /\ \/\ \
-\ \,\L\_\ \ `\\ \ \ \L\ \/_/\ \/\ \ \/\_\\ \ \_\ \
- \/_\__ \\ \ , ` \ \  __ \ \ \ \ \ \ \/_/_\ \  _  \
-   /\ \L\ \ \ \`\ \ \ \/\ \ \ \ \ \ \ \L\ \\ \ \ \ \
-   \ `\____\ \_\ \_\ \_\ \_\ \ \_\ \ \____/ \ \_\ \_\
-    \/_____/\/_/\/_/\/_/\/_/  \/_/  \/___/   \/_/\/_/
-                     yt-dlp + aria2c ultimate combine
-                             by rercon prod. | https://t.me/rercon
-```
+<p align="center">
+  <a href="https://github.com/RERCON0/SNATCH/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/RERCON0/SNATCH/actions/workflows/ci.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/RERCON0/SNATCH/actions/workflows/security.yml"><img alt="Security" src="https://github.com/RERCON0/SNATCH/actions/workflows/security.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/RERCON0/SNATCH/actions/workflows/dependency-watch.yml"><img alt="Dependency watch" src="https://github.com/RERCON0/SNATCH/actions/workflows/dependency-watch.yml/badge.svg?branch=main"></a>
+  <a href="https://github.com/RERCON0/SNATCH/releases/latest"><img alt="Последний релиз" src="https://img.shields.io/github/v/release/RERCON0/SNATCH?color=8b5cf6"></a>
+  <a href="https://github.com/RERCON0/SNATCH/releases"><img alt="Загрузки" src="https://img.shields.io/github/downloads/RERCON0/SNATCH/total?color=0ea5e9"></a>
+  <a href="LICENSE"><img alt="GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-2f855a"></a>
+  <a href="https://t.me/rercon"><img alt="Telegram" src="https://img.shields.io/badge/Telegram-@rercon-26A5E4?logo=telegram&logoColor=white"></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/RERCON0/SNATCH/releases/latest"><strong>Скачать для Windows</strong></a> ·
+  <a href="#использование">Быстрый старт</a> ·
+  <a href="#подпись-и-проверка-релиза">Проверить подпись</a> ·
+  <a href="docs/RELEASING.md">Сборка релиза</a> ·
+  <a href="SECURITY.md">Безопасность</a>
+</p>
+
+Вставьте ссылку, выберите качество и папку — SNATCH сам подберёт загрузчик,
+покажет прогресс и запомнит историю. Видео и стримы скачивает yt-dlp;
+прямые ссылки, torrent и magnet — aria2c. CLI `snatch` и GUI `snatch-app`
+используют один движок и общие настройки. Сам SNATCH написан на Rust;
+Python для запуска готовых приложений не требуется.
 
 ![SNATCH — окно GUI](docs/screenshot.png)
 
@@ -43,7 +59,7 @@ Ultimate-комбайн для скачивания: **yt-dlp + aria2c** в од
 
 - Для YouTube/сайтов/torrent: хотя бы один из загрузчиков **yt-dlp** и/или **aria2c** (можно поставить вручную или через встроенную автоустановку)
 - **ffmpeg** — ставится автоустановкой; нужен для склейки видео и звука в высоком качестве, mp3 (`audio`) и субтитров. Если ставить вручную — положите `ffmpeg.exe` в `%LOCALAPPDATA%\snatch\bin` или в `PATH`
-- Для сборки из исходников: **Rust** (stable, `cargo build --release`)
+- Для сборки из исходников: **Rust 1.99.0** (закреплён в [rust-toolchain.toml](rust-toolchain.toml)) и MSVC Build Tools для Windows
 
 ## Установка
 
@@ -67,9 +83,9 @@ SNATCH находит binaries в таком порядке: своя автоу
 Соберите из исходников:
 
 ```bash
-cargo build --release
+cargo build --locked --release
 # -> target/release/snatch.exe     (CLI)
-# -> target/release/snatch-app.exe (GUI, ~4.6 МБ, без терминала)
+# -> target/release/snatch-app.exe (GUI, без терминала)
 ```
 
 Готовые exe можно положить куда угодно и добавить в `PATH` — установка не нужна.
@@ -179,11 +195,53 @@ snatch "https://youtube.com/watch?v=..." -y -o "D:\Music" -f audio --cookies-fro
 
 Telegram-канал автора: https://t.me/rercon
 
+## Подпись и проверка релиза
+
+Новый процесс сборки, начиная с исходников **0.5.3**, создаёт ZIP с обоими EXE,
+лицензиями и подписанным манифестом **Ed25519**. Манифест связывает хеши файлов
+с точным Git-коммитом, деревом исходников, Cargo.lock и версией компилятора.
+Подпись проверяется до распаковки; изменённые, лишние и повторяющиеся файлы
+отклоняются. Архивы старых релизов не имеют этой подписи.
+
+Получите доверенный [публичный ключ](release/public-key.pem) и проверяющий
+[скрипт](scripts/release.py) из репозитория. В корне checkout выполните:
+
+```powershell
+python scripts/release.py verify .\snatch-windows-x64.zip
+```
+
+Проверке нужны **Python 3.13+** и **OpenSSL 3** (в Windows есть в Git for Windows).
+Встроенный в ZIP ключ сравнивается с внешним доверенным ключом; замена обоих
+файлов внутри архива не делает поддельную подпись действительной.
+Отпечаток публичного ключа SHA-256 (DER SubjectPublicKeyInfo):
+
+```text
+22f55367a7a9bf635237c2da1e50e4c89338733d7fea5ab616615d75fc620afc
+```
+
+Это подпись релизного пакета. Authenticode-подпись EXE этим процессом не заявляется.
+Подробности — в [инструкции сборки](docs/RELEASING.md).
+
+## Проверки CI
+
+| Проверка | Что контролирует |
+|---|---|
+| [CI](https://github.com/RERCON0/SNATCH/actions/workflows/ci.yml) | Windows и Linux: форматирование, Clippy без предупреждений, тесты CLI/GUI/движка и проверки подмены ZIP |
+| Windows release build | Архитектура x64, правильные CLI/GUI-подсистемы, ASLR, DEP и отсутствие зависимости от VC++ Redistributable |
+| [Security](https://github.com/RERCON0/SNATCH/actions/workflows/security.yml) | RustSec ежедневно и при изменениях; уязвимости, unsound и отозванные версии блокируют проверку; секреты ищутся во всей Git-истории |
+| [Dependency watch](https://github.com/RERCON0/SNATCH/actions/workflows/dependency-watch.yml) | Новая стабильная версия Rust и изменение закреплённого релиза aria2 требуют ревью |
+| [Dependabot](.github/dependabot.yml) | Еженедельные предложения обновить Cargo.lock и закреплённые Actions |
+
+Все Actions закреплены полными SHA. CI публикует **неподписанные кандидаты**
+для диагностики; релизная подпись создаётся отдельно, приватный ключ хранится
+вне Git и не передаётся runner'ам. Предупреждения о неподдерживаемых зависимостях
+остаются видны: состояние `ttf-parser` и план обновления описаны в [SECURITY.md](SECURITY.md).
+
 ## Разработка
 
 ```bash
-cargo build          # оба бинарника в target/debug
-cargo test            # вся тестовая база (валидация ссылок, сборка команд, конфиг, интерактивный флоу)
+cargo build --locked  # оба бинарника в target/debug
+cargo test --locked   # вся тестовая база (валидация ссылок, сборка команд, конфиг, интерактивный флоу)
 ```
 
 Тесты покрывают валидацию ссылок, сборку команд, обнаружение binaries, устойчивость конфига к битым данным и интерактивный CLI-флоу (предложение куки при auth-сбое, отказ/повтор, порядок валидации перед обнаружением загрузчиков).

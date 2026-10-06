@@ -79,7 +79,10 @@ mod imp {
                     let error = std::io::Error::last_os_error();
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(std::io::Error::new(error.kind(), format!("CreateJobObjectW: {error}")));
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("CreateJobObjectW: {error}"),
+                    ));
                 }
                 let mut info: ExtendedLimitInformation = std::mem::zeroed();
                 info.basic.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
@@ -89,15 +92,22 @@ mod imp {
                     &info as *const _ as *const c_void,
                     std::mem::size_of::<ExtendedLimitInformation>() as u32,
                 );
-                let failed = if ok == 0 { Some("SetInformationJobObject") }
-                    else if AssignProcessToJobObject(handle, process) == 0 { Some("AssignProcessToJobObject") }
-                    else { None };
+                let failed = if ok == 0 {
+                    Some("SetInformationJobObject")
+                } else if AssignProcessToJobObject(handle, process) == 0 {
+                    Some("AssignProcessToJobObject")
+                } else {
+                    None
+                };
                 if let Some(operation) = failed {
                     let error = std::io::Error::last_os_error();
                     CloseHandle(handle);
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err(std::io::Error::new(error.kind(), format!("{operation}: {error}")));
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!("{operation}: {error}"),
+                    ));
                 }
                 Ok(Some(Self { handle }))
             }
@@ -127,7 +137,9 @@ mod imp {
     pub struct Job;
 
     impl Job {
-        pub fn create_and_assign(_child: &mut std::process::Child) -> std::io::Result<Option<Self>> {
+        pub fn create_and_assign(
+            _child: &mut std::process::Child,
+        ) -> std::io::Result<Option<Self>> {
             Ok(None)
         }
         pub fn terminate(&self) {}
@@ -138,9 +150,10 @@ pub use imp::Job;
 
 /// Assign before the child executes any user code: a fast loader must not
 /// spawn descendants (or exit) in the CreateProcess -> AssignProcess window.
-pub fn spawn(command: &mut std::process::Command, hidden: bool)
-    -> std::io::Result<(std::process::Child, Option<Job>)>
-{
+pub fn spawn(
+    command: &mut std::process::Command,
+    hidden: bool,
+) -> std::io::Result<(std::process::Child, Option<Job>)> {
     #[cfg(windows)]
     {
         use std::os::windows::{io::AsRawHandle, process::CommandExt};
@@ -157,10 +170,14 @@ pub fn spawn(command: &mut std::process::Command, hidden: bool)
         let job = Job::create_and_assign(&mut child)?;
         let status = unsafe { NtResumeProcess(child.as_raw_handle()) };
         if status < 0 {
-            let error = std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
+            let error =
+                std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32);
             let _ = child.kill();
             let _ = child.wait();
-            return Err(std::io::Error::new(error.kind(), format!("NtResumeProcess: {error}")));
+            return Err(std::io::Error::new(
+                error.kind(),
+                format!("NtResumeProcess: {error}"),
+            ));
         }
         Ok((child, job))
     }
@@ -178,20 +195,28 @@ mod tests {
 
     #[test]
     fn closing_job_reaps_child_without_an_explicit_kill() {
-        let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+        let system = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| r"C:\Windows".into());
         let cwd = std::env::current_exe().unwrap();
         let mut command = Command::new(system.join("System32/PING.EXE"));
-        command.args(["-n", "30", "127.0.0.1"])
+        command
+            .args(["-n", "30", "127.0.0.1"])
             .current_dir(cwd.parent().unwrap())
-            .stdout(Stdio::null()).stderr(Stdio::null());
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
         let (mut child, job) = spawn(&mut command, true).unwrap();
         let job = job.unwrap();
         drop(job);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
-            if child.try_wait().unwrap().is_some() { break; }
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
             if std::time::Instant::now() > deadline {
-                child.kill().ok(); child.wait().ok(); panic!("job close did not reap child");
+                child.kill().ok();
+                child.wait().ok();
+                panic!("job close did not reap child");
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
@@ -199,14 +224,26 @@ mod tests {
 
     #[test]
     fn assignment_failure_reports_the_win32_operation() {
-        let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+        let system = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| r"C:\Windows".into());
         let cwd = std::env::current_exe().unwrap();
-        let mut child = Command::new(system.join("System32/cmd.exe")).args(["/C", "exit", "0"])
+        let mut child = Command::new(system.join("System32/cmd.exe"))
+            .args(["/C", "exit", "0"])
             .current_dir(cwd.parent().unwrap())
-            .stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         child.wait().unwrap();
-        let error = match Job::create_and_assign(&mut child) { Err(e) => e, Ok(_) => panic!("exited process was assigned") };
-        assert!(error.to_string().contains("AssignProcessToJobObject"), "{error}");
+        let error = match Job::create_and_assign(&mut child) {
+            Err(e) => e,
+            Ok(_) => panic!("exited process was assigned"),
+        };
+        assert!(
+            error.to_string().contains("AssignProcessToJobObject"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -217,10 +254,19 @@ mod tests {
         let cwd = std::env::current_exe().unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut command = Command::new(&cwd);
-        command.args(["--exact", "job_object::tests::pipe_tree_fixture", "--nocapture"])
-            .env("SNATCH_JOB_PIPE_FIXTURE", listener.local_addr().unwrap().to_string())
+        command
+            .args([
+                "--exact",
+                "job_object::tests::pipe_tree_fixture",
+                "--nocapture",
+            ])
+            .env(
+                "SNATCH_JOB_PIPE_FIXTURE",
+                listener.local_addr().unwrap().to_string(),
+            )
             .current_dir(cwd.parent().unwrap())
-            .stdout(Stdio::piped()).stderr(Stdio::piped());
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let (mut child, job) = spawn(&mut command, true).unwrap();
         let job = job.unwrap();
         // The fixture cannot spawn its grandchild until assignment completes.
@@ -230,25 +276,38 @@ mod tests {
         let mut stderr = child.stderr.take().unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         let out = std::thread::spawn(move || {
-            stdout.read_to_end(&mut Vec::new()).unwrap(); tx.send(()).unwrap();
+            stdout.read_to_end(&mut Vec::new()).unwrap();
+            tx.send(()).unwrap();
         });
         let err = std::thread::spawn(move || stderr.read_to_end(&mut Vec::new()).unwrap());
         child.wait().unwrap();
-        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err(), "grandchild should still hold stdout");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "grandchild should still hold stdout"
+        );
         job.terminate();
         rx.recv_timeout(Duration::from_secs(3)).unwrap();
-        out.join().unwrap(); err.join().unwrap();
+        out.join().unwrap();
+        err.join().unwrap();
     }
 
     #[test]
     fn pipe_tree_fixture() {
         use std::io::Read;
-        let Ok(address) = std::env::var("SNATCH_JOB_PIPE_FIXTURE") else { return };
+        let Ok(address) = std::env::var("SNATCH_JOB_PIPE_FIXTURE") else {
+            return;
+        };
         let mut ready = std::net::TcpStream::connect(address).unwrap();
         ready.read_exact(&mut [0u8; 1]).unwrap();
-        let system = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| r"C:\Windows".into());
+        let system = std::env::var_os("SystemRoot")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| r"C:\Windows".into());
         let child = Command::new(system.join("System32/PING.EXE"))
-            .args(["-n", "30", "127.0.0.1"]).stdout(Stdio::inherit()).stderr(Stdio::inherit()).spawn().unwrap();
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
         // std::process::Child does not kill on Drop: the grandchild keeps
         // both inherited pipe handles after this test process exits.
         drop(child);

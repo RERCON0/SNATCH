@@ -13,15 +13,15 @@ use eframe::egui;
 
 use snatch_rs::config::{home_dir, Config};
 use snatch_rs::engines::{
-    self, detect_engine, is_unc_path, looks_like_auth, parse_progress, preflight_warning, validate_url, Job,
-    COOKIES_BROWSERS, FORMATS,
+    self, detect_engine, is_unc_path, looks_like_auth, parse_progress, preflight_warning,
+    validate_url, Job, COOKIES_BROWSERS, FORMATS,
 };
 use snatch_rs::setup::{
     install_aria2_with, install_deno_with, install_ffmpeg_with, install_yt_dlp_with, SetupProgress,
 };
 use snatch_rs::tools::{bootstrap_dir, Toolchain};
-use snatch_rs::{job_object, torrent};
 use snatch_rs::ui::{clip, try_read_dirs_limited};
+use snatch_rs::{job_object, torrent};
 use snatch_rs::{BANNER, TELEGRAM_URL};
 
 const APP_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " — by rercon prod.");
@@ -76,7 +76,10 @@ enum Msg {
     /// File list resolved for a torrent job (metadata fetched off-thread).
     /// The tree is built on the listing thread: a huge/hostile torrent must
     /// not stall (or overflow) the UI thread.
-    TorrentFiles(u64, Result<(torrent::Listing, Vec<torrent::TorrNode>), String>),
+    TorrentFiles(
+        u64,
+        Result<(torrent::Listing, Vec<torrent::TorrNode>), String>,
+    ),
     DirListed(PathBuf, PathBuf, Result<(Vec<PathBuf>, bool), String>),
     TorrentMeta(u64, String),
     TorrentName(u64, String),
@@ -197,7 +200,10 @@ struct PickActions {
 
 /// The pick modal itself (list or error state). Free of `SnatchApp` so its
 /// geometry can be tested; returns the frame's actions and the window rect.
-fn torrent_pick_window(ctx: &egui::Context, pick: &mut TorrentPick) -> (PickActions, Option<egui::Rect>) {
+fn torrent_pick_window(
+    ctx: &egui::Context,
+    pick: &mut TorrentPick,
+) -> (PickActions, Option<egui::Rect>) {
     let mut act = PickActions::default();
     // Never wider than the window: at the default 460px a fixed 560px dialog
     // pushed the folder toggles/checkboxes off-screen. Frame margins + a gap.
@@ -311,7 +317,15 @@ fn torrent_tree_row(
     let (is_dir, name, size, expanded, leaf, sel, total) = {
         let node = torrent::node_at(tree, path);
         let (sel, total) = node.selection;
-        (node.file.is_none(), node.name.clone(), node.size, node.expanded, node.file, sel, total)
+        (
+            node.file.is_none(),
+            node.name.clone(),
+            node.size,
+            node.expanded,
+            node.file,
+            sel,
+            total,
+        )
     };
     let layout = egui::Layout::left_to_right(egui::Align::Center);
     ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), row_h), layout, |ui| {
@@ -320,11 +334,17 @@ fn torrent_tree_row(
         // the row past it.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
         ui.add_space((*depth).min(6) as f32 * 14.0);
-        if *depth > 6 { ui.label("…"); }
+        if *depth > 6 {
+            ui.label("…");
+        }
         if is_dir {
             let marker = if expanded { "▼" } else { "▶" };
             if ui
-                .add(egui::Button::new(marker).frame(false).min_size(egui::vec2(18.0, 18.0)))
+                .add(
+                    egui::Button::new(marker)
+                        .frame(false)
+                        .min_size(egui::vec2(18.0, 18.0)),
+                )
                 .clicked()
             {
                 torrent::node_at_mut(tree, path).expanded = !expanded;
@@ -334,22 +354,35 @@ fn torrent_tree_row(
             // click ticks the whole folder.
             let partial = sel > 0 && sel < total;
             let mut all = total > 0 && sel == total;
-            if ui.add(egui::Checkbox::new(&mut all, "").indeterminate(partial)).changed() {
+            if ui
+                .add(egui::Checkbox::new(&mut all, "").indeterminate(partial))
+                .changed()
+            {
                 torrent::node_at_mut(tree, path).set_all(selected, all);
                 selection_changed = true;
             }
             // Size and the partial count lead: a long name is what gets
             // truncated at the dialog's edge, never them.
-            let count = if partial { format!("{sel}/{total} · ") } else { String::new() };
-            ui.label(format!("{} · {count}{}", torrent::human_size(size), clip(&name, 120)));
+            let count = if partial {
+                format!("{sel}/{total} · ")
+            } else {
+                String::new()
+            };
+            ui.label(format!(
+                "{} · {count}{}",
+                torrent::human_size(size),
+                clip(&name, 120)
+            ));
         } else {
             ui.add_space(18.0);
             if let Some(fi) = leaf {
                 if fi < selected.len() {
-                    selection_changed |= ui.checkbox(
-                        &mut selected[fi],
-                        format!("{} · {}", torrent::human_size(size), clip(&name, 120)),
-                    ).changed();
+                    selection_changed |= ui
+                        .checkbox(
+                            &mut selected[fi],
+                            format!("{} · {}", torrent::human_size(size), clip(&name, 120)),
+                        )
+                        .changed();
                 }
             }
         }
@@ -358,7 +391,12 @@ fn torrent_tree_row(
 }
 
 /// The pick list itself: flattened rows + a virtualized scroll area.
-fn torrent_tree_rows(ui: &mut egui::Ui, tree: &mut [torrent::TorrNode], selected: &mut [bool], view: &mut torrent::TreeView) {
+fn torrent_tree_rows(
+    ui: &mut egui::Ui,
+    tree: &mut [torrent::TorrNode],
+    selected: &mut [bool],
+    view: &mut torrent::TreeView,
+) {
     view.prepare(tree, selected);
     let row_h = torrent_row_height(ui);
     egui::ScrollArea::vertical()
@@ -387,8 +425,10 @@ struct DirBrowser {
 
 fn torrent_console_line(id: u64, line: &str) -> Option<Msg> {
     let line = line.trim();
-    if line.is_empty() || line.contains("Download Progress Summary as of")
-        || line.chars().all(|c| matches!(c, '=' | '-')) {
+    if line.is_empty()
+        || line.contains("Download Progress Summary as of")
+        || line.chars().all(|c| matches!(c, '=' | '-'))
+    {
         return None;
     }
     if line.starts_with("FILE:") && line.contains("[MEMORY][METADATA]") {
@@ -406,16 +446,23 @@ fn torrent_console_line(id: u64, line: &str) -> Option<Msg> {
     }
     let lower = line.to_ascii_lowercase();
     if ["error", "warning", "failed", "aborted", "exception"]
-        .iter().any(|hint| lower.contains(hint)) {
+        .iter()
+        .any(|hint| lower.contains(hint))
+    {
         return Some(Msg::ErrLine(id, line.to_string()));
     }
     None
 }
 
 fn local_torrent_path(path: &Path) -> Result<String, String> {
-    let supported = path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
-        ["torrent", "metalink", "meta4"].iter().any(|allowed| ext.eq_ignore_ascii_case(allowed))
-    });
+    let supported = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            ["torrent", "metalink", "meta4"]
+                .iter()
+                .any(|allowed| ext.eq_ignore_ascii_case(allowed))
+        });
     if !supported {
         return Err("Выберите локальный .torrent, .metalink или .meta4 файл.".into());
     }
@@ -543,27 +590,43 @@ fn setup_theme(ctx: &egui::Context, dark: bool) {
     // Buttons and title bars need a higher baseline than the body text. Keep
     // identical font metrics; only shift painted glyphs so borders and input
     // rows remain aligned while popup captions clear the separator below.
-    fonts.font_data.insert("mono-button".to_owned(),
+    fonts.font_data.insert(
+        "mono-button".to_owned(),
         egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
-            y_offset_factor: 0.0, ..Default::default()
-        }));
-    fonts.families.insert(egui::FontFamily::Name("button".into()), vec!["mono-button".to_owned()]);
+            y_offset_factor: 0.0,
+            ..Default::default()
+        }),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("button".into()),
+        vec!["mono-button".to_owned()],
+    );
     // TextEdit's inner text: the boxed controls' no-nudge rendering. Body's
     // +0.15em glyph shift (below) reads fine in free-standing labels, but
     // inside an input's tight margins it sits visibly below the box centre;
     // boxed controls should also share one baseline with each other.
-    fonts.font_data.insert("mono-field".to_owned(),
+    fonts.font_data.insert(
+        "mono-field".to_owned(),
         egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
-            y_offset_factor: 0.0, ..Default::default()
-        }));
-    fonts.families.insert(egui::FontFamily::Name("field".into()), vec!["mono-field".to_owned()]);
-    fonts.font_data.insert("mono-title".to_owned(),
+            y_offset_factor: 0.0,
+            ..Default::default()
+        }),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("field".into()),
+        vec!["mono-field".to_owned()],
+    );
+    fonts.font_data.insert(
+        "mono-title".to_owned(),
         egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
-            y_offset_factor: -0.08, ..Default::default()
-        }));
-    fonts
-        .families
-        .insert(egui::FontFamily::Name("title".into()), vec!["mono-title".to_owned()]);
+            y_offset_factor: -0.08,
+            ..Default::default()
+        }),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("title".into()),
+        vec!["mono-title".to_owned()],
+    );
     ctx.set_fonts(fonts);
     // Visuals must go into BOTH style buckets too (see the all_styles_mut
     // comment below): ctx.set_visuals writes only the currently active
@@ -616,10 +679,22 @@ fn setup_theme(ctx: &egui::Context, dark: bool) {
         // HTML twin: mockup sizes are input/select/checkbox 13, .btn 12.5,
         // label.tag/.hint 12, footer/banner 11.
         let mut ts = style.text_styles.clone();
-        ts.insert(egui::TextStyle::Body, egui::FontId::new(13.0, egui::FontFamily::Proportional));
-        ts.insert(egui::TextStyle::Button, egui::FontId::new(12.5, egui::FontFamily::Name("button".into())));
-        ts.insert(egui::TextStyle::Small, egui::FontId::new(13.0, egui::FontFamily::Proportional));
-        ts.insert(egui::TextStyle::Monospace, egui::FontId::new(13.0, egui::FontFamily::Monospace));
+        ts.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(12.5, egui::FontFamily::Name("button".into())),
+        );
+        ts.insert(
+            egui::TextStyle::Small,
+            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::new(13.0, egui::FontFamily::Monospace),
+        );
         style.text_styles = ts;
     });
 }
@@ -634,25 +709,41 @@ fn terminal_visuals(dark: bool) -> egui::Visuals {
     let rgb = |r: u8, g: u8, b: u8| egui::Color32::from_rgb(r, g, b);
     let (bg, bg_lift, field, line, line_bright, text, text_dim, accent, warn, err) = if dark {
         (
-            rgb(0x0b, 0x0b, 0x0e), rgb(0x0e, 0x0e, 0x11), rgb(0x11, 0x11, 0x14),
-            rgb(0x1e, 0x1e, 0x24), rgb(0x33, 0x33, 0x3c),
-            rgb(0xd6, 0xd6, 0xda), rgb(0x83, 0x83, 0x8c),
-            rgb(0x59, 0xd6, 0x8c), rgb(0xe0, 0xb3, 0x4d), rgb(0xe0, 0x65, 0x5c),
+            rgb(0x0b, 0x0b, 0x0e),
+            rgb(0x0e, 0x0e, 0x11),
+            rgb(0x11, 0x11, 0x14),
+            rgb(0x1e, 0x1e, 0x24),
+            rgb(0x33, 0x33, 0x3c),
+            rgb(0xd6, 0xd6, 0xda),
+            rgb(0x83, 0x83, 0x8c),
+            rgb(0x59, 0xd6, 0x8c),
+            rgb(0xe0, 0xb3, 0x4d),
+            rgb(0xe0, 0x65, 0x5c),
         )
     } else {
         (
-            rgb(0xf3, 0xf3, 0xf1), rgb(0xff, 0xff, 0xff), rgb(0xfb, 0xfb, 0xfa),
-            rgb(0xda, 0xda, 0xd6), rgb(0xb5, 0xb5, 0xb0),
-            rgb(0x1c, 0x1c, 0x1e), rgb(0x5c, 0x5c, 0x62),
-            rgb(0x1a, 0x7f, 0x37), rgb(0x9a, 0x67, 0x00), rgb(0xcf, 0x22, 0x2e),
+            rgb(0xf3, 0xf3, 0xf1),
+            rgb(0xff, 0xff, 0xff),
+            rgb(0xfb, 0xfb, 0xfa),
+            rgb(0xda, 0xda, 0xd6),
+            rgb(0xb5, 0xb5, 0xb0),
+            rgb(0x1c, 0x1c, 0x1e),
+            rgb(0x5c, 0x5c, 0x62),
+            rgb(0x1a, 0x7f, 0x37),
+            rgb(0x9a, 0x67, 0x00),
+            rgb(0xcf, 0x22, 0x2e),
         )
     };
 
-    let mut v = if dark { egui::Visuals::dark() } else { egui::Visuals::light() };
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
     v.window_rounding = egui::Rounding::ZERO;
     v.menu_rounding = egui::Rounding::ZERO;
     v.window_fill = bg_lift;
-    v.window_stroke = egui::Stroke::new(1.0, line);
+    v.window_stroke = egui::Stroke::new(1.0_f32, line);
     v.window_shadow = egui::Shadow::NONE;
     v.popup_shadow = egui::Shadow::NONE;
     v.panel_fill = bg;
@@ -665,8 +756,9 @@ fn terminal_visuals(dark: bool) -> egui::Visuals {
     // Used for the text-selection highlight inside a TextEdit, and (via
     // interact_selectable) as a focus-outline color - not for "this choice
     // is picked" chrome, that's custom-drawn now (see `engine_choice`).
-    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 45);
-    v.selection.stroke = egui::Stroke::new(1.0, accent);
+    v.selection.bg_fill =
+        egui::Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 45);
+    v.selection.stroke = egui::Stroke::new(1.0_f32, accent);
 
     for w in [
         &mut v.widgets.noninteractive,
@@ -681,26 +773,26 @@ fn terminal_visuals(dark: bool) -> egui::Visuals {
         w.bg_fill = field;
     }
     v.widgets.noninteractive.weak_bg_fill = bg;
-    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, line);
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_dim);
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, line);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_dim);
 
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
-    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, line);
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_dim);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, line);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_dim);
 
     v.widgets.hovered.weak_bg_fill = egui::Color32::TRANSPARENT;
-    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, line_bright);
-    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text);
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, line_bright);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text);
     v.widgets.hovered.expansion = 0.0;
 
     v.widgets.active.weak_bg_fill = field;
-    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, accent);
-    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, text);
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text);
     v.widgets.active.expansion = 0.0;
 
     v.widgets.open.weak_bg_fill = egui::Color32::TRANSPARENT;
-    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, line_bright);
-    v.widgets.open.fg_stroke = egui::Stroke::new(1.0, text);
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, line_bright);
+    v.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, text);
 
     v
 }
@@ -713,7 +805,7 @@ fn terminal_visuals(dark: bool) -> egui::Visuals {
 /// a `Ui` to read visuals from itself.
 fn accent_button(accent: egui::Color32, text: impl Into<String>) -> egui::Button<'static> {
     egui::Button::new(egui::RichText::new(text.into()).color(accent))
-        .stroke(egui::Stroke::new(1.0, accent))
+        .stroke(egui::Stroke::new(1.0_f32, accent))
         .fill(egui::Color32::TRANSPARENT)
 }
 
@@ -762,7 +854,8 @@ fn slow_spinner(ui: &mut egui::Ui) {
         })
         .collect();
     let color = ui.visuals().strong_text_color();
-    ui.painter().add(egui::Shape::line(points, egui::Stroke::new(3.0, color)));
+    ui.painter()
+        .add(egui::Shape::line(points, egui::Stroke::new(3.0_f32, color)));
 }
 
 /// A fixed-width bar slot and two fixed-height buttons. `allocate_ui` cannot
@@ -786,17 +879,27 @@ fn job_controls(
             let gap = ui.spacing().item_spacing.x;
             let bar_w = (ui.available_width() - first.1 - second.1 - 2.0 * gap).max(40.0);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(bar_w, HEIGHT), egui::Sense::hover());
-            let mut bar_ui = ui.new_child(egui::UiBuilder::new()
-                .max_rect(rect)
-                .layout(egui::Layout::left_to_right(egui::Align::Center)));
+            let mut bar_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            );
             if let Some(p) = progress {
-                bar_ui.add(egui::ProgressBar::new(p)
-                    .rounding(egui::Rounding::ZERO).fill(fill)
-                    .desired_width(bar_w).desired_height(HEIGHT));
+                bar_ui.add(
+                    egui::ProgressBar::new(p)
+                        .rounding(egui::Rounding::ZERO)
+                        .fill(fill)
+                        .desired_width(bar_w)
+                        .desired_height(HEIGHT),
+                );
             } else if paused {
-                bar_ui.add(egui::ProgressBar::new(0.0)
-                    .rounding(egui::Rounding::ZERO).fill(fill)
-                    .desired_width(bar_w).desired_height(HEIGHT));
+                bar_ui.add(
+                    egui::ProgressBar::new(0.0)
+                        .rounding(egui::Rounding::ZERO)
+                        .fill(fill)
+                        .desired_width(bar_w)
+                        .desired_height(HEIGHT),
+                );
             } else {
                 bar_ui.horizontal(|ui| {
                     slow_spinner(ui);
@@ -804,14 +907,22 @@ fn job_controls(
                 });
             }
             if paused {
-                ui.painter().rect_stroke(rect, egui::Rounding::ZERO, egui::Stroke::new(1.0, fill));
+                ui.painter().rect_stroke(
+                    rect,
+                    egui::Rounding::ZERO,
+                    egui::Stroke::new(1.0_f32, fill),
+                );
             }
             (
-                ui.add_sized([first.1, HEIGHT], egui::Button::new(first.0)).clicked(),
-                ui.add_sized([second.1, HEIGHT], egui::Button::new(second.0)).clicked(),
+                ui.add_sized([first.1, HEIGHT], egui::Button::new(first.0))
+                    .clicked(),
+                ui.add_sized([second.1, HEIGHT], egui::Button::new(second.0))
+                    .clicked(),
             )
-        }).inner
-    }).inner
+        })
+        .inner
+    })
+    .inner
 }
 
 /// Flat "● label" / "○ label" choice, no box at all (not radio_value's
@@ -830,7 +941,11 @@ fn engine_choice(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respon
     // (Button accepts it via WidgetText) can.
     // Inactive dot is dimmer than its label in the mockup
     // (`::before{color:--text-mute}` vs `span{color:--text-dim}`).
-    let dot_color = if selected { accent } else { ui.visuals().weak_text_color() };
+    let dot_color = if selected {
+        accent
+    } else {
+        ui.visuals().weak_text_color()
+    };
     let mut job = egui::text::LayoutJob::default();
     job.append(
         &format!("{dot} "),
@@ -869,7 +984,11 @@ fn engine_choice(ui: &mut egui::Ui, label: &str, selected: bool) -> egui::Respon
 /// exactly the "old architecture wearing new colors" complaint.
 fn tag_label(ui: &mut egui::Ui, text: &str) {
     // mockup's label.tag is 12px, a step under the fields it captions
-    ui.label(egui::RichText::new(format!("› {text}")).color(ui.visuals().weak_text_color()).size(12.0));
+    ui.label(
+        egui::RichText::new(format!("› {text}"))
+            .color(ui.visuals().weak_text_color())
+            .size(12.0),
+    );
 }
 
 /// `egui::Window::new(title)` renders the title with `TextStyle::Heading`
@@ -882,19 +1001,29 @@ fn window_title(text: &str) -> egui::RichText {
     // 15pt made the title taller than the title bar's own line box, so the
     // glyphs rode on top of the window's top stroke; 13 sits inside it. The
     // "title" family is the un-tweaked face (see setup_theme).
-    egui::RichText::new(text).font(egui::FontId::new(13.0, egui::FontFamily::Name("title".into())))
+    egui::RichText::new(text).font(egui::FontId::new(
+        13.0,
+        egui::FontFamily::Name("title".into()),
+    ))
 }
 
 /// Input-field text: body size, but rendered with the boxed controls' font
 /// ("field" family, no glyph nudge - see setup_theme) so the text sits
 /// centred inside the field's margins.
 fn field_font() -> egui::FontSelection {
-    egui::FontSelection::FontId(egui::FontId::new(13.0, egui::FontFamily::Name("field".into())))
+    egui::FontSelection::FontId(egui::FontId::new(
+        13.0,
+        egui::FontFamily::Name("field".into()),
+    ))
 }
 
 fn clicked_outside(ctx: &egui::Context, rect: egui::Rect) -> bool {
-    ctx.input(|i| i.pointer.any_pressed()
-        && i.pointer.interact_pos().is_some_and(|pos| !rect.contains(pos)))
+    ctx.input(|i| {
+        i.pointer.any_pressed()
+            && i.pointer
+                .interact_pos()
+                .is_some_and(|pos| !rect.contains(pos))
+    })
 }
 
 /// Dashed 1px rule across the available width - mockups/b-terminal.html uses
@@ -908,8 +1037,10 @@ fn dashed_separator(ui: &mut egui::Ui) {
     let mut x = rect.left();
     while x < rect.right() {
         let x_end = (x + dash).min(rect.right());
-        ui.painter()
-            .line_segment([egui::pos2(x, y), egui::pos2(x_end, y)], egui::Stroke::new(1.0, color));
+        ui.painter().line_segment(
+            [egui::pos2(x, y), egui::pos2(x_end, y)],
+            egui::Stroke::new(1.0_f32, color),
+        );
         x += dash + gap;
     }
 }
@@ -930,14 +1061,10 @@ fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     }
     ctx.set_pixels_per_point(UI_SCALE);
     if resize_viewport {
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-            460.0,
-            720.0,
-        )));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(460.0, 720.0)));
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
-        460.0,
-        600.0,
+        460.0, 600.0,
     )));
 }
 
@@ -1023,14 +1150,21 @@ impl SnatchApp {
         let mut app = Self::from_config(cfg, tx, rx);
         if let Some(warning) = warning {
             app.push_log(format!("⚠ {warning}; файл настроек сохранён без изменений"));
-            app.set_status(StatusKind::Warn, "Не удалось прочитать настройки — см. журнал");
+            app.set_status(
+                StatusKind::Warn,
+                "Не удалось прочитать настройки — см. журнал",
+            );
             app.show_log_window = true;
         }
         app
     }
 
     fn from_config(cfg: Config, tx: Sender<Msg>, rx: Receiver<Msg>) -> Self {
-        let out_dir = if !cfg.last_dir.is_empty() { cfg.last_dir.clone() } else { cfg.default_dir.clone() };
+        let out_dir = if !cfg.last_dir.is_empty() {
+            cfg.last_dir.clone()
+        } else {
+            cfg.default_dir.clone()
+        };
         let drives = list_drives();
         let dark_mode = cfg.dark_mode;
         Self {
@@ -1046,7 +1180,10 @@ impl SnatchApp {
             extra_ytdlp: String::new(),
             extra_aria2: String::new(),
             cfg,
-            tc: Toolchain { yt_dlp: None, aria2c: None },
+            tc: Toolchain {
+                yt_dlp: None,
+                aria2c: None,
+            },
             setup_started: false,
             setup_progress: None,
             phase: Phase::Idle,
@@ -1096,13 +1233,19 @@ impl SnatchApp {
             style.visuals = terminal_visuals(self.dark_mode);
         });
         self.cfg.dark_mode = self.dark_mode;
-        if !self.save_config() { self.set_status(StatusKind::Warn, "Настройки темы не сохранены — см. журнал"); }
+        if !self.save_config() {
+            self.set_status(StatusKind::Warn, "Настройки темы не сохранены — см. журнал");
+        }
     }
 
     fn save_config(&mut self) -> bool {
         match self.cfg.try_save_now() {
             Ok(()) => true,
-            Err(e) => { self.push_log(format!("⚠ Не удалось сохранить настройки: {e}")); self.show_log_window = true; false }
+            Err(e) => {
+                self.push_log(format!("⚠ Не удалось сохранить настройки: {e}"));
+                self.show_log_window = true;
+                false
+            }
         }
     }
 
@@ -1119,7 +1262,10 @@ impl SnatchApp {
             Ok(url) => {
                 self.url = url;
                 self.engine_mode = EngineMode::Auto;
-                let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
                 self.set_status(StatusKind::Ok, format!("Выбран файл: {}", clip(&name, 64)));
             }
             Err(e) => self.set_status(StatusKind::Err, e),
@@ -1235,8 +1381,15 @@ impl SnatchApp {
                         self.browser.current = resolved.clone();
                         self.browser.listed_for = Some(resolved);
                         match result {
-                            Ok((entries, truncated)) => { self.browser.entries = entries; self.browser.truncated = truncated; self.browser.error = None; }
-                            Err(e) => { self.browser.entries.clear(); self.browser.error = Some(e); }
+                            Ok((entries, truncated)) => {
+                                self.browser.entries = entries;
+                                self.browser.truncated = truncated;
+                                self.browser.error = None;
+                            }
+                            Err(e) => {
+                                self.browser.entries.clear();
+                                self.browser.error = Some(e);
+                            }
                         }
                     }
                 }
@@ -1251,7 +1404,8 @@ impl SnatchApp {
                     if is_current {
                         match result {
                             Ok((listing, tree)) => {
-                                let single = listing.info.files.len() <= 1 && self.phase != Phase::Setup;
+                                let single =
+                                    listing.info.files.len() <= 1 && self.phase != Phase::Setup;
                                 if let Some(pick) = self.torrent_pick.as_mut() {
                                     pick.selected = vec![true; listing.info.files.len()];
                                     pick.tree = tree;
@@ -1259,7 +1413,9 @@ impl SnatchApp {
                                     pick.info = Some(listing.info);
                                     pick.meta = listing.meta;
                                 }
-                                if single { self.finish_torrent_pick(ctx, None); }
+                                if single {
+                                    self.finish_torrent_pick(ctx, None);
+                                }
                             }
                             Err(e) => {
                                 // The modal shows why and lets the user pick
@@ -1296,7 +1452,9 @@ impl SnatchApp {
                 Msg::SetupProgress(label, done, total) => {
                     self.setup_progress = Some((label, done, total));
                 }
-                Msg::ToolsReady(tc) => apply_initial_discovery(&mut self.tc, self.setup_started, tc),
+                Msg::ToolsReady(tc) => {
+                    apply_initial_discovery(&mut self.tc, self.setup_started, tc)
+                }
                 Msg::SetupDone(ok, tc) => {
                     self.setup_progress = None;
                     self.tc = tc;
@@ -1350,7 +1508,10 @@ impl SnatchApp {
         if aj.pausing && code != 0 {
             self.set_status(StatusKind::None, format!("«{label}» на паузе"));
             self.paused.push(PausedJob {
-                job: aj.job.clone(), label, progress: aj.progress, status: aj.status,
+                job: aj.job.clone(),
+                label,
+                progress: aj.progress,
+                status: aj.status,
                 select: aj.select,
                 no_continue: false,
             });
@@ -1377,16 +1538,33 @@ impl SnatchApp {
                     // chosen files can exist yet be incomplete.
                     text.push_str(" · соседние невыбранные файлы могут быть неполными");
                 }
-                if !persisted { text.push_str(" · история не сохранена — см. журнал"); }
-                self.set_status(if persisted { StatusKind::Ok } else { StatusKind::Warn }, text);
+                if !persisted {
+                    text.push_str(" · история не сохранена — см. журнал");
+                }
+                self.set_status(
+                    if persisted {
+                        StatusKind::Ok
+                    } else {
+                        StatusKind::Warn
+                    },
+                    text,
+                );
             }
             127 => self.set_status(
                 StatusKind::Err,
-                format!("«{label}»: не удалось запустить загрузчик (бинарник пропал или не исполняем)"),
+                format!(
+                    "«{label}»: не удалось запустить загрузчик (бинарник пропал или не исполняем)"
+                ),
             ),
-            130 => self.set_status(StatusKind::Warn, format!("«{label}» прервано (файл можно докачать)")),
+            130 => self.set_status(
+                StatusKind::Warn,
+                format!("«{label}» прервано (файл можно докачать)"),
+            ),
             c => {
-                self.set_status(StatusKind::Err, format!("«{label}»: ошибка (код {c}) — см. журнал"));
+                self.set_status(
+                    StatusKind::Err,
+                    format!("«{label}»: ошибка (код {c}) — см. журнал"),
+                );
                 self.show_log_window = true;
                 let offer_retry = c == 1 && aj.auth_seen && aj.job.engine == "yt-dlp";
                 // The run resumed a .part and still failed: the old part is
@@ -1401,7 +1579,10 @@ impl SnatchApp {
                     self.retry_offer = Some(aj.job.clone());
                 } else if retry_from_scratch {
                     if self.spawn_job(ctx, aj.job.clone(), true, aj.select.clone()) {
-                        self.set_status(StatusKind::Warn, format!("«{label}»: докачка дала битый файл — повторяю с начала"));
+                        self.set_status(
+                            StatusKind::Warn,
+                            format!("«{label}»: докачка дала битый файл — повторяю с начала"),
+                        );
                     } else {
                         self.retain_failed_start(aj.job, aj.select, true);
                     }
@@ -1412,18 +1593,30 @@ impl SnatchApp {
     }
 
     fn retain_failed_start(&mut self, job: Job, select: torrent::Choice, no_continue: bool) {
-        self.paused.push(PausedJob { label: engines::batch_name(&job.url), job, progress: None,
-            status: self.status.clone(), select, no_continue });
+        self.paused.push(PausedJob {
+            label: engines::batch_name(&job.url),
+            job,
+            progress: None,
+            status: self.status.clone(),
+            select,
+            no_continue,
+        });
     }
 
     fn retire_offers(&mut self, url: &str) {
-        if self.retry_offer.as_ref().is_some_and(|job| job.url == url) { self.retry_offer = None; }
+        if self.retry_offer.as_ref().is_some_and(|job| job.url == url) {
+            self.retry_offer = None;
+        }
     }
 
     fn retry_with_cookies(&mut self, ctx: &egui::Context) {
-        let Some(mut job) = self.retry_offer.clone() else { return };
+        let Some(mut job) = self.retry_offer.clone() else {
+            return;
+        };
         job.cookies_browser = Some(self.cookies_browser.clone());
-        if self.dispatch_job(ctx, job, torrent::Choice::default()) { self.retry_offer = None; }
+        if self.dispatch_job(ctx, job, torrent::Choice::default()) {
+            self.retry_offer = None;
+        }
     }
 
     /// Starts queued jobs until MAX_CONCURRENT is reached or the queue runs
@@ -1433,8 +1626,15 @@ impl SnatchApp {
             return;
         }
         while self.jobs.len() < MAX_CONCURRENT {
-            let Some(queued) = self.queue.pop_front() else { break };
-            if !self.spawn_job(ctx, queued.job.clone(), queued.no_continue, queued.select.clone()) {
+            let Some(queued) = self.queue.pop_front() else {
+                break;
+            };
+            if !self.spawn_job(
+                ctx,
+                queued.job.clone(),
+                queued.no_continue,
+                queued.select.clone(),
+            ) {
                 self.retain_failed_start(queued.job, queued.select, queued.no_continue);
             }
         }
@@ -1448,7 +1648,10 @@ impl SnatchApp {
     /// matching the CLI's `-j` batch where each URL picks its own engine but
     /// shares format/folder.
     fn start_download(&mut self, ctx: &egui::Context) {
-        if self.close_requested { self.set_status(StatusKind::Warn, "Приложение закрывается"); return; }
+        if self.close_requested {
+            self.set_status(StatusKind::Warn, "Приложение закрывается");
+            return;
+        }
         if self.phase == Phase::Setup {
             self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
             return;
@@ -1465,15 +1668,24 @@ impl SnatchApp {
             self.set_status(StatusKind::Err, "Укажите папку сохранения");
             return;
         }
-        let fmt = if engine == "yt-dlp" { self.fmt.clone() } else { "best".to_string() };
-        let cookies = if !self.use_cookies { None } else {
+        let fmt = if engine == "yt-dlp" {
+            self.fmt.clone()
+        } else {
+            "best".to_string()
+        };
+        let cookies = if !self.use_cookies {
+            None
+        } else {
             match engine.as_str() {
                 "yt-dlp" => Some(self.cookies_browser.clone()),
                 _ => None,
             }
         };
         if self.url_in_flight(&url) {
-            self.set_status(StatusKind::Err, "Эта ссылка уже скачивается, в очереди или на паузе");
+            self.set_status(
+                StatusKind::Err,
+                "Эта ссылка уже скачивается, в очереди или на паузе",
+            );
             return;
         }
         let job = Job {
@@ -1490,7 +1702,10 @@ impl SnatchApp {
             // The modal disables the form, so this is only a safety net: a
             // second pick must never replace the open one and its job.
             if self.torrent_pick.is_some() {
-                self.set_status(StatusKind::Err, "Сначала завершите выбор файлов открытого торрента");
+                self.set_status(
+                    StatusKind::Err,
+                    "Сначала завершите выбор файлов открытого торрента",
+                );
                 return;
             }
             self.begin_torrent_pick(ctx, job);
@@ -1522,7 +1737,10 @@ impl SnatchApp {
     /// for this link consumed. Returns whether the job is running or queued.
     fn start_picked(&mut self, ctx: &egui::Context, job: Job, choice: torrent::Choice) -> bool {
         if self.url_in_flight(&job.url) {
-            self.set_status(StatusKind::Err, "Эта ссылка уже скачивается, в очереди или на паузе");
+            self.set_status(
+                StatusKind::Err,
+                "Эта ссылка уже скачивается, в очереди или на паузе",
+            );
             return false;
         }
         // Before dispatch: a queued or failed start overrides it.
@@ -1531,7 +1749,9 @@ impl SnatchApp {
         let started = self.dispatch_job(ctx, job, choice);
         if started {
             self.retire_offers(&url);
-            if self.url.trim() == url { self.url.clear(); }
+            if self.url.trim() == url {
+                self.url.clear();
+            }
         }
         started
     }
@@ -1540,7 +1760,10 @@ impl SnatchApp {
     /// this attempt, so retrying the modal never repeats a slow magnet fetch.
     fn finish_torrent_pick(&mut self, ctx: &egui::Context, files: Option<Vec<usize>>) {
         if let Some(mut pick) = self.torrent_pick.take() {
-            let choice = torrent::Choice { files, meta: pick.meta.clone() };
+            let choice = torrent::Choice {
+                files,
+                meta: pick.meta.clone(),
+            };
             if !self.start_picked(ctx, pick.job.clone(), choice) {
                 pick.hint = Some(self.status.clone());
                 self.torrent_pick = Some(pick);
@@ -1558,21 +1781,30 @@ impl SnatchApp {
 
     /// Queue-or-start for jobs that are ready to run. Returns whether the job
     /// is now running or queued (false: spawn_job refused it).
-    fn dispatch_job(
-        &mut self,
-        ctx: &egui::Context,
-        job: Job,
-        select: torrent::Choice,
-    ) -> bool {
-        if self.close_requested { self.set_status(StatusKind::Warn, "Приложение закрывается"); return false; }
+    fn dispatch_job(&mut self, ctx: &egui::Context, job: Job, select: torrent::Choice) -> bool {
+        if self.close_requested {
+            self.set_status(StatusKind::Warn, "Приложение закрывается");
+            return false;
+        }
         if self.url_in_flight(&job.url) {
-            self.set_status(StatusKind::Warn, "Эта ссылка уже скачивается, ожидает или находится в выборе файлов"); return false;
+            self.set_status(
+                StatusKind::Warn,
+                "Эта ссылка уже скачивается, ожидает или находится в выборе файлов",
+            );
+            return false;
         }
         if self.jobs.len() < MAX_CONCURRENT {
             self.spawn_job(ctx, job, false, select)
         } else {
-            self.queue.push_back(QueuedJob { job, select, no_continue: false });
-            self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+            self.queue.push_back(QueuedJob {
+                job,
+                select,
+                no_continue: false,
+            });
+            self.set_status(
+                StatusKind::None,
+                format!("Добавлено в очередь ({})", self.queue.len()),
+            );
             true
         }
     }
@@ -1580,7 +1812,11 @@ impl SnatchApp {
     /// Fetch the torrent file list off-thread, then show the pick modal.
     fn begin_torrent_pick(&mut self, ctx: &egui::Context, job: Job) {
         if self.close_requested || self.phase == Phase::Setup {
-            self.set_status(StatusKind::Warn, "Новая загрузка недоступна во время закрытия или установки"); return;
+            self.set_status(
+                StatusKind::Warn,
+                "Новая загрузка недоступна во время закрытия или установки",
+            );
+            return;
         }
         self.browser.open = false;
         self.show_dir_history = false;
@@ -1595,11 +1831,14 @@ impl SnatchApp {
         let cancel_bg = cancel.clone();
         std::thread::spawn(move || {
             let result = match aria2c {
-                Some(path) => torrent::show_files(&path, &url, torrent::METADATA_TIMEOUT, &cancel_bg)
-                    .map(|listing| {
-                        let tree = torrent::build_torrent_tree(&listing.info.files);
-                        (listing, tree)
-                    }),
+                Some(path) => {
+                    torrent::show_files(&path, &url, torrent::METADATA_TIMEOUT, &cancel_bg).map(
+                        |listing| {
+                            let tree = torrent::build_torrent_tree(&listing.info.files);
+                            (listing, tree)
+                        },
+                    )
+                }
                 None => Err("aria2c не найден — установите загрузчики".to_string()),
             };
             let _ = tx.send(Msg::TorrentFiles(id, result));
@@ -1638,12 +1877,22 @@ impl SnatchApp {
         // add an uncancelled process past cancel_all() and defer closing
         // until that download finishes.
         if self.close_requested {
-            self.set_status(StatusKind::Warn, "Приложение закрывается — загрузка не запущена");
+            self.set_status(
+                StatusKind::Warn,
+                "Приложение закрывается — загрузка не запущена",
+            );
             return false;
         }
-        if self.phase == Phase::Setup { self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков"); return false; }
+        if self.phase == Phase::Setup {
+            self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
+            return false;
+        }
         if self.url_in_flight(&job.url) {
-            self.set_status(StatusKind::Warn, "Эта ссылка уже скачивается, ожидает или находится в выборе файлов"); return false;
+            self.set_status(
+                StatusKind::Warn,
+                "Эта ссылка уже скачивается, ожидает или находится в выборе файлов",
+            );
+            return false;
         }
         let label = engines::batch_name(&job.url);
         let warns = preflight_warning(&job);
@@ -1656,7 +1905,11 @@ impl SnatchApp {
             }
         };
         let extras = match extras_from_fields(
-            self.subs, &self.sub_langs, self.playlist, &self.extra_ytdlp, &self.extra_aria2,
+            self.subs,
+            &self.sub_langs,
+            self.playlist,
+            &self.extra_ytdlp,
+            &self.extra_aria2,
         ) {
             Ok(extras) => extras,
             Err(e) => {
@@ -1684,7 +1937,10 @@ impl SnatchApp {
 
         let install_guard = match snatch_rs::tools::try_lock_for_spawn(Path::new(&cmd[0])) {
             Ok(guard) => guard,
-            Err(e) => { self.set_status(StatusKind::Err, e); return false; }
+            Err(e) => {
+                self.set_status(StatusKind::Err, e);
+                return false;
+            }
         };
         let mut command = Command::new(&cmd[0]);
         command
@@ -1715,7 +1971,10 @@ impl SnatchApp {
         let (mut child, proc_job) = match job_object::spawn(&mut command, true) {
             Ok(result) => result,
             Err(e) => {
-                self.set_status(StatusKind::Err, format!("«{label}»: запуск/защита загрузчика: {e}"));
+                self.set_status(
+                    StatusKind::Err,
+                    format!("«{label}»: запуск/защита загрузчика: {e}"),
+                );
                 self.push_log(format!("✘ Загрузчик остановлен: {e}"));
                 return false;
             }
@@ -1794,7 +2053,9 @@ impl SnatchApp {
                                 match msg {
                                     Msg::TorrentStatus(..) => latest = Some(msg),
                                     other => {
-                                        if matches!(other, Msg::TorrentMeta(..)) { latest = None; }
+                                        if matches!(other, Msg::TorrentMeta(..)) {
+                                            latest = None;
+                                        }
                                         let _ = tx_out.send(other);
                                     }
                                 }
@@ -1805,7 +2066,9 @@ impl SnatchApp {
                                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(200));
                             if due {
                                 if let Msg::TorrentStatus(_, _, ref stat) = msg {
-                                    if last_torrent_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(2)) {
+                                    if last_torrent_log
+                                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+                                    {
                                         last_torrent_log = Some(Instant::now());
                                         let _ = tx_out.send(Msg::TorrentLog(id, stat.clone()));
                                     }
@@ -1847,7 +2110,8 @@ impl SnatchApp {
                         Ok(0) | Err(_) => break,
                         Ok(_) => {}
                     }
-                    let line = engines::sanitize_child_output(&engines::decode_child_bytes(&buf)).into_owned();
+                    let line = engines::sanitize_child_output(&engines::decode_child_bytes(&buf))
+                        .into_owned();
                     let _ = tx_err.send(Msg::ErrLine(id, line));
                     // Running already schedules repaint every 150ms in drain;
                     // per-line requests here would redraw the entire window
@@ -1987,7 +2251,10 @@ impl SnatchApp {
             j.cancelled = true;
             j.cancel_flag.store(true, Ordering::SeqCst);
             let label = j.label.clone();
-            self.set_status(StatusKind::Warn, format!("«{}»: останавливаю…", clip(&label, 60)));
+            self.set_status(
+                StatusKind::Warn,
+                format!("«{}»: останавливаю…", clip(&label, 60)),
+            );
         }
     }
 
@@ -2001,7 +2268,10 @@ impl SnatchApp {
             j.pausing = true;
             j.cancel_flag.store(true, Ordering::SeqCst);
             let label = j.label.clone();
-            self.set_status(StatusKind::None, format!("«{}»: ставлю на паузу…", clip(&label, 60)));
+            self.set_status(
+                StatusKind::None,
+                format!("«{}»: ставлю на паузу…", clip(&label, 60)),
+            );
         }
     }
 
@@ -2046,7 +2316,8 @@ impl SnatchApp {
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
-                    let title_width = (ui.available_width() - 3.0 * 40.0 - THEME_BTN_WIDTH).max(0.0);
+                    let title_width =
+                        (ui.available_width() - 3.0 * 40.0 - THEME_BTN_WIDTH).max(0.0);
                     let (rect, drag) = ui.allocate_exact_size(
                         egui::vec2(title_width, 42.0),
                         egui::Sense::click_and_drag(),
@@ -2059,7 +2330,8 @@ impl SnatchApp {
                         ui.visuals().weak_text_color(),
                     );
                     if drag.double_clicked() {
-                        self.maximized = !ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized));
+                        self.maximized =
+                            !ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
                     } else if drag.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
@@ -2073,27 +2345,43 @@ impl SnatchApp {
                     // every other Russian label in the app already. Label
                     // names the mode a click switches *to* (dark is too dark
                     // to read outdoors in daylight, this is the way out).
-                    let label = if self.dark_mode { "день" } else { "ночь" };
-                    if ui.add_sized([THEME_BTN_WIDTH, 38.0], egui::Button::new(label).frame(false))
-                        .on_hover_text(if self.dark_mode { "Светлая тема" } else { "Тёмная тема" })
+                    let label = if self.dark_mode {
+                        "день"
+                    } else {
+                        "ночь"
+                    };
+                    if ui
+                        .add_sized(
+                            [THEME_BTN_WIDTH, 38.0],
+                            egui::Button::new(label).frame(false),
+                        )
+                        .on_hover_text(if self.dark_mode {
+                            "Светлая тема"
+                        } else {
+                            "Тёмная тема"
+                        })
                         .clicked()
                     {
                         self.toggle_theme(ctx);
                     }
-                    if ui.add_sized([40.0, 38.0], egui::Button::new("─").frame(false))
+                    if ui
+                        .add_sized([40.0, 38.0], egui::Button::new("─").frame(false))
                         .on_hover_text("Свернуть")
                         .clicked()
                     {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
-                    if ui.add_sized([40.0, 38.0], egui::Button::new("□").frame(false))
+                    if ui
+                        .add_sized([40.0, 38.0], egui::Button::new("□").frame(false))
                         .on_hover_text("Развернуть / восстановить")
                         .clicked()
                     {
-                        self.maximized = !ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized));
+                        self.maximized =
+                            !ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(self.maximized));
                     }
-                    if ui.add_sized([40.0, 38.0], egui::Button::new("×").frame(false))
+                    if ui
+                        .add_sized([40.0, 38.0], egui::Button::new("×").frame(false))
                         .on_hover_text("Закрыть")
                         .clicked()
                     {
@@ -2116,20 +2404,54 @@ impl SnatchApp {
 
     #[cfg(windows)]
     fn ui_resize_edges(&self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized)) { return; }
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized)) {
+            return;
+        }
         let screen = ctx.screen_rect();
         let e = 6.0;
         let w = screen.width();
         let h = screen.height();
         let handles = [
-            (egui::pos2(0.0, 0.0), egui::vec2(e, e), egui::ResizeDirection::NorthWest),
-            (egui::pos2(e, 0.0), egui::vec2(w - 2.0 * e, e), egui::ResizeDirection::North),
-            (egui::pos2(w - e, 0.0), egui::vec2(e, e), egui::ResizeDirection::NorthEast),
-            (egui::pos2(0.0, e), egui::vec2(e, h - 2.0 * e), egui::ResizeDirection::West),
-            (egui::pos2(w - e, e), egui::vec2(e, h - 2.0 * e), egui::ResizeDirection::East),
-            (egui::pos2(0.0, h - e), egui::vec2(e, e), egui::ResizeDirection::SouthWest),
-            (egui::pos2(e, h - e), egui::vec2(w - 2.0 * e, e), egui::ResizeDirection::South),
-            (egui::pos2(w - e, h - e), egui::vec2(e, e), egui::ResizeDirection::SouthEast),
+            (
+                egui::pos2(0.0, 0.0),
+                egui::vec2(e, e),
+                egui::ResizeDirection::NorthWest,
+            ),
+            (
+                egui::pos2(e, 0.0),
+                egui::vec2(w - 2.0 * e, e),
+                egui::ResizeDirection::North,
+            ),
+            (
+                egui::pos2(w - e, 0.0),
+                egui::vec2(e, e),
+                egui::ResizeDirection::NorthEast,
+            ),
+            (
+                egui::pos2(0.0, e),
+                egui::vec2(e, h - 2.0 * e),
+                egui::ResizeDirection::West,
+            ),
+            (
+                egui::pos2(w - e, e),
+                egui::vec2(e, h - 2.0 * e),
+                egui::ResizeDirection::East,
+            ),
+            (
+                egui::pos2(0.0, h - e),
+                egui::vec2(e, e),
+                egui::ResizeDirection::SouthWest,
+            ),
+            (
+                egui::pos2(e, h - e),
+                egui::vec2(w - 2.0 * e, e),
+                egui::ResizeDirection::South,
+            ),
+            (
+                egui::pos2(w - e, h - e),
+                egui::vec2(e, e),
+                egui::ResizeDirection::SouthEast,
+            ),
         ];
         for (i, (pos, size, direction)) in handles.into_iter().enumerate() {
             egui::Area::new(egui::Id::new(("window_resize", i)))
@@ -2214,8 +2536,11 @@ impl SnatchApp {
                         }
                     }
                 });
-            self.show_url_history = open && (toggle_hist || !window
-                .as_ref().is_some_and(|w| clicked_outside(ctx, w.response.rect)));
+            self.show_url_history = open
+                && (toggle_hist
+                    || !window
+                        .as_ref()
+                        .is_some_and(|w| clicked_outside(ctx, w.response.rect)));
             if let Some(u) = picked {
                 self.url = u;
                 self.show_url_history = false;
@@ -2257,7 +2582,9 @@ impl SnatchApp {
                     // exact center - no font-metric guessing involved.
                     let color = ui.visuals().weak_text_color();
                     let font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-                    let galley = ui.painter().layout_no_wrap(format!("→ {guess_label}"), font, color);
+                    let galley =
+                        ui.painter()
+                            .layout_no_wrap(format!("→ {guess_label}"), font, color);
                     // Exact rect-center math landed a hair high - likely the
                     // "→" glyph's own ink sits above its box's true center,
                     // not a layout issue. Small fixed nudge down.
@@ -2304,10 +2631,7 @@ impl SnatchApp {
                     toggle_hist = true;
                 }
                 if ui
-                    .add_enabled(
-                        enabled,
-                        egui::Button::new("обзор"),
-                    )
+                    .add_enabled(enabled, egui::Button::new("обзор"))
                     .on_hover_text("Выбрать папку для скачивания")
                     .clicked()
                 {
@@ -2333,7 +2657,10 @@ impl SnatchApp {
     }
 
     fn ui_dir_history(&mut self, ctx: &egui::Context, opened_this_frame: bool) {
-        if self.torrent_pick.is_some() || self.close_requested { self.show_dir_history = false; return; }
+        if self.torrent_pick.is_some() || self.close_requested {
+            self.show_dir_history = false;
+            return;
+        }
         if !self.show_dir_history {
             return;
         }
@@ -2345,17 +2672,20 @@ impl SnatchApp {
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 200.0])
             .show(ctx, |ui| {
-                    if dirs.is_empty() {
-                        ui.weak("(история пуста — папки появятся после успешных скачиваний)");
+                if dirs.is_empty() {
+                    ui.weak("(история пуста — папки появятся после успешных скачиваний)");
+                }
+                for d in &dirs {
+                    if ui.selectable_label(false, clip(d, 64)).clicked() {
+                        picked = Some(d.clone());
                     }
-                    for d in &dirs {
-                        if ui.selectable_label(false, clip(d, 64)).clicked() {
-                            picked = Some(d.clone());
-                        }
-                    }
-                });
-        self.show_dir_history = open && (opened_this_frame || !window
-            .as_ref().is_some_and(|w| clicked_outside(ctx, w.response.rect)));
+                }
+            });
+        self.show_dir_history = open
+            && (opened_this_frame
+                || !window
+                    .as_ref()
+                    .is_some_and(|w| clicked_outside(ctx, w.response.rect)));
         if let Some(d) = picked {
             self.out_dir = d;
             self.show_dir_history = false;
@@ -2394,17 +2724,25 @@ impl SnatchApp {
                         );
                     });
             });
-        self.show_log_window = open && (opened_this_frame || !window
-            .as_ref().is_some_and(|w| clicked_outside(ctx, w.response.rect)));
+        self.show_log_window = open
+            && (opened_this_frame
+                || !window
+                    .as_ref()
+                    .is_some_and(|w| clicked_outside(ctx, w.response.rect)));
     }
 
     fn open_dir_browser(&mut self) {
-        if self.close_requested || self.torrent_pick.is_some() { return; }
+        if self.close_requested || self.torrent_pick.is_some() {
+            return;
+        }
         // Cheap bitmask query - a drive plugged in since startup shows up.
         self.drives = list_drives();
         let typed = PathBuf::from(self.out_dir.trim());
         if is_unc_path(&typed) {
-            self.set_status(StatusKind::Err, "Сетевую UNC-папку нельзя открывать. Выберите локальную папку.");
+            self.set_status(
+                StatusKind::Err,
+                "Сетевую UNC-папку нельзя открывать. Выберите локальную папку.",
+            );
             return;
         }
         // Probe only volumes the OS currently reports as logical drives. A
@@ -2413,8 +2751,11 @@ impl SnatchApp {
         // device times out - the same stall class list_drives() avoids at
         // startup (see its comment above). Unknown roots open at home.
         #[cfg(windows)]
-        let root_known = path_drive_letter(&typed)
-            .is_some_and(|letter| self.drives.iter().any(|d| path_drive_letter(d) == Some(letter)));
+        let root_known = path_drive_letter(&typed).is_some_and(|letter| {
+            self.drives
+                .iter()
+                .any(|d| path_drive_letter(d) == Some(letter))
+        });
         #[cfg(not(windows))]
         let root_known = true;
         let start = if !root_known || typed.as_os_str().is_empty() {
@@ -2431,12 +2772,17 @@ impl SnatchApp {
     }
 
     fn ui_dir_browser(&mut self, ctx: &egui::Context) {
-        if self.torrent_pick.is_some() || self.close_requested { self.browser.open = false; return; }
+        if self.torrent_pick.is_some() || self.close_requested {
+            self.browser.open = false;
+            return;
+        }
         if !self.browser.open {
             return;
         }
         let opened_this_frame = self.browser.listed_for.is_none();
-        if self.browser.listed_for.as_ref() != Some(&self.browser.current) && self.browser.in_flight.is_none() {
+        if self.browser.listed_for.as_ref() != Some(&self.browser.current)
+            && self.browser.in_flight.is_none()
+        {
             let requested = self.browser.current.clone();
             let initial = self.browser.resolve_initial;
             self.browser.resolve_initial = false;
@@ -2450,9 +2796,14 @@ impl SnatchApp {
             std::thread::spawn(move || {
                 let mut resolved = requested.clone();
                 if initial && !is_unc_path(&resolved) && !resolved.is_dir() {
-                    if let Some(parent) = resolved.parent().filter(|p| !is_unc_path(p) && p.is_dir()) { resolved = parent.to_path_buf(); }
+                    if let Some(parent) =
+                        resolved.parent().filter(|p| !is_unc_path(p) && p.is_dir())
+                    {
+                        resolved = parent.to_path_buf();
+                    }
                 }
-                let result = try_read_dirs_limited(&resolved, DIR_BROWSER_SCAN_CAP).map_err(|e| e.to_string());
+                let result = try_read_dirs_limited(&resolved, DIR_BROWSER_SCAN_CAP)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(Msg::DirListed(requested, resolved, result));
                 ctx.request_repaint();
             });
@@ -2575,8 +2926,11 @@ impl SnatchApp {
         // itself was never told to close), so writing it last would clobber
         // the `open = false` a confirmed pick sets, leaving the window stuck
         // open even though out_dir had already been updated.
-        self.browser.open = still_open && (opened_this_frame || !window
-            .as_ref().is_some_and(|w| clicked_outside(ctx, w.response.rect)));
+        self.browser.open = still_open
+            && (opened_this_frame
+                || !window
+                    .as_ref()
+                    .is_some_and(|w| clicked_outside(ctx, w.response.rect)));
         if let Some(p) = navigate {
             if !is_unc_path(&p) {
                 self.browser.current = p;
@@ -2616,9 +2970,8 @@ impl SnatchApp {
         tag_label(ui, "опции");
         ui.horizontal(|ui| {
             ui.add_enabled_ui(enabled && engine == "yt-dlp", |ui| {
-                ui.checkbox(&mut self.subs, "субтитры").on_hover_text(
-                    "Скачивать субтитры (ручные и автоматические) рядом с видео",
-                );
+                ui.checkbox(&mut self.subs, "субтитры")
+                    .on_hover_text("Скачивать субтитры (ручные и автоматические) рядом с видео");
                 if self.subs {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.sub_langs)
@@ -2671,14 +3024,31 @@ impl SnatchApp {
                 ui.add_space(10.0);
             }
             let accent = ui.visuals().hyperlink_color;
-            ui.label(egui::RichText::new(clip(&aj.label, 72)).size(12.0).color(accent));
+            ui.label(
+                egui::RichText::new(clip(&aj.label, 72))
+                    .size(12.0)
+                    .color(accent),
+            );
             let waiting = if aj.status.starts_with("Получаю метаданные") {
                 "Метаданные торрента…"
-            } else { "Подключение…" };
-            let (pause, cancel) = job_controls(ui, aj.progress, accent, false, waiting,
-                ("пауза", ACTIVE_BTN_W), ("отмена", ACTIVE_BTN_W));
-            if pause { pause_id = Some(aj.id); }
-            if cancel { cancel_id = Some(aj.id); }
+            } else {
+                "Подключение…"
+            };
+            let (pause, cancel) = job_controls(
+                ui,
+                aj.progress,
+                accent,
+                false,
+                waiting,
+                ("пауза", ACTIVE_BTN_W),
+                ("отмена", ACTIVE_BTN_W),
+            );
+            if pause {
+                pause_id = Some(aj.id);
+            }
+            if cancel {
+                cancel_id = Some(aj.id);
+            }
             if !aj.status.is_empty() {
                 ui.weak(clip(&aj.status, 90));
             }
@@ -2704,12 +3074,29 @@ impl SnatchApp {
             }
             let accent = ui.visuals().hyperlink_color;
             let warn = ui.visuals().warn_fg_color;
-            ui.label(egui::RichText::new(clip(&pj.label, 72)).size(12.0).color(accent));
-            let (resume, remove) = job_controls(ui, pj.progress, warn, true, "",
-                ("продолжить", RESUME_BTN_W), ("убрать", REMOVE_BTN_W));
-            if resume { resume_idx = Some(i); }
-            if remove { drop_idx = Some(i); }
-            if !pj.status.is_empty() { ui.weak(clip(&pj.status, 90)); }
+            ui.label(
+                egui::RichText::new(clip(&pj.label, 72))
+                    .size(12.0)
+                    .color(accent),
+            );
+            let (resume, remove) = job_controls(
+                ui,
+                pj.progress,
+                warn,
+                true,
+                "",
+                ("продолжить", RESUME_BTN_W),
+                ("убрать", REMOVE_BTN_W),
+            );
+            if resume {
+                resume_idx = Some(i);
+            }
+            if remove {
+                drop_idx = Some(i);
+            }
+            if !pj.status.is_empty() {
+                ui.weak(clip(&pj.status, 90));
+            }
         }
         // The paused row that actually left the list this frame (a refused
         // resume keeps its row), for the index shift of "убрать" below.
@@ -2736,17 +3123,30 @@ impl SnatchApp {
                         self.paused.insert(i, pj);
                         resumed_row = None;
                     }
-                } else if self.close_requested { self.paused.insert(i, pj); resumed_row = None; }
-                else {
-                    self.queue.push_back(QueuedJob { job: pj.job, select: pj.select, no_continue: pj.no_continue });
-                    self.set_status(StatusKind::None, format!("Добавлено в очередь ({})", self.queue.len()));
+                } else if self.close_requested {
+                    self.paused.insert(i, pj);
+                    resumed_row = None;
+                } else {
+                    self.queue.push_back(QueuedJob {
+                        job: pj.job,
+                        select: pj.select,
+                        no_continue: pj.no_continue,
+                    });
+                    self.set_status(
+                        StatusKind::None,
+                        format!("Добавлено в очередь ({})", self.queue.len()),
+                    );
                 }
             }
         }
         if let Some(i) = drop_idx {
             // If resume and remove were clicked in the same frame, the first
             // removal shifted indices. The clicked row is now elsewhere.
-            let idx = if resumed_row.is_some_and(|r| r < i) { i - 1 } else { i };
+            let idx = if resumed_row.is_some_and(|r| r < i) {
+                i - 1
+            } else {
+                i
+            };
             if resume_idx != Some(i) && idx < self.paused.len() {
                 let pj = self.paused.remove(idx);
                 if self.status == format!("«{}» на паузе", pj.label) {
@@ -2811,9 +3211,13 @@ impl SnatchApp {
         // `.cta { text-transform: uppercase }` - the *rendered* (approved)
         // look is "▶ СКАЧАТЬ", not "▶ скачать". Mockup's `.cta` is
         // `font: 600 13px` - 16.0 here was never actually checked against it.
-        let label = if self.jobs.len() < MAX_CONCURRENT { "▶ СКАЧАТЬ" } else { "+ В ОЧЕРЕДЬ" };
+        let label = if self.jobs.len() < MAX_CONCURRENT {
+            "▶ СКАЧАТЬ"
+        } else {
+            "+ В ОЧЕРЕДЬ"
+        };
         let cta = egui::Button::new(egui::RichText::new(label).color(accent).size(13.0))
-            .stroke(egui::Stroke::new(1.0, accent))
+            .stroke(egui::Stroke::new(1.0_f32, accent))
             .fill(egui::Color32::TRANSPARENT);
         let clicked = ui
             .add_enabled_ui(can, |ui| ui.add_sized([width, 36.0], cta).clicked())
@@ -2835,7 +3239,9 @@ impl SnatchApp {
     /// done; the loading phase lives in the run row. Drawn in the Foreground
     /// order so update()'s dim overlay (Middle) stays beneath it.
     fn ui_torrent_pick(&mut self, ctx: &egui::Context) {
-        let Some(pick) = self.torrent_pick.as_mut() else { return };
+        let Some(pick) = self.torrent_pick.as_mut() else {
+            return;
+        };
         if pick.loading() {
             return;
         }
@@ -2860,7 +3266,10 @@ impl SnatchApp {
                 .map(|(_, f)| f.index)
                 .collect();
             let every = chosen.len() == pick.selected.len();
-            if chosen.is_empty() { pick.hint = Some("Выберите хотя бы один файл".into()); return; }
+            if chosen.is_empty() {
+                pick.hint = Some("Выберите хотя бы один файл".into());
+                return;
+            }
             // Refuse a too-scattered selection here, while it can be changed,
             // not as a failed start after the modal is gone.
             if let Err(e) = torrent::select_spec(&chosen) {
@@ -2942,7 +3351,8 @@ impl eframe::App for SnatchApp {
                     ui.weak(egui::RichText::new(format!("snatch {APP_VERSION}")).size(11.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.hyperlink_to(
-                            egui::RichText::new(TELEGRAM_URL.trim_start_matches("https://")).size(11.0),
+                            egui::RichText::new(TELEGRAM_URL.trim_start_matches("https://"))
+                                .size(11.0),
                             TELEGRAM_URL,
                         );
                     });
@@ -3188,7 +3598,11 @@ fn app_icon() -> Option<egui::IconData> {
             .resize_exact(256, 256, image::imageops::FilterType::Lanczos3)
     };
     let rgba = img.into_rgba8();
-    Some(egui::IconData { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() })
+    Some(egui::IconData {
+        width: rgba.width(),
+        height: rgba.height(),
+        rgba: rgba.into_raw(),
+    })
 }
 
 /// A windows-subsystem exe has no console to print to, so a startup failure
@@ -3199,14 +3613,27 @@ fn fatal_dialog(title: &str, text: &str) {
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
     extern "system" {
-        fn MessageBoxW(hwnd: *mut c_void, text: *const u16, caption: *const u16, mb_type: u32) -> i32;
+        fn MessageBoxW(
+            hwnd: *mut c_void,
+            text: *const u16,
+            caption: *const u16,
+            mb_type: u32,
+        ) -> i32;
     }
     const MB_ICONERROR: u32 = 0x10;
     let wide = |s: &str| -> Vec<u16> {
-        std::ffi::OsStr::new(s).encode_wide().chain(Some(0)).collect()
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(Some(0))
+            .collect()
     };
     unsafe {
-        MessageBoxW(std::ptr::null_mut(), wide(text).as_ptr(), wide(title).as_ptr(), MB_ICONERROR);
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide(text).as_ptr(),
+            wide(title).as_ptr(),
+            MB_ICONERROR,
+        );
     }
 }
 
@@ -3217,7 +3644,10 @@ fn main() -> eframe::Result {
     // panic="abort" still runs the hook before aborting: surface internal
     // panics instead of dying silently without a console.
     std::panic::set_hook(Box::new(|info| {
-        fatal_dialog("SNATCH — внутренняя ошибка", &format!("SNATCH не смог продолжить работу.\n\n{info}"));
+        fatal_dialog(
+            "SNATCH — внутренняя ошибка",
+            &format!("SNATCH не смог продолжить работу.\n\n{info}"),
+        );
     }));
 
     let mut viewport = egui::ViewportBuilder::default()
@@ -3225,11 +3655,16 @@ fn main() -> eframe::Result {
         .with_min_inner_size([460.0, 600.0])
         .with_title("SNATCH — by rercon prod.");
     #[cfg(windows)]
-    { viewport = viewport.with_decorations(false); }
+    {
+        viewport = viewport.with_decorations(false);
+    }
     if let Some(icon) = app_icon() {
         viewport = viewport.with_icon(icon);
     }
-    let options = eframe::NativeOptions { viewport, ..Default::default() };
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
     let result = eframe::run_native(
         "SNATCH",
         options,
@@ -3255,21 +3690,38 @@ mod tests {
 
     fn test_app() -> SnatchApp {
         let (tx, rx) = channel();
-        SnatchApp::from_config(snatch_rs::config::sanitize(&serde_json::Value::Null), tx, rx)
+        SnatchApp::from_config(
+            snatch_rs::config::sanitize(&serde_json::Value::Null),
+            tx,
+            rx,
+        )
     }
 
     fn test_job(url: &str) -> Job {
-        Job { engine: "yt-dlp".into(), url: url.into(), out_dir: std::env::temp_dir(), fmt: "best".into(), cookies_browser: None }
+        Job {
+            engine: "yt-dlp".into(),
+            url: url.into(),
+            out_dir: std::env::temp_dir(),
+            fmt: "best".into(),
+            cookies_browser: None,
+        }
     }
 
     #[test]
     fn setup_progress_text_shows_bytes_percent_and_a_fallback() {
-        let p = ("ffmpeg".to_string(), 50 * 1024 * 1024, Some(100 * 1024 * 1024));
+        let p = (
+            "ffmpeg".to_string(),
+            50 * 1024 * 1024,
+            Some(100 * 1024 * 1024),
+        );
         let t = setup_progress_text(Some(&p));
         assert!(t.contains("ffmpeg") && t.contains("50%"), "{t}");
         let p = ("yt-dlp.exe".to_string(), 1024, None);
         assert!(setup_progress_text(Some(&p)).contains("yt-dlp.exe"));
-        assert_eq!(setup_progress_text(None), "скачиваю yt-dlp, aria2c, ffmpeg и Deno…");
+        assert_eq!(
+            setup_progress_text(None),
+            "скачиваю yt-dlp, aria2c, ffmpeg и Deno…"
+        );
     }
 
     #[test]
@@ -3287,19 +3739,29 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app();
         let job = test_job("https://example.test/watch");
-        app.url = job.url.clone(); app.out_dir = job.out_dir.to_string_lossy().into_owned();
+        app.url = job.url.clone();
+        app.out_dir = job.out_dir.to_string_lossy().into_owned();
         app.retry_offer = Some(job.clone());
         app.start_download(&ctx);
         assert_eq!(app.url, job.url);
         assert!(app.retry_offer.is_some());
         app.retry_with_cookies(&ctx);
         assert!(app.retry_offer.is_some());
-        app.queue.push_back(QueuedJob { job: job.clone(),
-            select: torrent::Choice { files: Some(vec![1, 3]), meta: None }, no_continue: true });
+        app.queue.push_back(QueuedJob {
+            job: job.clone(),
+            select: torrent::Choice {
+                files: Some(vec![1, 3]),
+                meta: None,
+            },
+            no_continue: true,
+        });
         app.fill_free_slots(&ctx);
         assert_eq!(app.paused.len(), 1);
         assert_eq!(app.paused[0].job.url, job.url);
-        assert_eq!(app.paused[0].select.files.as_deref(), Some([1, 3].as_slice()));
+        assert_eq!(
+            app.paused[0].select.files.as_deref(),
+            Some([1, 3].as_slice())
+        );
         assert!(app.paused[0].no_continue);
         assert!(!app.paused[0].status.is_empty());
     }
@@ -3309,10 +3771,23 @@ mod tests {
         let ctx = egui::Context::default();
         let mut app = test_app();
         let job = test_job("https://example.test/watch");
-        app.jobs.push(ActiveJob { id: 1, job: job.clone(), label: "video".into(), progress: Some(0.8), status: String::new(),
-            status_kind: StatusKind::None, warns: vec![], cancel_flag: Arc::new(AtomicBool::new(false)),
-            cancelled: false, pausing: false, auth_seen: false, missing_control_file: false, resumed_seen: true,
-            no_continue: false, select: torrent::Choice::default() });
+        app.jobs.push(ActiveJob {
+            id: 1,
+            job: job.clone(),
+            label: "video".into(),
+            progress: Some(0.8),
+            status: String::new(),
+            status_kind: StatusKind::None,
+            warns: vec![],
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancelled: false,
+            pausing: false,
+            auth_seen: false,
+            missing_control_file: false,
+            resumed_seen: true,
+            no_continue: false,
+            select: torrent::Choice::default(),
+        });
         app.finish_job(1, 1, &ctx);
         assert!(app.jobs.is_empty());
         assert_eq!(app.paused.len(), 1);
@@ -3325,24 +3800,41 @@ mod tests {
     #[test]
     fn closing_refuses_picks_and_dispatch_before_any_side_effect() {
         let ctx = egui::Context::default();
-        let mut app = test_app(); app.close_requested = true;
+        let mut app = test_app();
+        app.close_requested = true;
         let job = test_job("https://example.test/watch");
         assert!(!app.dispatch_job(&ctx, job.clone(), torrent::Choice::default()));
         app.begin_torrent_pick(&ctx, job);
-        assert!(app.torrent_pick.is_none()); assert!(app.queue.is_empty()); assert!(app.jobs.is_empty());
+        assert!(app.torrent_pick.is_none());
+        assert!(app.queue.is_empty());
+        assert!(app.jobs.is_empty());
         assert_eq!(app.next_pick_id, 0);
     }
 
     #[test]
     fn an_open_pick_blocks_duplicate_downloads_and_directory_popups() {
-        let ctx = egui::Context::default(); let mut app = test_app();
+        let ctx = egui::Context::default();
+        let mut app = test_app();
         let job = test_job("https://example.test/watch");
-        app.torrent_pick = Some(TorrentPick { id: 1, job: job.clone(), cancel: Arc::new(AtomicBool::new(false)),
-            info: None, meta: None, selected: vec![], tree: vec![], view: torrent::TreeView::default(), error: None, hint: None });
+        app.torrent_pick = Some(TorrentPick {
+            id: 1,
+            job: job.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            info: None,
+            meta: None,
+            selected: vec![],
+            tree: vec![],
+            view: torrent::TreeView::default(),
+            error: None,
+            hint: None,
+        });
         assert!(app.url_in_flight(&job.url));
-        app.retry_offer = Some(job); app.retry_with_cookies(&ctx);
-        assert!(app.retry_offer.is_some()); assert!(app.jobs.is_empty());
-        app.open_dir_browser(); assert!(!app.browser.open);
+        app.retry_offer = Some(job);
+        app.retry_with_cookies(&ctx);
+        assert!(app.retry_offer.is_some());
+        assert!(app.jobs.is_empty());
+        app.open_dir_browser();
+        assert!(!app.browser.open);
     }
 
     #[test]
@@ -3350,7 +3842,11 @@ mod tests {
         for native in [1.0, 1.25, 2.0] {
             let ctx = egui::Context::default();
             let mut input = egui::RawInput::default();
-            input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap().native_pixels_per_point = Some(native);
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(native);
             let output = ctx.run(input, |ctx| pin_pixel_scale(ctx, true));
             let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
             assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(460.0, 720.0))));
@@ -3360,13 +3856,32 @@ mod tests {
 
     #[test]
     fn directory_errors_are_visible_and_stale_scans_do_not_replace_navigation() {
-        let ctx = egui::Context::default(); let mut app = test_app();
-        let current = std::env::temp_dir().join("wanted"); let previous = std::env::temp_dir().join("previous");
-        app.browser.open = true; app.browser.current = current.clone(); app.browser.in_flight = Some(previous.clone());
-        app.tx.send(Msg::DirListed(previous.clone(), previous, Ok((vec!["stale".into()], false)))).unwrap();
-        app.drain(&ctx); assert_eq!(app.browser.current, current); assert!(app.browser.entries.is_empty());
-        app.tx.send(Msg::DirListed(current.clone(), current.clone(), Err("test access denied".into()))).unwrap();
-        app.drain(&ctx); assert_eq!(app.browser.listed_for, Some(current));
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let current = std::env::temp_dir().join("wanted");
+        let previous = std::env::temp_dir().join("previous");
+        app.browser.open = true;
+        app.browser.current = current.clone();
+        app.browser.in_flight = Some(previous.clone());
+        app.tx
+            .send(Msg::DirListed(
+                previous.clone(),
+                previous,
+                Ok((vec!["stale".into()], false)),
+            ))
+            .unwrap();
+        app.drain(&ctx);
+        assert_eq!(app.browser.current, current);
+        assert!(app.browser.entries.is_empty());
+        app.tx
+            .send(Msg::DirListed(
+                current.clone(),
+                current.clone(),
+                Err("test access denied".into()),
+            ))
+            .unwrap();
+        app.drain(&ctx);
+        assert_eq!(app.browser.listed_for, Some(current));
         assert_eq!(app.browser.error.as_deref(), Some("test access denied"));
     }
 
@@ -3374,12 +3889,18 @@ mod tests {
     fn torrent_console_summary_cannot_replace_gui_status_with_separator() {
         assert!(torrent_console_line(1, "*** Download Progress Summary as of now ***").is_none());
         assert!(torrent_console_line(1, "============================").is_none());
-        assert!(matches!(torrent_console_line(1, "[#25017a 361MiB/6.8GiB(5%) CN:30 SD:5 DL:4.1MiB]"),
-            Some(Msg::TorrentStatus(1, p, status)) if (p - 0.05).abs() < 0.001 && status.contains("361MiB/6.8GiB")));
-        assert!(matches!(torrent_console_line(1, "FILE: [MEMORY][METADATA][DL] Cuphead"),
-            Some(Msg::TorrentMeta(1, name)) if name == "Cuphead"));
-        assert!(matches!(torrent_console_line(1, "Exception: errorCode=13 File x exists, but a control file(*.aria2) does not exist."),
-            Some(Msg::ErrLine(1, line)) if engines::aria2_missing_control(&line)));
+        assert!(
+            matches!(torrent_console_line(1, "[#25017a 361MiB/6.8GiB(5%) CN:30 SD:5 DL:4.1MiB]"),
+            Some(Msg::TorrentStatus(1, p, status)) if (p - 0.05).abs() < 0.001 && status.contains("361MiB/6.8GiB"))
+        );
+        assert!(
+            matches!(torrent_console_line(1, "FILE: [MEMORY][METADATA][DL] Cuphead"),
+            Some(Msg::TorrentMeta(1, name)) if name == "Cuphead")
+        );
+        assert!(
+            matches!(torrent_console_line(1, "Exception: errorCode=13 File x exists, but a control file(*.aria2) does not exist."),
+            Some(Msg::ErrLine(1, line)) if engines::aria2_missing_control(&line))
+        );
     }
 
     #[test]
@@ -3392,10 +3913,16 @@ mod tests {
         assert_eq!(url, file.to_string_lossy());
         assert_eq!(detect_engine(&url), "aria2");
         let job = Job {
-            engine: detect_engine(&url).into(), url, out_dir: dir.join("Downloads"),
-            fmt: "best".into(), cookies_browser: None,
+            engine: detect_engine(&url).into(),
+            url,
+            out_dir: dir.join("Downloads"),
+            fmt: "best".into(),
+            cookies_browser: None,
         };
-        let tc = Toolchain { yt_dlp: None, aria2c: Some(PathBuf::from("aria2c")) };
+        let tc = Toolchain {
+            yt_dlp: None,
+            aria2c: Some(PathBuf::from("aria2c")),
+        };
         let cmd = engines::build(&job, &tc).unwrap();
         assert_eq!(cmd[cmd.len() - 2], "--");
         assert_eq!(cmd.last().unwrap(), file.as_os_str());
@@ -3408,7 +3935,10 @@ mod tests {
         let ctx = egui::Context::default();
         setup_theme(&ctx, true);
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(460.0, 600.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(460.0, 600.0),
+            )),
             ..Default::default()
         };
         let mut heights = Vec::new();
@@ -3419,16 +3949,32 @@ mod tests {
                 for (progress, paused, fill, labels) in [
                     (Some(0.3), false, green, (("пауза", 86.0), ("отмена", 86.0))),
                     (None, false, green, (("пауза", 86.0), ("отмена", 86.0))),
-                    (Some(0.3), true, yellow, (("продолжить", 100.0), ("убрать", 72.0))),
+                    (
+                        Some(0.3),
+                        true,
+                        yellow,
+                        (("продолжить", 100.0), ("убрать", 72.0)),
+                    ),
                 ] {
                     let top = ui.cursor().top();
-                    let _ = job_controls(ui, progress, fill, paused, "Подключение…", labels.0, labels.1);
+                    let _ = job_controls(
+                        ui,
+                        progress,
+                        fill,
+                        paused,
+                        "Подключение…",
+                        labels.0,
+                        labels.1,
+                    );
                     heights.push(ui.cursor().top() - top);
                 }
             });
         });
         for height in heights {
-            assert!((height - 34.0).abs() < 1.0, "row + spacing must be 28 + 6, got {height}");
+            assert!(
+                (height - 34.0).abs() < 1.0,
+                "row + spacing must be 28 + 6, got {height}"
+            );
         }
     }
 
@@ -3437,9 +3983,21 @@ mod tests {
         let ctx = egui::Context::default();
         setup_theme(&ctx, true);
         let files = [
-            torrent::FileEntry { index: 1, path: "folder/a.bin".into(), size: 10 },
-            torrent::FileEntry { index: 2, path: "folder/sub/b.bin".into(), size: 20 },
-            torrent::FileEntry { index: 3, path: "top.txt".into(), size: 5 },
+            torrent::FileEntry {
+                index: 1,
+                path: "folder/a.bin".into(),
+                size: 10,
+            },
+            torrent::FileEntry {
+                index: 2,
+                path: "folder/sub/b.bin".into(),
+                size: 20,
+            },
+            torrent::FileEntry {
+                index: 3,
+                path: "top.txt".into(),
+                size: 5,
+            },
         ];
         let mut tree = torrent::build_torrent_tree(&files);
         tree[0].expanded = true;
@@ -3450,7 +4008,10 @@ mod tests {
         // + checkbox) and two file rows (checkbox only).
         assert_eq!(rows.len(), 4);
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(600.0, 600.0))),
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 600.0),
+            )),
             ..Default::default()
         };
         let (mut heights, mut pitch) = (Vec::new(), 0.0);
@@ -3466,7 +4027,10 @@ mod tests {
             });
         });
         for height in heights {
-            assert!((height - pitch).abs() < 0.5, "every row must advance {pitch}, got {height}");
+            assert!(
+                (height - pitch).abs() < 0.5,
+                "every row must advance {pitch}, got {height}"
+            );
         }
     }
 
@@ -3499,7 +4063,8 @@ mod tests {
             },
             cancel: Arc::new(AtomicBool::new(false)),
             info: Some(torrent::TorrentInfo {
-                name: "Очень длинное имя торрента, которое не помещается в одну строку диалога".into(),
+                name: "Очень длинное имя торрента, которое не помещается в одну строку диалога"
+                    .into(),
                 total: 30 << 30,
                 files: files.clone(),
             }),
@@ -3516,7 +4081,10 @@ mod tests {
             let (mut rect, mut buttons) = (None, Vec::new());
             // A Window settles its size over the first frames.
             for _ in 0..3 {
-                let input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
                 let _ = ctx.run(input, |ctx| {
                     let (act, shown) = torrent_pick_window(ctx, pick);
                     (rect, buttons) = (shown, act.buttons);
@@ -3524,18 +4092,28 @@ mod tests {
             }
             (rect.expect("the pick window is shown"), buttons)
         };
-        let check = |what: &str, (dialog, buttons): (egui::Rect, Vec<egui::Rect>), expected: usize| {
-            assert!(screen.contains_rect(dialog), "{what} dialog {dialog:?} must fit {screen:?}");
-            assert_eq!(buttons.len(), expected, "{what}: buttons drawn");
-            for (i, a) in buttons.iter().enumerate() {
-                assert!(dialog.contains_rect(*a), "{what}: button {a:?} outside {dialog:?}");
-                for b in &buttons[i + 1..] {
-                    let both = a.intersect(*b);
-                    // An overlap made a click on one button hit the other.
-                    assert!(both.width() <= 0.0 || both.height() <= 0.0, "{what}: {a:?} overlaps {b:?}");
+        let check =
+            |what: &str, (dialog, buttons): (egui::Rect, Vec<egui::Rect>), expected: usize| {
+                assert!(
+                    screen.contains_rect(dialog),
+                    "{what} dialog {dialog:?} must fit {screen:?}"
+                );
+                assert_eq!(buttons.len(), expected, "{what}: buttons drawn");
+                for (i, a) in buttons.iter().enumerate() {
+                    assert!(
+                        dialog.contains_rect(*a),
+                        "{what}: button {a:?} outside {dialog:?}"
+                    );
+                    for b in &buttons[i + 1..] {
+                        let both = a.intersect(*b);
+                        // An overlap made a click on one button hit the other.
+                        assert!(
+                            both.width() <= 0.0 || both.height() <= 0.0,
+                            "{what}: {a:?} overlaps {b:?}"
+                        );
+                    }
                 }
-            }
-        };
+            };
         check("list", frame(&mut pick), 4);
         pick.info = None;
         pick.error = Some("не удалось получить метаданные торрента (таймаут)".into());
@@ -3545,10 +4123,23 @@ mod tests {
     #[test]
     fn late_startup_discovery_does_not_undo_installed_tools() {
         let installed = PathBuf::from("installed-aria2c.exe");
-        let mut tools = Toolchain { yt_dlp: None, aria2c: Some(installed.clone()) };
-        apply_initial_discovery(&mut tools, true, Toolchain { yt_dlp: None, aria2c: None });
+        let mut tools = Toolchain {
+            yt_dlp: None,
+            aria2c: Some(installed.clone()),
+        };
+        apply_initial_discovery(
+            &mut tools,
+            true,
+            Toolchain {
+                yt_dlp: None,
+                aria2c: None,
+            },
+        );
         assert_eq!(tools.aria2c, Some(installed));
-        let mut not_installed = Toolchain { yt_dlp: None, aria2c: None };
+        let mut not_installed = Toolchain {
+            yt_dlp: None,
+            aria2c: None,
+        };
         apply_initial_discovery(&mut not_installed, false, tools);
         assert!(not_installed.aria2c.is_some());
     }

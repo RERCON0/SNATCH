@@ -18,8 +18,8 @@ use inquire::{Confirm, Select, Text};
 
 use snatch_rs::config::Config;
 use snatch_rs::engines::{
-    self, batch_name, detect_engine, is_unc_path, preflight_warning,
-    validate_cookies_browser, validate_url, Job, RunResult, COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
+    self, batch_name, detect_engine, is_unc_path, preflight_warning, validate_cookies_browser,
+    validate_url, Job, RunResult, COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
 };
 #[cfg(windows)]
 use snatch_rs::setup::{install_aria2, install_deno, install_ffmpeg, install_yt_dlp};
@@ -122,8 +122,18 @@ fn extras_from_args(args: &Args) -> Result<engines::RunExtras, String> {
         subs: args.subs,
         sub_langs: args.sub_langs.clone().unwrap_or_default(),
         playlist: args.playlist,
-        extra_ytdlp: args.yt_dlp_args.as_deref().map(engines::split_cli_args).transpose()?.unwrap_or_default(),
-        extra_aria2: args.aria2_args.as_deref().map(engines::split_cli_args).transpose()?.unwrap_or_default(),
+        extra_ytdlp: args
+            .yt_dlp_args
+            .as_deref()
+            .map(engines::split_cli_args)
+            .transpose()?
+            .unwrap_or_default(),
+        extra_aria2: args
+            .aria2_args
+            .as_deref()
+            .map(engines::split_cli_args)
+            .transpose()?
+            .unwrap_or_default(),
     })
 }
 
@@ -132,7 +142,10 @@ fn plan_from_args(args: &Args) -> Option<Plan> {
         errln("Для режима -y нужны хотя бы одна ссылка и --output.");
         return None;
     };
-    let engine = args.engine.clone().unwrap_or_else(|| detect_engine(url).to_string());
+    let engine = args
+        .engine
+        .clone()
+        .unwrap_or_else(|| detect_engine(url).to_string());
     let fmt = args.format.clone().unwrap_or_else(|| "best".to_string());
     let extras = match extras_from_args(args) {
         Ok(extras) => extras,
@@ -159,7 +172,10 @@ fn plans_from_args(args: &Args) -> Option<Vec<Plan>> {
     for url in args.urls.iter().skip(1) {
         plans.push(Plan {
             url: url.clone(),
-            engine: args.engine.clone().unwrap_or_else(|| detect_engine(url).to_string()),
+            engine: args
+                .engine
+                .clone()
+                .unwrap_or_else(|| detect_engine(url).to_string()),
             fmt: plans[0].fmt.clone(),
             out_dir: plans[0].out_dir.clone(),
             cookies_browser: plans[0].cookies_browser.clone(),
@@ -214,7 +230,9 @@ mod picker_console {
     static ALTERNATE: AtomicBool = AtomicBool::new(false);
 
     pub fn restore() {
-        if !RAW.swap(false, Ordering::SeqCst) { return; }
+        if !RAW.swap(false, Ordering::SeqCst) {
+            return;
+        }
         let _ = crossterm::terminal::disable_raw_mode();
         let mut out = std::io::stdout();
         if ALTERNATE.swap(false, Ordering::SeqCst) {
@@ -239,10 +257,18 @@ mod picker_console {
             static INIT: std::sync::Once = std::sync::Once::new();
             INIT.call_once(|| {
                 let previous = std::panic::take_hook();
-                std::panic::set_hook(Box::new(move |info| { restore(); previous(info); }));
+                std::panic::set_hook(Box::new(move |info| {
+                    restore();
+                    previous(info);
+                }));
                 #[cfg(windows)]
                 unsafe {
-                    extern "system" { fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32; }
+                    extern "system" {
+                        fn SetConsoleCtrlHandler(
+                            handler: Option<unsafe extern "system" fn(u32) -> i32>,
+                            add: i32,
+                        ) -> i32;
+                    }
                     SetConsoleCtrlHandler(Some(control), 1);
                 }
             });
@@ -252,7 +278,9 @@ mod picker_console {
         }
     }
     impl Drop for InterruptGuard {
-        fn drop(&mut self) { LISTEN.store(false, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            LISTEN.store(false, Ordering::SeqCst);
+        }
     }
 
     pub fn raw_started(alternate: bool) {
@@ -267,15 +295,26 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     if plan.engine != "aria2" || !engines::is_bittorrent_input(&plan.url) {
         return Use(torrent::Choice::default());
     }
-    let Some(aria2c) = &tc.aria2c else { return Use(torrent::Choice::default()) };
+    let Some(aria2c) = &tc.aria2c else {
+        return Use(torrent::Choice::default());
+    };
     // Same gate the download itself applies, and BEFORE anything touches the
     // input: a \\host\share path must not even be probed (SMB auth leak),
     // and a malformed link should not cost a metadata fetch first. An invalid
     // link skips the picker; download() reports the reason.
-    let Ok(url) = validate_url(&plan.url) else { return Use(torrent::Choice::default()) };
-    outln("⌛ получаю список файлов торрента (для magnet это может занять минуту; Ctrl+C — отмена)…");
+    let Ok(url) = validate_url(&plan.url) else {
+        return Use(torrent::Choice::default());
+    };
+    outln(
+        "⌛ получаю список файлов торрента (для magnet это может занять минуту; Ctrl+C — отмена)…",
+    );
     let _interrupt = picker_console::InterruptGuard::new();
-    let listing = match torrent::show_files(aria2c, &url, torrent::METADATA_TIMEOUT, &picker_console::CANCEL) {
+    let listing = match torrent::show_files(
+        aria2c,
+        &url,
+        torrent::METADATA_TIMEOUT,
+        &picker_console::CANCEL,
+    ) {
         Ok(listing) => listing,
         Err(_) if picker_console::CANCEL.load(Ordering::SeqCst) => return Cancel,
         Err(e) => {
@@ -298,7 +337,10 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     let info = &listing.info;
     // Every outcome keeps the fetched metadata: the download then reuses it
     // instead of asking the swarm for it a second time.
-    let all = torrent::Choice { files: None, meta: listing.meta.clone() };
+    let all = torrent::Choice {
+        files: None,
+        meta: listing.meta.clone(),
+    };
     if info.files.len() <= 1 {
         return Use(all);
     }
@@ -311,10 +353,13 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     // Default is the whole torrent (what the release intends); the full
     // file picker only opens when the user explicitly asks for it - dumping
     // hundreds of entries unprompted is unreadable.
-    match Confirm::new(&format!("Скачать все {} файлов (как в раздаче)?", info.files.len()))
-        .with_default(true)
-        .with_help_message("ответьте «нет», чтобы выбрать отдельные файлы")
-        .prompt()
+    match Confirm::new(&format!(
+        "Скачать все {} файлов (как в раздаче)?",
+        info.files.len()
+    ))
+    .with_default(true)
+    .with_help_message("ответьте «нет», чтобы выбрать отдельные файлы")
+    .prompt()
     {
         Ok(true) => return Use(all),
         Ok(false) => {}
@@ -325,7 +370,10 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     match pick_torrent_files(info) {
         Ok(Some(sel)) => {
             outln(PARTIAL_NEIGHBOURS_NOTE);
-            Use(torrent::Choice { files: Some(sel), meta: listing.meta })
+            Use(torrent::Choice {
+                files: Some(sel),
+                meta: listing.meta,
+            })
         }
         Ok(None) => Use(all),
         Err(()) => Cancel,
@@ -348,14 +396,19 @@ fn download(plan: &Plan, cfg: &mut Config, tc: Option<&Toolchain>) -> RunResult 
 }
 
 fn download_with_discovery(
-    plan: &Plan, cfg: &mut Config, tc: Option<&Toolchain>,
+    plan: &Plan,
+    cfg: &mut Config,
+    tc: Option<&Toolchain>,
     discover: impl FnOnce() -> Toolchain,
 ) -> RunResult {
     let url = match validate_url(&plan.url) {
         Ok(u) => u,
         Err(e) => {
             errln(format!("✘ {e}"));
-            return RunResult { code: 2, auth_hint: false };
+            return RunResult {
+                code: 2,
+                auth_hint: false,
+            };
         }
     };
     let discovered;
@@ -367,9 +420,14 @@ fn download_with_discovery(
         }
     };
 
-    let clean_plan = Plan { url, ..plan.clone() };
+    let clean_plan = Plan {
+        url,
+        ..plan.clone()
+    };
     run_batch(std::slice::from_ref(&clean_plan), cfg, tc, 1)
-        .into_iter().next().expect("one queued job has one result")
+        .into_iter()
+        .next()
+        .expect("one queued job has one result")
 }
 
 enum BatchEvent {
@@ -418,7 +476,8 @@ fn highlight_progress(status: &str) -> String {
             // Advance past the WHOLE whitespace char: for a multi-byte
             // whitespace (e.g. NNBSP) `i + 1` is not a char boundary and
             // insert_str would panic.
-            let start = out[..end].rfind(char::is_whitespace)
+            let start = out[..end]
+                .rfind(char::is_whitespace)
                 .map_or(0, |i| i + out[i..].chars().next().map_or(1, char::len_utf8));
             out.insert_str(end + 1, RESET);
             out.insert_str(start, GREEN);
@@ -426,9 +485,13 @@ fn highlight_progress(status: &str) -> String {
         return out;
     }
     let mut fields = status.split(" · ");
-    let Some(percent) = fields.next() else { return status.to_string(); };
+    let Some(percent) = fields.next() else {
+        return status.to_string();
+    };
     if !percent.ends_with('%')
-        || !percent[..percent.len() - 1].chars().all(|c| c.is_ascii_digit() || c == '.' || c == ',')
+        || !percent[..percent.len() - 1]
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == ',')
     {
         return status.to_string();
     }
@@ -458,32 +521,58 @@ impl BatchDisplay {
         let mut bars = Vec::new();
         let mut views = Vec::new();
         for (id, plan) in plans.iter().enumerate() {
-            views.push(BatchView { name: batch_name(&plan.url), status: "в очереди".into(), last_printed: None });
+            views.push(BatchView {
+                name: batch_name(&plan.url),
+                status: "в очереди".into(),
+                last_printed: None,
+            });
             if let Some(multi) = &multi {
                 let bar = multi.add(ProgressBar::new_spinner());
-                bar.set_style(ProgressStyle::with_template("{spinner:.green} {wide_msg}").expect("valid style"));
+                bar.set_style(
+                    ProgressStyle::with_template("{spinner:.green} {wide_msg}")
+                        .expect("valid style"),
+                );
                 bar.set_message(Self::line(id, plans.len(), &views[id], colors));
                 bars.push(bar);
             } else {
                 outln(Self::line(id, plans.len(), &views[id], false));
             }
         }
-        Self { multi, bars, views, colors, ticking: vec![false; plans.len()] }
+        Self {
+            multi,
+            bars,
+            views,
+            colors,
+            ticking: vec![false; plans.len()],
+        }
     }
 
     fn line(id: usize, total: usize, view: &BatchView, colors: bool) -> String {
-        let status = if colors { highlight_progress(&view.status) } else { view.status.clone() };
-        format!("[{} / {}] {} — {}", id + 1, total, clip(&view.name, 38), status)
+        let status = if colors {
+            highlight_progress(&view.status)
+        } else {
+            view.status.clone()
+        };
+        format!(
+            "[{} / {}] {} — {}",
+            id + 1,
+            total,
+            clip(&view.name, 38),
+            status
+        )
     }
 
     fn update(&mut self, id: usize, status: Option<String>, name: Option<String>) {
         let total = self.views.len();
         let view = &mut self.views[id];
-        if let Some(name) = name { view.name = name; }
+        if let Some(name) = name {
+            view.name = name;
+        }
         if let Some(status) = status {
             // The generic allocation notice can arrive from stderr after a
             // more useful byte counter on stdout; don't overwrite the latter.
-            if status != "выделение места на диске…" || !view.status.contains("выделение места ") {
+            if status != "выделение места на диске…" || !view.status.contains("выделение места ")
+            {
                 view.status = status;
             }
         }
@@ -494,7 +583,10 @@ impl BatchDisplay {
                 self.ticking[id] = true;
             }
             self.bars[id].set_message(line);
-        } else if view.last_printed.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
+        } else if view
+            .last_printed
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
+        {
             outln(line);
             view.last_printed = Some(Instant::now());
         }
@@ -504,7 +596,12 @@ impl BatchDisplay {
         // Network-sourced metadata (torrent listings, resolved names) never
         // goes through a child pipe. Never let it inject terminal escapes.
         let safe = engines::sanitize_child_output(text);
-        let line = format!("[{} / {}] {}: {safe}", id + 1, self.views.len(), clip(&self.views[id].name, 38));
+        let line = format!(
+            "[{} / {}] {}: {safe}",
+            id + 1,
+            self.views.len(),
+            clip(&self.views[id].name, 38)
+        );
         if let Some(multi) = &self.multi {
             let _ = multi.println(line);
         } else {
@@ -546,10 +643,14 @@ fn read_batch_pipe(
         let decoded = clean_loader_text(&decoded_bytes);
         let mut latest = None;
         for line in decoded.lines().map(str::trim).filter(|s| !s.is_empty()) {
-            if engines::looks_like_auth(line) { auth.store(true, Ordering::Relaxed); }
+            if engines::looks_like_auth(line) {
+                auth.store(true, Ordering::Relaxed);
+            }
             if line.contains("Download Progress Summary as of")
                 || line.chars().all(|c| c == '-' || c == '=')
-            { continue; }
+            {
+                continue;
+            }
             if line.starts_with("FILE:") && line.contains("[MEMORY][METADATA]") {
                 latest = Some("получение метаданных торрента…".into());
             } else if let Some(name) = engines::aria2_name_from_file(line) {
@@ -594,7 +695,10 @@ fn run_batch_job(
         Ok(url) => url,
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
-            return RunResult { code: 2, auth_hint: false };
+            return RunResult {
+                code: 2,
+                auth_hint: false,
+            };
         }
     };
     let job = Job {
@@ -613,21 +717,37 @@ fn run_batch_job(
         Ok(lock) => lock,
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
-            return RunResult { code: 2, auth_hint: false };
+            return RunResult {
+                code: 2,
+                auth_hint: false,
+            };
         }
     };
-    let cmd = match cli_command(&job, tc, plan.no_continue, true, &plan.torrent, &plan.extras) {
+    let cmd = match cli_command(
+        &job,
+        tc,
+        plan.no_continue,
+        true,
+        &plan.torrent,
+        &plan.extras,
+    ) {
         Ok(cmd) => cmd,
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
-            return RunResult { code: 2, auth_hint: false };
+            return RunResult {
+                code: 2,
+                auth_hint: false,
+            };
         }
     };
     let install_guard = match snatch_rs::tools::lock_for_spawn(Path::new(&cmd[0])) {
         Ok(guard) => guard,
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(id, format!("✘ {e}")));
-            return RunResult { code: 127, auth_hint: false };
+            return RunResult {
+                code: 127,
+                auth_hint: false,
+            };
         }
     };
     let mut command = Command::new(&cmd[0]);
@@ -645,7 +765,10 @@ fn run_batch_job(
                 id,
                 format!("✘ Не удалось запустить загрузчик: {e}"),
             ));
-            return RunResult { code: 127, auth_hint: false };
+            return RunResult {
+                code: 127,
+                auth_hint: false,
+            };
         }
     };
     drop(install_guard);
@@ -655,14 +778,16 @@ fn run_batch_job(
     let err_tx = tx.clone();
     let err_auth = auth.clone();
     let aria2 = job.engine == "aria2";
-    let err_reader = std::thread::spawn(move || {
-        read_batch_pipe(stderr, id, aria2, &err_tx, &err_auth)
-    });
+    let err_reader =
+        std::thread::spawn(move || read_batch_pipe(stderr, id, aria2, &err_tx, &err_auth));
     let out_tx = tx.clone();
     let out_auth = auth.clone();
-    let out_reader = std::thread::spawn(move || read_batch_pipe(stdout, id, aria2, &out_tx, &out_auth));
+    let out_reader =
+        std::thread::spawn(move || read_batch_pipe(stdout, id, aria2, &out_tx, &out_auth));
     let status = child.wait();
-    if let Some(job) = &proc_job { job.terminate(); }
+    if let Some(job) = &proc_job {
+        job.terminate();
+    }
     let _ = out_reader.join();
     let _ = err_reader.join();
     RunResult {
@@ -721,8 +846,10 @@ fn run_batch_with(
                             display.diagnostic(id, engines::ARIA2_MISSING_CONTROL_HINT);
                         }
                     } else if plans[id].engine != "aria2"
-                        || !(line.contains("Exception caught") || line.starts_with("(OK):")
-                            || line.starts_with("If there are any errors")) {
+                        || !(line.contains("Exception caught")
+                            || line.starts_with("(OK):")
+                            || line.starts_with("If there are any errors"))
+                    {
                         display.diagnostic(id, &line);
                     }
                 }
@@ -739,9 +866,15 @@ fn run_batch_with(
                             display.diagnostic(id, PARTIAL_NEIGHBOURS_NOTE);
                         }
                     } else if missing_control[id] {
-                        display.finished(id, "✘ Файлы уже есть, но нет .aria2 — выберите пустую папку".into());
+                        display.finished(
+                            id,
+                            "✘ Файлы уже есть, но нет .aria2 — выберите пустую папку".into(),
+                        );
                     } else {
-                        display.finished(id, format!("✘ Ошибка (код {}). См. сообщения выше.", result.code));
+                        display.finished(
+                            id,
+                            format!("✘ Ошибка (код {}). См. сообщения выше.", result.code),
+                        );
                     }
                     results[id] = Some(result);
                 }
@@ -750,7 +883,12 @@ fn run_batch_with(
     });
     results
         .into_iter()
-        .map(|r| r.unwrap_or(RunResult { code: 127, auth_hint: false }))
+        .map(|r| {
+            r.unwrap_or(RunResult {
+                code: 127,
+                auth_hint: false,
+            })
+        })
         .collect()
 }
 
@@ -762,7 +900,12 @@ fn should_offer_cookies(plan: &Plan, code: i32, auth_hint: bool) -> bool {
     code == RETRY_CODE && auth_hint && plan.engine == "yt-dlp"
 }
 
-fn retry_with_cookies(plan: Plan, result: RunResult, cfg: &mut Config, tc: &Toolchain) -> RunResult {
+fn retry_with_cookies(
+    plan: Plan,
+    result: RunResult,
+    cfg: &mut Config,
+    tc: &Toolchain,
+) -> RunResult {
     retry_with_cookies_inner(
         plan,
         result,
@@ -796,7 +939,10 @@ fn retry_with_cookies_inner(
     while should_offer_cookies(&plan, result.code, result.auth_hint) {
         let had_cookies = plan.cookies_browser.is_some();
         let question = if had_cookies {
-            format!("\nНе скачалось (код {}). Попробовать с куками другого браузера?", result.code)
+            format!(
+                "\nНе скачалось (код {}). Попробовать с куками другого браузера?",
+                result.code
+            )
         } else {
             format!(
                 "\nНе скачалось (код {}). Похоже, сайту нужна авторизация: можно взять куки \
@@ -841,29 +987,42 @@ fn split_links(text: &str) -> Result<Vec<String>, &'static str> {
             (Some(q), ch) if q == ch => quoted = None,
             (None, '\'' | '"') => quoted = Some(c),
             (None, ch) if ch.is_whitespace() => {
-                if !current.is_empty() { urls.push(std::mem::take(&mut current)); }
+                if !current.is_empty() {
+                    urls.push(std::mem::take(&mut current));
+                }
             }
             _ => current.push(c),
         }
     }
-    if quoted.is_some() { return Err("Не закрыты кавычки вокруг ссылки или пути к .torrent."); }
-    if !current.is_empty() { urls.push(current); }
+    if quoted.is_some() {
+        return Err("Не закрыты кавычки вокруг ссылки или пути к .torrent.");
+    }
+    if !current.is_empty() {
+        urls.push(current);
+    }
     Ok(urls)
 }
 
 fn ask_links(cfg: &Config) -> Option<Vec<String>> {
     loop {
-        let text = Text::new("Ссылки через пробел (Enter — история):").prompt().ok()?;
+        let text = Text::new("Ссылки через пробел (Enter — история):")
+            .prompt()
+            .ok()?;
         if !text.trim().is_empty() {
             match split_links(&text) {
                 Ok(urls) if !urls.is_empty() => return Some(urls),
                 // Quotes/whitespace only: nothing to download - ask again
                 // instead of "succeeding" with a zero-URL queue.
                 Ok(_) => continue,
-                Err(e) => { errln(format!("✘ {e}")); continue; }
+                Err(e) => {
+                    errln(format!("✘ {e}"));
+                    continue;
+                }
             }
         }
-        if cfg.urls.is_empty() { return None; }
+        if cfg.urls.is_empty() {
+            return None;
+        }
         let mut choices = vec![LinkChoice::New];
         choices.extend(cfg.urls.iter().take(6).cloned().map(LinkChoice::Existing));
         let pick = Select::new("Последние ссылки:", choices)
@@ -871,7 +1030,9 @@ fn ask_links(cfg: &Config) -> Option<Vec<String>> {
             .with_help_message(SELECT_HELP_PLAIN)
             .prompt()
             .ok()?;
-        if let LinkChoice::Existing(url) = pick { return Some(vec![url]); }
+        if let LinkChoice::Existing(url) = pick {
+            return Some(vec![url]);
+        }
     }
 }
 
@@ -923,7 +1084,11 @@ fn ask_engine(url: &str, tc: &Toolchain) -> Option<String> {
             EngineOpt(e, label)
         })
         .collect();
-    Select::new("Чем скачивать:", choices).with_help_message(SELECT_HELP).prompt().ok().map(|c| c.0.to_string())
+    Select::new("Чем скачивать:", choices)
+        .with_help_message(SELECT_HELP)
+        .prompt()
+        .ok()
+        .map(|c| c.0.to_string())
 }
 
 fn ask_format() -> Option<String> {
@@ -934,7 +1099,11 @@ fn ask_format() -> Option<String> {
         }
     }
     let choices: Vec<FmtOpt> = FORMATS.iter().map(|(k, l)| FmtOpt(k, l)).collect();
-    Select::new("Формат (yt-dlp):", choices).with_help_message(SELECT_HELP).prompt().ok().map(|c| c.0.to_string())
+    Select::new("Формат (yt-dlp):", choices)
+        .with_help_message(SELECT_HELP)
+        .prompt()
+        .ok()
+        .map(|c| c.0.to_string())
 }
 
 enum DirEntryChoice {
@@ -950,7 +1119,11 @@ impl fmt::Display for DirEntryChoice {
             // File names are remote-controlled (archive contents!): never let
             // them inject raw escape sequences into the terminal menu.
             DirEntryChoice::Select(p) => {
-                write!(f, "✓ Выбрать эту папку ({})", clip(&p.display().to_string(), 90))
+                write!(
+                    f,
+                    "✓ Выбрать эту папку ({})",
+                    clip(&p.display().to_string(), 90)
+                )
             }
             DirEntryChoice::Up => write!(f, "↑ Наверх"),
             // Honest wording: the list is alphabetical and the tail is never
@@ -960,7 +1133,10 @@ impl fmt::Display for DirEntryChoice {
                 "… показаны первые {MAX_BROWSE_ENTRIES} папок по алфавиту (всего {n})"
             ),
             DirEntryChoice::Down(p) => {
-                let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
                 write!(f, "📁 {}", clip(&name, 60))
             }
         }
@@ -969,8 +1145,14 @@ impl fmt::Display for DirEntryChoice {
 
 fn browse_dir(start: PathBuf) -> Option<String> {
     let fallback = snatch_rs::config::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let mut current = if !is_unc_path(&start) && start.exists() { start } else { fallback };
-    if is_unc_path(&current) { return None; }
+    let mut current = if !is_unc_path(&start) && start.exists() {
+        start
+    } else {
+        fallback
+    };
+    if is_unc_path(&current) {
+        return None;
+    }
     loop {
         let all_dirs = safe_read_dirs(&current);
         let shown = all_dirs.len().min(MAX_BROWSE_ENTRIES);
@@ -979,7 +1161,13 @@ fn browse_dir(start: PathBuf) -> Option<String> {
         if all_dirs.len() > MAX_BROWSE_ENTRIES {
             choices.push(DirEntryChoice::More(all_dirs.len()));
         }
-        let ans = Select::new(&format!("Папка: {}", clip(&current.display().to_string(), 90)), choices).with_help_message(SELECT_HELP).prompt().ok()?;
+        let ans = Select::new(
+            &format!("Папка: {}", clip(&current.display().to_string(), 90)),
+            choices,
+        )
+        .with_help_message(SELECT_HELP)
+        .prompt()
+        .ok()?;
         match ans {
             DirEntryChoice::Select(p) => return Some(p.to_string_lossy().into_owned()),
             DirEntryChoice::Up => {
@@ -1017,8 +1205,10 @@ fn ask_dir(cfg: &Config) -> Option<String> {
     let home = snatch_rs::config::home_dir().unwrap_or_else(|| PathBuf::from("."));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let mut choices = Vec::new();
-    if !cfg.last_dir.is_empty() && !is_unc_path(Path::new(&cfg.last_dir))
-        && Path::new(&cfg.last_dir).exists() {
+    if !cfg.last_dir.is_empty()
+        && !is_unc_path(Path::new(&cfg.last_dir))
+        && Path::new(&cfg.last_dir).exists()
+    {
         choices.push(DirChoice::Last(cfg.last_dir.clone()));
     }
     choices.push(DirChoice::Downloads);
@@ -1026,24 +1216,40 @@ fn ask_dir(cfg: &Config) -> Option<String> {
     choices.push(DirChoice::Cwd);
     choices.push(DirChoice::Browse);
 
-    let pick = Select::new("Куда сохранять:", choices).with_help_message(SELECT_HELP).prompt().ok()?;
+    let pick = Select::new("Куда сохранять:", choices)
+        .with_help_message(SELECT_HELP)
+        .prompt()
+        .ok()?;
     match pick {
         DirChoice::Last(d) => Some(d),
         DirChoice::Downloads => Some(home.join("Downloads").to_string_lossy().into_owned()),
         DirChoice::Desktop => Some(home.join("Desktop").to_string_lossy().into_owned()),
         DirChoice::Cwd => Some(cwd.to_string_lossy().into_owned()),
         DirChoice::Browse => {
-            let start = if !cfg.last_dir.is_empty() { PathBuf::from(&cfg.last_dir) } else { PathBuf::from(&cfg.default_dir) };
+            let start = if !cfg.last_dir.is_empty() {
+                PathBuf::from(&cfg.last_dir)
+            } else {
+                PathBuf::from(&cfg.default_dir)
+            };
             browse_dir(start)
         }
     }
 }
 
 /// The plan summary line shown before starting the whole queue.
-fn confirm_message(engine: &str, fmt: &str, out_dir: &str, cookies_browser: Option<&str>) -> String {
+fn confirm_message(
+    engine: &str,
+    fmt: &str,
+    out_dir: &str,
+    cookies_browser: Option<&str>,
+) -> String {
     match engine {
         "yt-dlp" => {
-            let label = FORMATS.iter().find(|(k, _)| *k == fmt).map(|(_, l)| *l).unwrap_or(fmt);
+            let label = FORMATS
+                .iter()
+                .find(|(k, _)| *k == fmt)
+                .map(|(_, l)| *l)
+                .unwrap_or(fmt);
             let mut m = format!(" yt-dlp · {label} · → {}", clip(out_dir, 40));
             if let Some(b) = cookies_browser {
                 m.push_str(&format!(" · 🍪 куки: {b}"));
@@ -1055,24 +1261,61 @@ fn confirm_message(engine: &str, fmt: &str, out_dir: &str, cookies_browser: Opti
 }
 
 fn queue_summary(plans: &[Plan], jobs: u8) -> String {
-    let mut summary = format!("Задач: {} · одновременно: {}", plans.len(), plans.len().min(usize::from(jobs)));
+    let mut summary = format!(
+        "Задач: {} · одновременно: {}",
+        plans.len(),
+        plans.len().min(usize::from(jobs))
+    );
     for (i, plan) in plans.iter().enumerate() {
-        let cookies = if plan.engine == "yt-dlp" { plan.cookies_browser.as_deref() } else { None };
-        summary.push_str(&format!("\n  {}/{}. {}\n       {}", i + 1, plans.len(), clip(&plan.url, 60),
-            confirm_message(&plan.engine, &plan.fmt, &plan.out_dir, cookies).trim()));
+        let cookies = if plan.engine == "yt-dlp" {
+            plan.cookies_browser.as_deref()
+        } else {
+            None
+        };
+        summary.push_str(&format!(
+            "\n  {}/{}. {}\n       {}",
+            i + 1,
+            plans.len(),
+            clip(&plan.url, 60),
+            confirm_message(&plan.engine, &plan.fmt, &plan.out_dir, cookies).trim()
+        ));
     }
     summary
 }
 
-fn collect(tc: &Toolchain, url: String, out_dir: &str, cookies_browser: Option<String>, engine_override: Option<&str>, format_override: Option<&str>) -> Option<Plan> {
+fn collect(
+    tc: &Toolchain,
+    url: String,
+    out_dir: &str,
+    cookies_browser: Option<String>,
+    engine_override: Option<&str>,
+    format_override: Option<&str>,
+) -> Option<Plan> {
     if url.is_empty() {
         return None;
     }
-    let engine = match engine_override { Some(engine) => engine.to_string(), None => ask_engine(&url, tc)? };
+    let engine = match engine_override {
+        Some(engine) => engine.to_string(),
+        None => ask_engine(&url, tc)?,
+    };
     let fmt = if engine == "yt-dlp" {
-        match format_override { Some(format) => format.to_string(), None => ask_format()? }
-    } else { "best".to_string() };
-    Some(Plan { url, engine, fmt, out_dir: out_dir.to_string(), cookies_browser, no_continue: false, torrent: torrent::Choice::default(), extras: engines::RunExtras::default() })
+        match format_override {
+            Some(format) => format.to_string(),
+            None => ask_format()?,
+        }
+    } else {
+        "best".to_string()
+    };
+    Some(Plan {
+        url,
+        engine,
+        fmt,
+        out_dir: out_dir.to_string(),
+        cookies_browser,
+        no_continue: false,
+        torrent: torrent::Choice::default(),
+        extras: engines::RunExtras::default(),
+    })
 }
 
 fn main() -> std::process::ExitCode {
@@ -1088,7 +1331,10 @@ fn main() -> std::process::ExitCode {
 
     if args.clear_history {
         cfg.clear_history();
-        if let Err(e) = cfg.try_save() { errln(format!("✘ История не очищена: {e}")); return exit_code(1); }
+        if let Err(e) = cfg.try_save() {
+            errln(format!("✘ История не очищена: {e}"));
+            return exit_code(1);
+        }
         outln("История очищена.");
         return std::process::ExitCode::SUCCESS;
     }
@@ -1103,7 +1349,10 @@ fn main() -> std::process::ExitCode {
         {
             let dir = match bootstrap_dir() {
                 Ok(dir) => dir,
-                Err(e) => { errln(e); return exit_code(2); }
+                Err(e) => {
+                    errln(e);
+                    return exit_code(2);
+                }
             };
             if let Err(e) = std::fs::create_dir_all(&dir) {
                 errln(format!("✘ Не удалось создать {}: {e}", dir.display()));
@@ -1119,7 +1368,10 @@ fn main() -> std::process::ExitCode {
                 };
                 match result {
                     Ok(path) => outln(format!("✔ {name}: {}", path.display())),
-                    Err(e) => { errln(format!("✘ {name}: {e}")); failed = true; }
+                    Err(e) => {
+                        errln(format!("✘ {name}: {e}"));
+                        failed = true;
+                    }
                 }
             }
             return exit_code(if failed { 1 } else { 0 });
@@ -1180,7 +1432,10 @@ fn main() -> std::process::ExitCode {
         let urls = if preset_urls.is_empty() {
             match ask_links(&cfg) {
                 Some(urls) => urls,
-                None => { outln("Отменено."); return exit_code(130); }
+                None => {
+                    outln("Отменено.");
+                    return exit_code(130);
+                }
             }
         } else {
             std::mem::take(&mut preset_urls)
@@ -1198,8 +1453,20 @@ fn main() -> std::process::ExitCode {
         let total = urls.len();
         let mut plans = Vec::with_capacity(total);
         for (i, url) in urls.into_iter().enumerate() {
-            outln(format!("\nНастройка {}/{}: {}", i + 1, total, clip(&url, 65)));
-            let Some(mut plan) = collect(&tc, url, &out_dir, args.cookies_browser.clone(), args.engine.as_deref(), args.format.as_deref()) else {
+            outln(format!(
+                "\nНастройка {}/{}: {}",
+                i + 1,
+                total,
+                clip(&url, 65)
+            ));
+            let Some(mut plan) = collect(
+                &tc,
+                url,
+                &out_dir,
+                args.cookies_browser.clone(),
+                args.engine.as_deref(),
+                args.format.as_deref(),
+            ) else {
                 outln("Отменено.");
                 return exit_code(130);
             };
@@ -1207,7 +1474,11 @@ fn main() -> std::process::ExitCode {
             plans.push(plan);
         }
         outln(queue_summary(&plans, args.jobs));
-        if !Confirm::new("Скачать всё?").with_default(true).prompt().unwrap_or(false) {
+        if !Confirm::new("Скачать всё?")
+            .with_default(true)
+            .prompt()
+            .unwrap_or(false)
+        {
             outln("Отменено.");
             return exit_code(130);
         }
@@ -1252,7 +1523,10 @@ fn main() -> std::process::ExitCode {
                 if should_offer_cookies(&plan, result.code, result.auth_hint) {
                     *result = retry_with_cookies(
                         plan.clone(),
-                        RunResult { code: result.code, auth_hint: result.auth_hint },
+                        RunResult {
+                            code: result.code,
+                            auth_hint: result.auth_hint,
+                        },
                         &mut cfg,
                         &tc,
                     );
@@ -1260,7 +1534,10 @@ fn main() -> std::process::ExitCode {
             }
             batch_exit_code(&results)
         };
-        match Confirm::new("\nСкачать ещё что-нибудь?").with_default(false).prompt() {
+        match Confirm::new("\nСкачать ещё что-нибудь?")
+            .with_default(false)
+            .prompt()
+        {
             Ok(true) => continue,
             _ => return exit_code(code),
         }
@@ -1317,7 +1594,9 @@ fn exit_code(code: i32) -> std::process::ExitCode {
 /// Interactive tree picker for torrent files (qbittorrent-style: folders
 /// collapse, Space toggles a whole subtree). Returns the chosen aria2 file
 /// indices; Err on cancel.
-fn picker_view_rows(height: u16) -> usize { height.saturating_sub(5) as usize }
+fn picker_view_rows(height: u16) -> usize {
+    height.saturating_sub(5) as usize
+}
 
 fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>, ()> {
     use crossterm::event::{self, Event, KeyCode};
@@ -1349,7 +1628,11 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
     if alternate {
         let _ = execute!(out, terminal::EnterAlternateScreen);
     }
-    let clear = if alternate { terminal::ClearType::FromCursorDown } else { terminal::ClearType::All };
+    let clear = if alternate {
+        terminal::ClearType::FromCursorDown
+    } else {
+        terminal::ClearType::All
+    };
     // Drop keys buffered by the previous inquire prompt: a stale Enter in
     // the queue would otherwise confirm the picker instantly, leaving the
     // drawn tree behind while the next prompt silently takes over input.
@@ -1375,15 +1658,30 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
         let view = picker_view_rows(term_h);
         let start = cursor.saturating_sub(view.saturating_sub(1));
         let width = (cols as usize).saturating_sub(1);
-        let _ = queue!(out, cursor::MoveTo(0, 0), terminal::Clear(clear), cursor::Hide);
+        let _ = queue!(
+            out,
+            cursor::MoveTo(0, 0),
+            terminal::Clear(clear),
+            cursor::Hide
+        );
         let header = "ВЫБОР ФАЙЛОВ — ↑↓ движение · →/← раскрыть · Space отметить · Enter подтвердить · Esc отмена";
         if view == 0 {
-            let _ = write!(out, "{}", clip_cells("Увеличьте высоту терминала (Esc — отмена)", width));
-        } else { let _ = write!(out, "{}\r\n\r\n", clip_cells(header, width)); }
+            let _ = write!(
+                out,
+                "{}",
+                clip_cells("Увеличьте высоту терминала (Esc — отмена)", width)
+            );
+        } else {
+            let _ = write!(out, "{}\r\n\r\n", clip_cells(header, width));
+        }
         for (ri, (path, depth)) in rows.iter().enumerate().skip(start).take(view) {
             let node = torrent::node_at(&tree, path);
             let mark = if node.file.is_none() {
-                if node.expanded { "▼" } else { "▶" }
+                if node.expanded {
+                    "▼"
+                } else {
+                    "▶"
+                }
             } else {
                 " "
             };
@@ -1404,7 +1702,11 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
             let line = format!(
                 "{}{}{} {} {} · {}",
                 if ri == cursor { "> " } else { "  " },
-                if *depth > 6 { format!("{}… ", "  ".repeat(6)) } else { "  ".repeat(*depth) },
+                if *depth > 6 {
+                    format!("{}… ", "  ".repeat(6))
+                } else {
+                    "  ".repeat(*depth)
+                },
                 mark,
                 box_,
                 torrent::human_size(node.size),
@@ -1412,11 +1714,17 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
             );
             let line = clip_cells(&line, width);
             if ri == cursor {
-                let _ = queue!(out, crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse));
+                let _ = queue!(
+                    out,
+                    crossterm::style::SetAttribute(crossterm::style::Attribute::Reverse)
+                );
             }
             let _ = write!(out, "{line}\r\n");
             if ri == cursor {
-                let _ = queue!(out, crossterm::style::SetAttribute(crossterm::style::Attribute::Reset));
+                let _ = queue!(
+                    out,
+                    crossterm::style::SetAttribute(crossterm::style::Attribute::Reset)
+                );
             }
         }
         if let Some(text) = note.as_ref().filter(|_| view > 0) {
@@ -1424,8 +1732,12 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
         }
         let _ = out.flush();
 
-        if picker_console::CANCEL.load(Ordering::SeqCst) { return Err(()); }
-        if !event::poll(std::time::Duration::from_millis(100)).map_err(|_| ())? { continue; }
+        if picker_console::CANCEL.load(Ordering::SeqCst) {
+            return Err(());
+        }
+        if !event::poll(std::time::Duration::from_millis(100)).map_err(|_| ())? {
+            continue;
+        }
         match event::read() {
             Ok(Event::Key(key)) => {
                 // Ignore release/repeat events: only real presses navigate.
@@ -1434,72 +1746,76 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
                 }
                 note = None;
                 match key.code {
-                KeyCode::Up => cursor = cursor.saturating_sub(1),
-                KeyCode::Down => cursor = (cursor + 1).min(rows.len().saturating_sub(1)),
-                KeyCode::Left => {
-                    if let Some((path, _)) = rows.get(cursor) {
-                        let node = torrent::node_at_mut(&mut tree, path);
-                        if node.file.is_none() {
-                            view_cache.rows_dirty |= node.expanded;
-                            node.expanded = false;
-                        }
-                    }
-                }
-                KeyCode::Right => {
-                    if let Some((path, _)) = rows.get(cursor) {
-                        let node = torrent::node_at_mut(&mut tree, path);
-                        if node.file.is_none() {
-                            view_cache.rows_dirty |= !node.expanded;
-                            node.expanded = true;
-                        }
-                    }
-                }
-                KeyCode::Char(' ') => {
-                    if let Some((path, _)) = rows.get(cursor) {
-                        let node = torrent::node_at_mut(&mut tree, path);
-                        if let Some(fi) = node.file {
-                            if let Some(s) = selected.get_mut(fi) {
-                                *s = !*s;
+                    KeyCode::Up => cursor = cursor.saturating_sub(1),
+                    KeyCode::Down => cursor = (cursor + 1).min(rows.len().saturating_sub(1)),
+                    KeyCode::Left => {
+                        if let Some((path, _)) = rows.get(cursor) {
+                            let node = torrent::node_at_mut(&mut tree, path);
+                            if node.file.is_none() {
+                                view_cache.rows_dirty |= node.expanded;
+                                node.expanded = false;
                             }
-                        } else {
-                            let (sel, total) = node.selection;
-                            node.set_all(&mut selected, sel != total);
                         }
-                        view_cache.selection_dirty = true;
                     }
-                }
-                KeyCode::Enter => {
-                    if view == 0 { continue; }
-                    let chosen: Vec<usize> = info
-                        .files
-                        .iter()
-                        .enumerate()
-                        .filter(|(i, _)| selected.get(*i).copied().unwrap_or(false))
-                        .map(|(_, f)| f.index)
-                        .collect();
-                    // Nothing ticked: keep the picker open (Esc cancels).
-                    if chosen.is_empty() {
-                        note = Some("Выберите хотя бы один файл (Esc — отмена)".into());
-                        continue;
+                    KeyCode::Right => {
+                        if let Some((path, _)) = rows.get(cursor) {
+                            let node = torrent::node_at_mut(&mut tree, path);
+                            if node.file.is_none() {
+                                view_cache.rows_dirty |= !node.expanded;
+                                node.expanded = true;
+                            }
+                        }
                     }
-                    if chosen.len() == info.files.len() {
-                        return Ok(None);
+                    KeyCode::Char(' ') => {
+                        if let Some((path, _)) = rows.get(cursor) {
+                            let node = torrent::node_at_mut(&mut tree, path);
+                            if let Some(fi) = node.file {
+                                if let Some(s) = selected.get_mut(fi) {
+                                    *s = !*s;
+                                }
+                            } else {
+                                let (sel, total) = node.selection;
+                                node.set_all(&mut selected, sel != total);
+                            }
+                            view_cache.selection_dirty = true;
+                        }
                     }
-                    // Too many scattered files for one command line: say so
-                    // here, where the selection can still be changed.
-                    if let Err(e) = torrent::select_spec(&chosen) {
-                        note = Some(format!("⚠ {e}"));
-                        continue;
+                    KeyCode::Enter => {
+                        if view == 0 {
+                            continue;
+                        }
+                        let chosen: Vec<usize> = info
+                            .files
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| selected.get(*i).copied().unwrap_or(false))
+                            .map(|(_, f)| f.index)
+                            .collect();
+                        // Nothing ticked: keep the picker open (Esc cancels).
+                        if chosen.is_empty() {
+                            note = Some("Выберите хотя бы один файл (Esc — отмена)".into());
+                            continue;
+                        }
+                        if chosen.len() == info.files.len() {
+                            return Ok(None);
+                        }
+                        // Too many scattered files for one command line: say so
+                        // here, where the selection can still be changed.
+                        if let Err(e) = torrent::select_spec(&chosen) {
+                            note = Some(format!("⚠ {e}"));
+                            continue;
+                        }
+                        return Ok(Some(chosen));
                     }
-                    return Ok(Some(chosen));
-                }
-                KeyCode::Esc | KeyCode::Char('q') => return Err(()),
-                KeyCode::Char('c')
-                    if key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    return Err(())
-                }
-                _ => {}
+                    KeyCode::Esc | KeyCode::Char('q') => return Err(()),
+                    KeyCode::Char('c')
+                        if key
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    {
+                        return Err(())
+                    }
+                    _ => {}
                 }
             }
             Ok(_) => {}
@@ -1542,9 +1858,21 @@ mod tests {
 
     #[test]
     fn interactive_overrides_are_honored_without_opening_prompts() {
-        let tc = Toolchain { yt_dlp: None, aria2c: None };
-        let plan = collect(&tc, "https://example.test/video".into(), "out", None, Some("yt-dlp"), Some("audio")).unwrap();
-        assert_eq!(plan.engine, "yt-dlp"); assert_eq!(plan.fmt, "audio");
+        let tc = Toolchain {
+            yt_dlp: None,
+            aria2c: None,
+        };
+        let plan = collect(
+            &tc,
+            "https://example.test/video".into(),
+            "out",
+            None,
+            Some("yt-dlp"),
+            Some("audio"),
+        )
+        .unwrap();
+        assert_eq!(plan.engine, "yt-dlp");
+        assert_eq!(plan.fmt, "audio");
     }
 
     #[test]
@@ -1684,14 +2012,34 @@ mod tests {
 
     #[test]
     fn multiple_urls_select_engines_independently() {
-        let mut args = args_with(Some("https://video.example/watch?id=1"), Some("downloads"), None);
-        args.urls.push("magnet:?xt=urn:btih:73510898AF9039563184FAFE9CB0F186DE6AAA4".into());
+        let mut args = args_with(
+            Some("https://video.example/watch?id=1"),
+            Some("downloads"),
+            None,
+        );
+        args.urls
+            .push("magnet:?xt=urn:btih:73510898AF9039563184FAFE9CB0F186DE6AAA4".into());
         args.urls.push("https://host/file.iso".into());
         let plans = plans_from_args(&args).unwrap();
         assert_eq!(plans.len(), 3);
-        assert_eq!(plans.iter().map(|p| p.engine.as_str()).collect::<Vec<_>>(), ["yt-dlp", "aria2", "aria2"]);
+        assert_eq!(
+            plans.iter().map(|p| p.engine.as_str()).collect::<Vec<_>>(),
+            ["yt-dlp", "aria2", "aria2"]
+        );
         assert!(plans.iter().all(|p| p.out_dir == "downloads"));
-        assert_eq!(batch_exit_code(&[RunResult { code: 0, auth_hint: false }, RunResult { code: 1, auth_hint: false }]), 1);
+        assert_eq!(
+            batch_exit_code(&[
+                RunResult {
+                    code: 0,
+                    auth_hint: false
+                },
+                RunResult {
+                    code: 1,
+                    auth_hint: false
+                }
+            ]),
+            1
+        );
     }
 
     #[test]
@@ -1706,7 +2054,10 @@ mod tests {
     #[test]
     fn interactive_queue_summary_counts_and_lists_each_engine() {
         let mut args = args_with(Some("https://host/a.zip"), Some("Downloads"), None);
-        args.urls.extend(["https://example.com/watch?v=2".into(), "https://host/b.zip".into()]);
+        args.urls.extend([
+            "https://example.com/watch?v=2".into(),
+            "https://host/b.zip".into(),
+        ]);
         let plans = plans_from_args(&args).unwrap();
         let text = queue_summary(&plans, 2);
         assert!(text.contains("Задач: 3 · одновременно: 2"));
@@ -1718,7 +2069,10 @@ mod tests {
     #[test]
     fn cli_progress_options_do_not_change_shared_gui_builder() {
         let dir = std::env::temp_dir().join(format!("snatch-cli-opts-{}", std::process::id()));
-        let tc = Toolchain { yt_dlp: None, aria2c: Some(PathBuf::from("aria2c")) };
+        let tc = Toolchain {
+            yt_dlp: None,
+            aria2c: Some(PathBuf::from("aria2c")),
+        };
         let job = Job {
             engine: "aria2".into(),
             url: "magnet:?xt=urn:btih:73510898AF9039563184FAFE9CB0F186DE6AAA4".into(),
@@ -1726,7 +2080,15 @@ mod tests {
             fmt: "best".into(),
             cookies_browser: None,
         };
-        let cmd = cli_command(&job, &tc, false, true, &torrent::Choice::default(), &engines::RunExtras::default()).unwrap();
+        let cmd = cli_command(
+            &job,
+            &tc,
+            false,
+            true,
+            &torrent::Choice::default(),
+            &engines::RunExtras::default(),
+        )
+        .unwrap();
         assert_eq!(cmd[cmd.len() - 2], "--");
         assert!(cmd.iter().any(|arg| arg == "--summary-interval=2"));
         std::fs::remove_dir_all(dir).ok();
@@ -1744,11 +2106,17 @@ mod tests {
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(events.len(), 3);
         assert!(matches!(&events[1], BatchEvent::Name(0, name) if name == "Cuphead_1.3.9"));
-        assert!(matches!(&events[2], BatchEvent::Progress(0, line) if line.contains("выделение места 1.1GiB/3.3GiB (33%)")));
+        assert!(
+            matches!(&events[2], BatchEvent::Progress(0, line) if line.contains("выделение места 1.1GiB/3.3GiB (33%)"))
+        );
         assert!(!events.iter().any(|e| matches!(e, BatchEvent::Line(..))));
         assert!(!clean_loader_text("\x1b[1;32mNOTICE\x1b[0m").contains("[1;32m"));
-        let stat = engines::aria2_stat("[#50e13e 880KiB/0.9MiB(88%) CN:1 SD:4 DL:812KiB UL:14KiB]").unwrap();
-        assert!(stat.contains("88% · 880KiB/0.9MiB · ↓812KiB/с · сиды 4 · соединения 1"), "{stat}");
+        let stat = engines::aria2_stat("[#50e13e 880KiB/0.9MiB(88%) CN:1 SD:4 DL:812KiB UL:14KiB]")
+            .unwrap();
+        assert!(
+            stat.contains("88% · 880KiB/0.9MiB · ↓812KiB/с · сиды 4 · соединения 1"),
+            "{stat}"
+        );
     }
 
     #[test]
@@ -1773,7 +2141,10 @@ mod tests {
         args.urls.push("also-not-a-url".into());
         let plans = plans_from_args(&args).unwrap();
         let mut cfg = empty_cfg();
-        let tc = Toolchain { yt_dlp: None, aria2c: None };
+        let tc = Toolchain {
+            yt_dlp: None,
+            aria2c: None,
+        };
         let results = run_batch(&plans, &mut cfg, &tc, 2);
         assert_eq!(results.iter().map(|r| r.code).collect::<Vec<_>>(), [2, 2]);
         assert_eq!(batch_exit_code(&results), 2);
@@ -1783,10 +2154,16 @@ mod tests {
     #[test]
     fn batch_respects_worker_limit_and_keeps_results_by_job() {
         let mut args = args_with(Some("https://host/one.zip"), Some("unused"), None);
-        args.urls.extend(["https://host/two.zip".into(), "https://host/three.zip".into()]);
+        args.urls.extend([
+            "https://host/two.zip".into(),
+            "https://host/three.zip".into(),
+        ]);
         let plans = plans_from_args(&args).unwrap();
         let mut cfg = empty_cfg();
-        let tc = Toolchain { yt_dlp: None, aria2c: None };
+        let tc = Toolchain {
+            yt_dlp: None,
+            aria2c: None,
+        };
         let active = AtomicUsize::new(0);
         let peak = AtomicUsize::new(0);
         let results = run_batch_with(&plans, &mut cfg, &tc, 2, |id, _, _, _| {
@@ -1798,10 +2175,16 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
             active.fetch_sub(1, Ordering::SeqCst);
-            RunResult { code: id as i32 + 1, auth_hint: false }
+            RunResult {
+                code: id as i32 + 1,
+                auth_hint: false,
+            }
         });
         assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert_eq!(results.iter().map(|r| r.code).collect::<Vec<_>>(), [1, 2, 3]);
+        assert_eq!(
+            results.iter().map(|r| r.code).collect::<Vec<_>>(),
+            [1, 2, 3]
+        );
     }
 
     #[test]
@@ -1817,8 +2200,13 @@ mod tests {
         let mut plan = base_plan();
         plan.url = "https://[::1".to_string();
         let mut cfg = empty_cfg();
-        assert_eq!(download_with_discovery(&plan, &mut cfg, None,
-            || panic!("bad URL must not discover tools")).code, 2);
+        assert_eq!(
+            download_with_discovery(&plan, &mut cfg, None, || panic!(
+                "bad URL must not discover tools"
+            ))
+            .code,
+            2
+        );
     }
 
     // -- retry_with_cookies_inner (test_retry_with_cookies_*, test_no_retry_without_auth_hint, test_retry_gives_up_after_second_failure) --
@@ -1829,13 +2217,19 @@ mod tests {
         let mut seen: Vec<Option<String>> = Vec::new();
         let out = retry_with_cookies_inner(
             base_plan(),
-            RunResult { code: 1, auth_hint: true },
+            RunResult {
+                code: 1,
+                auth_hint: true,
+            },
             &mut cfg,
             |_q, _default| Some(true),
             || Some("chrome".to_string()),
             |plan, _cfg| {
                 seen.push(plan.cookies_browser.clone());
-                RunResult { code: 0, auth_hint: false }
+                RunResult {
+                    code: 0,
+                    auth_hint: false,
+                }
             },
         );
         assert_eq!(out.code, 0);
@@ -1847,7 +2241,10 @@ mod tests {
         let mut cfg = empty_cfg();
         let out = retry_with_cookies_inner(
             base_plan(),
-            RunResult { code: 1, auth_hint: true },
+            RunResult {
+                code: 1,
+                auth_hint: true,
+            },
             &mut cfg,
             |_q, _default| Some(false),
             || panic!("select must not be called"),
@@ -1861,7 +2258,10 @@ mod tests {
         let mut cfg = empty_cfg();
         let out = retry_with_cookies_inner(
             base_plan(),
-            RunResult { code: 1, auth_hint: true },
+            RunResult {
+                code: 1,
+                auth_hint: true,
+            },
             &mut cfg,
             |_q, _default| Some(true),
             || None,
@@ -1875,7 +2275,10 @@ mod tests {
         let mut cfg = empty_cfg();
         let out = retry_with_cookies_inner(
             base_plan(),
-            RunResult { code: 1, auth_hint: false },
+            RunResult {
+                code: 1,
+                auth_hint: false,
+            },
             &mut cfg,
             |_q, _default| panic!("confirm must not be called"),
             || panic!("select must not be called"),
@@ -1894,13 +2297,19 @@ mod tests {
         let mut calls = 0;
         let out = retry_with_cookies_inner(
             base_plan(),
-            RunResult { code: 1, auth_hint: true },
+            RunResult {
+                code: 1,
+                auth_hint: true,
+            },
             &mut cfg,
             move |_q, _default| confirms.pop(),
             || Some("chrome".to_string()),
             |_p, _c| {
                 calls += 1;
-                RunResult { code: 1, auth_hint: true }
+                RunResult {
+                    code: 1,
+                    auth_hint: true,
+                }
             },
         );
         assert_eq!(out.code, 1);
@@ -1911,18 +2320,36 @@ mod tests {
 
     #[test]
     fn engine_offer_puts_guess_first() {
-        let tc = Toolchain { yt_dlp: Some(PathBuf::from("y")), aria2c: Some(PathBuf::from("a")) };
-        assert_eq!(engine_offer(&tc, "https://youtube.com/watch?v=1"), ["yt-dlp", "aria2"]);
+        let tc = Toolchain {
+            yt_dlp: Some(PathBuf::from("y")),
+            aria2c: Some(PathBuf::from("a")),
+        };
+        assert_eq!(
+            engine_offer(&tc, "https://youtube.com/watch?v=1"),
+            ["yt-dlp", "aria2"]
+        );
         assert_eq!(engine_offer(&tc, "https://host/f.zip"), ["aria2", "yt-dlp"]);
-        let none = Toolchain { yt_dlp: None, aria2c: None };
+        let none = Toolchain {
+            yt_dlp: None,
+            aria2c: None,
+        };
         assert!(engine_offer(&none, "https://x").is_empty());
-        let one = Toolchain { yt_dlp: Some(PathBuf::from("y")), aria2c: None };
-        assert_eq!(engine_offer(&one, "https://youtube.com/watch?v=1"), ["yt-dlp"]);
+        let one = Toolchain {
+            yt_dlp: Some(PathBuf::from("y")),
+            aria2c: None,
+        };
+        assert_eq!(
+            engine_offer(&one, "https://youtube.com/watch?v=1"),
+            ["yt-dlp"]
+        );
     }
 
     #[test]
     fn ask_engine_single_option_needs_no_terminal() {
-        let tc = Toolchain { yt_dlp: Some(PathBuf::from("y")), aria2c: None };
+        let tc = Toolchain {
+            yt_dlp: Some(PathBuf::from("y")),
+            aria2c: None,
+        };
         assert_eq!(
             ask_engine("https://youtube.com/watch?v=1", &tc).as_deref(),
             Some("yt-dlp")
