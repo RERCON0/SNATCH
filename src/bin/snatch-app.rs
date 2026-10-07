@@ -434,9 +434,8 @@ fn torrent_console_line(id: u64, line: &str) -> Option<Msg> {
     {
         return None;
     }
-    if line.starts_with("FILE:") && line.contains("[MEMORY][METADATA]") {
-        let name = line.split_once("[DL]").map_or("", |(_, name)| name.trim());
-        return Some(Msg::TorrentMeta(id, name.to_string()));
+    if let Some(name) = engines::aria2_metadata_name(line) {
+        return Some(Msg::TorrentMeta(id, name));
     }
     if let Some(name) = engines::aria2_name_from_file(line) {
         return Some(Msg::TorrentName(id, name));
@@ -1486,7 +1485,9 @@ impl SnatchApp {
                 }
                 Msg::TorrentName(id, name) => {
                     if let Some(j) = self.job_mut(id) {
-                        j.label = name;
+                        if !engines::is_bittorrent_input(&j.job.url) {
+                            j.label = name;
+                        }
                     }
                 }
                 Msg::TorrentLog(id, line) => self.push_job_log(id, line),
@@ -1675,7 +1676,7 @@ impl SnatchApp {
 
     fn retain_failed_start(&mut self, job: Job, select: torrent::Choice, no_continue: bool) {
         self.paused.push(PausedJob {
-            label: engines::batch_name(&job.url),
+            label: engines::download_name(&job.url, &select),
             job,
             progress: None,
             status: self.status.clone(),
@@ -1866,6 +1867,7 @@ impl SnatchApp {
     fn finish_torrent_pick(&mut self, ctx: &egui::Context, files: Option<Vec<usize>>) {
         if let Some(mut pick) = self.torrent_pick.take() {
             let choice = torrent::Choice {
+                name: pick.info.as_ref().map(|info| info.name.clone()),
                 files,
                 meta: pick.meta.clone(),
             };
@@ -2034,7 +2036,7 @@ impl SnatchApp {
             );
             return false;
         }
-        let label = engines::batch_name(&job.url);
+        let label = engines::download_name(&job.url, &select);
         let warns = preflight_warning(&job);
 
         let output_lock = match engines::lock_aria2_target(&job, false) {
@@ -4047,6 +4049,7 @@ mod tests {
         app.queue.push_back(QueuedJob {
             job: job.clone(),
             select: torrent::Choice {
+                name: None,
                 files: Some(vec![1, 3]),
                 meta: None,
             },
@@ -4180,6 +4183,52 @@ mod tests {
         app.drain(&ctx);
         assert_eq!(app.browser.listed_for, Some(current));
         assert_eq!(app.browser.error.as_deref(), Some("test access denied"));
+    }
+
+    #[test]
+    fn torrent_file_summaries_cannot_replace_the_download_title() {
+        let ctx = egui::Context::default();
+        let mut app = test_app();
+        let mut job =
+            test_job("magnet:?xt=urn:btih:C575A7D7522DF7ADEAAFBFB2531264B2C8CF7067&dn=Hades%20II");
+        job.engine = "aria2".into();
+        app.jobs.push(ActiveJob {
+            id: 1,
+            label: engines::download_name(&job.url, &torrent::Choice::default()),
+            job,
+            progress: Some(0.01),
+            status: String::new(),
+            status_kind: StatusKind::None,
+            warns: vec![],
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+            cancelled: false,
+            pausing: false,
+            auth_seen: false,
+            missing_control_file: false,
+            resumed_seen: false,
+            no_continue: false,
+            select: torrent::Choice::default(),
+        });
+        for line in [
+            "FILE: C:/Users/example/Desktop/file.bin (3more)",
+            "FILE: C:/Users/example/Desktop/.egstore/data.bin (2more)",
+        ] {
+            app.tx.send(torrent_console_line(1, line).unwrap()).unwrap();
+        }
+        app.drain(&ctx);
+        assert_eq!(app.jobs[0].label, "Hades II");
+        app.tx
+            .send(torrent_console_line(1, "FILE: [MEMORY][METADATA] Actual torrent title").unwrap())
+            .unwrap();
+        app.drain(&ctx);
+        assert_eq!(app.jobs[0].label, "Actual torrent title");
+        app.tx
+            .send(
+                torrent_console_line(1, "FILE: C:/Users/example/Desktop/file.bin (3more)").unwrap(),
+            )
+            .unwrap();
+        app.drain(&ctx);
+        assert_eq!(app.jobs[0].label, "Actual torrent title");
     }
 
     #[test]

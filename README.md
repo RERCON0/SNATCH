@@ -29,12 +29,12 @@
 
 <table>
   <tr>
-    <th>Dark · English</th>
-    <th>Light · Русский</th>
+    <th>Dark</th>
+    <th>Light</th>
   </tr>
   <tr>
-    <td width="50%"><a href="docs/screenshot.png"><img src="docs/screenshot.png" alt="SNATCH GUI — dark theme, English" width="420"></a></td>
-    <td width="50%"><a href="docs/screenshot-light-ru.png"><img src="docs/screenshot-light-ru.png" alt="SNATCH GUI — light theme, Russian" width="420"></a></td>
+    <td width="50%"><a href="docs/screenshot.png"><img src="docs/screenshot.png" alt="SNATCH GUI — dark theme" width="420"></a></td>
+    <td width="50%"><a href="docs/screenshot-light-ru.png"><img src="docs/screenshot-light-ru.png" alt="SNATCH GUI — light theme" width="420"></a></td>
   </tr>
 </table>
 
@@ -78,6 +78,7 @@ link and a running download.
 
 - **Automatic engine selection** for videos, direct links and torrents.
 - **Quality options:** video up to 2160p, mp3 or original audio, subtitles and playlists.
+- **Audio with artwork:** embeds the source thumbnail and available tags in MP3, M4A and Opus downloads. AAC/Opus stays without re-encoding; ffmpeg is required.
 - **Safe resume:** interrupted downloads are checked against their original source.
 - **Concurrent CLI downloads:** three by default, configurable with `-j 1..16`.
 - **History:** the last 15 links and folders; dark and light GUI themes.

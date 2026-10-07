@@ -214,6 +214,18 @@ pub fn aria2_stat(line: &str) -> Option<String> {
     ))
 }
 
+/// The metadata status line names the torrent, while normal FILE lines only
+/// describe whichever file/directory aria2 is reporting at that moment.
+pub fn aria2_metadata_name(line: &str) -> Option<String> {
+    let name = line
+        .strip_prefix("FILE:")?
+        .trim()
+        .strip_prefix("[MEMORY][METADATA]")?
+        .trim();
+    let name = name.strip_prefix("[DL]").unwrap_or(name).trim();
+    clean_display_name(name)
+}
+
 pub fn aria2_name_from_file(line: &str) -> Option<String> {
     let file = line.strip_prefix("FILE:")?.trim();
     let multi_file = file.ends_with("more)");
@@ -232,10 +244,45 @@ pub fn aria2_name_from_file(line: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// Metadata and percent-decoded display names must not inject terminal
+/// controls. This changes only display text, never the URL or saved path.
+fn clean_display_name(name: &str) -> Option<String> {
+    let clean = sanitize_child_output(name);
+    let name: String = clean
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+fn magnet_name(url: &str) -> Option<String> {
+    if scheme_of(url) != "magnet" {
+        return None;
+    }
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let (_, name) = parsed.query_pairs().find(|(key, _)| key == "dn")?;
+    clean_display_name(&name)
+}
+
+/// Prefer the parsed torrent title; a FILE summary can refer to the save folder
+/// or an arbitrary nested file, so it must never replace a torrent's title.
+pub fn download_name(url: &str, choice: &crate::torrent::Choice) -> String {
+    if is_bittorrent_input(url) {
+        if let Some(name) = choice.name.as_deref().and_then(clean_display_name) {
+            return name;
+        }
+    }
+    batch_name(url)
+}
+
 /// Short display name for a URL before anything better is known (a torrent's
 /// real name only arrives once aria2 reads its metadata) - shared by the
 /// CLI's batch display and the GUI's per-job row/log-prefix label.
 pub fn batch_name(url: &str) -> String {
+    if let Some(name) = magnet_name(url) {
+        return name;
+    }
     if let Some(hash) = url
         .split_once("btih:")
         .map(|(_, s)| s.split('&').next().unwrap_or(s))
@@ -709,8 +756,9 @@ fn format_flags(fmt: &str) -> Vec<&'static str> {
         "720p" => vec!["-f", "bv*[height<=720]+ba/b[height<=720]"],
         "480p" => vec!["-f", "bv*[height<=480]+ba/b[height<=480]"],
         "audio" => vec!["-x", "--audio-format", "mp3"],
-        // bestaudio in its original container: no ffmpeg re-encode.
-        "audio-src" => vec!["-f", "ba/b"],
+        // Extract Opus from WebM so its container can carry a cover.
+        // yt-dlp's "best" extraction stream-copies AAC/Opus without re-encoding.
+        "audio-src" => vec!["-f", "ba/b", "-x", "--audio-format", "best"],
         _ => vec![],
     }
 }
@@ -1228,6 +1276,20 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
         };
         cmd.push(langs.into());
     }
+    if matches!(job.fmt.as_str(), "audio" | "audio-src") {
+        // Use the downloader's existing postprocessors, with no new runtime.
+        // JPEG covers work with both ID3 and MP4/Vorbis picture tags. A source
+        // without artwork still downloads normally. Explicit extras can opt out.
+        for a in [
+            "--embed-metadata",
+            "--embed-thumbnail",
+            "--convert-thumbnails",
+            "jpg",
+            "--no-embed-info-json",
+        ] {
+            cmd.push(a.into());
+        }
+    }
     for a in &extras.extra_ytdlp {
         cmd.push(a.clone().into());
     }
@@ -1387,8 +1449,16 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool, has_js: bool) -> V
             if job.fmt == "audio" {
                 warns.push(
                     tr!(
-                        "ffmpeg not found — mp3 extraction may fail.",
-                        "Не найден ffmpeg — извлечение mp3 может не сработать."
+                        "ffmpeg not found — mp3 extraction and cover embedding may fail. Install tools from the GUI or with `snatch --install-tools`.",
+                        "Не найден ffmpeg — извлечение mp3 и встраивание обложки могут не сработать. Установите инструменты в GUI или через `snatch --install-tools`."
+                    )
+                    .to_string(),
+                );
+            } else if job.fmt == "audio-src" {
+                warns.push(
+                    tr!(
+                        "ffmpeg not found — original audio extraction and cover embedding may fail. Install tools from the GUI or with `snatch --install-tools`.",
+                        "Не найден ffmpeg — извлечение исходного аудио и встраивание обложки могут не сработать. Установите инструменты в GUI или через `snatch --install-tools`."
                     )
                     .to_string(),
                 );
@@ -2184,6 +2254,63 @@ mod tests {
     }
 
     #[test]
+    fn audio_artwork_defaults_allow_an_explicit_opt_out_and_leave_video_alone() {
+        let out = tmp_out();
+        let mut job = Job {
+            engine: "yt-dlp".into(),
+            url: "https://example.test/watch?v=1".into(),
+            out_dir: out.clone(),
+            fmt: "audio".into(),
+            cookies_browser: None,
+        };
+        let extras = RunExtras {
+            extra_ytdlp: vec!["--no-embed-thumbnail".into()],
+            ..RunExtras::default()
+        };
+        for fmt in ["audio", "audio-src"] {
+            job.fmt = fmt.into();
+            let cmd = build_with(&job, &tc_both(), &extras).unwrap();
+            let enabled = cmd.iter().position(|a| a == "--embed-thumbnail").unwrap();
+            let disabled = cmd
+                .iter()
+                .position(|a| a == "--no-embed-thumbnail")
+                .unwrap();
+            assert!(enabled < disabled, "an explicit user option must win");
+            assert_eq!(cmd.last().unwrap(), job.url.as_str());
+            assert_eq!(cmd[cmd.len() - 2], "--");
+        }
+        job.fmt = "best".into();
+        let cmd = build(&job, &tc_both()).unwrap();
+        assert!(!cmd
+            .iter()
+            .any(|a| a == "--embed-thumbnail" || a == "--embed-metadata"));
+        std::fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn torrent_title_uses_metadata_then_decoded_magnet_name() {
+        let job = Job {
+            engine: "aria2".into(),
+            url: "magnet:?xt=urn:btih:C575A7D7522DF7ADEAAFBFB2531264B2C8CF7067&dn=%5BDL%5D%20Hades%20II%20%28Portable%29".into(),
+            out_dir: PathBuf::from(r"C:\Users\example\Desktop"),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
+        let mut choice = crate::torrent::Choice::default();
+        assert_eq!(download_name(&job.url, &choice), "[DL] Hades II (Portable)");
+        choice.name = Some("\x1b[2JActual torrent name".into());
+        assert_eq!(download_name(&job.url, &choice), "Actual torrent name");
+        assert_eq!(
+            aria2_metadata_name("FILE: [MEMORY][METADATA] Example torrent").as_deref(),
+            Some("Example torrent")
+        );
+        assert!(aria2_metadata_name("FILE: C:/Users/example/Desktop (3more)").is_none());
+        let name = batch_name("magnet:?xt=urn:btih:abc&dn=%1B%5B2JExample%0Atrack");
+        assert_eq!(name, "Example track");
+        assert!(!name.chars().any(char::is_control));
+    }
+
+    #[test]
     fn formats_cover_caps_and_source_audio() {
         let keys: Vec<&str> = formats().iter().map(|(k, _)| *k).collect();
         for k in [
@@ -2199,7 +2326,10 @@ mod tests {
             assert!(keys.contains(&k), "{k}");
         }
         assert!(format_flags("720p").contains(&"bv*[height<=720]+ba/b[height<=720]"));
-        assert_eq!(format_flags("audio-src"), vec!["-f", "ba/b"]);
+        assert_eq!(
+            format_flags("audio-src"),
+            vec!["-f", "ba/b", "-x", "--audio-format", "best"]
+        );
         assert!(format_flags("audio").contains(&"mp3"));
     }
 
@@ -2700,7 +2830,11 @@ mod tests {
     fn batch_name_still_handles_magnets() {
         let name =
             batch_name("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Foo");
-        assert!(name.starts_with("magnet "));
+        assert_eq!(name, "Foo");
+        assert_eq!(
+            batch_name("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567"),
+            "magnet 0123456789a…"
+        );
     }
 
     #[test]

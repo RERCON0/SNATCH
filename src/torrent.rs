@@ -99,6 +99,8 @@ impl Meta {
 /// fetched metadata) is also what every non-torrent job carries.
 #[derive(Debug, Clone, Default)]
 pub struct Choice {
+    /// Display title from the parsed torrent metadata; retained across pause/queue.
+    pub name: Option<String>,
     /// aria2 file indices (`--select-file`); None = every file.
     pub files: Option<Vec<usize>>,
     /// Metadata fetched while listing, used as aria2's input instead of the
@@ -1335,6 +1337,7 @@ idx|path/length
             _dir: dir,
         }));
         let paused = Choice {
+            name: None,
             files: Some(vec![1]),
             meta: Some(meta.clone()),
         };
@@ -1366,6 +1369,7 @@ idx|path/length
             aria2c: Some(PathBuf::from("aria2c")),
         };
         let choice = Choice {
+            name: Some("Stable torrent title".into()),
             files: Some(vec![3, 1, 3]),
             meta: Some(meta),
         };
@@ -1397,6 +1401,7 @@ idx|path/length
             files: None,
             ..choice
         };
+        assert_eq!(all.name.as_deref(), Some("Stable torrent title"));
         assert!(
             crate::engines::build_for_run(&http, &tc, &all).is_ok(),
             "all files need no indices"

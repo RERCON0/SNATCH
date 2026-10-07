@@ -22,6 +22,8 @@
 | `-h, --help` | Show help |
 | `-V, --version` | Show version |
 
+Audio modes embed the source thumbnail and available metadata by default. `audio-src` extracts AAC/Opus without re-encoding (WebM/Opus becomes `.opus`). This needs ffmpeg from `snatch --install-tools`. If the source has no thumbnail, audio still downloads. To omit artwork, pass `--yt-dlp-args "--no-embed-thumbnail"`.
+
 ## Interface language
 
 ```powershell

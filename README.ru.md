@@ -29,12 +29,12 @@
 
 <table>
   <tr>
-    <th>Тёмная тема · English</th>
-    <th>Светлая тема · Русский</th>
+    <th>Тёмная тема</th>
+    <th>Светлая тема</th>
   </tr>
   <tr>
-    <td width="50%"><a href="docs/screenshot.png"><img src="docs/screenshot.png" alt="SNATCH GUI — тёмная тема, английский язык" width="420"></a></td>
-    <td width="50%"><a href="docs/screenshot-light-ru.png"><img src="docs/screenshot-light-ru.png" alt="SNATCH GUI — светлая тема, русский язык" width="420"></a></td>
+    <td width="50%"><a href="docs/screenshot.png"><img src="docs/screenshot.png" alt="SNATCH GUI — тёмная тема" width="420"></a></td>
+    <td width="50%"><a href="docs/screenshot-light-ru.png"><img src="docs/screenshot-light-ru.png" alt="SNATCH GUI — светлая тема" width="420"></a></td>
   </tr>
 </table>
 
@@ -79,6 +79,7 @@ SNATCH создан, чтобы быстро получить нужный ма�
 - **English / Русский**: кнопка EN / RU рядом с темой в шапке GUI или `snatch --lang en|ru`.
 - **Автовыбор движка** для видео, прямых ссылок и торрентов.
 - **Качество на выбор**: до 2160p, mp3 или исходное аудио, субтитры и плейлисты.
+- **Музыка с обложкой**: превью и доступные теги из источника встраиваются в MP3, M4A и Opus. Исходные AAC/Opus сохраняются без перекодирования; нужен ffmpeg.
 - **Докачка после сбоя** с проверкой принадлежности файла исходной загрузке.
 - **Несколько задач в CLI**: до трёх одновременно по умолчанию, `-j 1..16`.
 - **История** последних 15 ссылок и папок, тёмная и светлая темы GUI.

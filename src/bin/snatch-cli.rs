@@ -20,7 +20,7 @@ use inquire::{Confirm, Select, Text};
 
 use snatch_rs::config::Config;
 use snatch_rs::engines::{
-    self, batch_name, detect_engine, engine_labels, formats, is_unc_path, preflight_warning,
+    self, detect_engine, engine_labels, formats, is_unc_path, preflight_warning,
     validate_cookies_browser, validate_url, Job, RunResult, COOKIES_BROWSERS,
 };
 #[cfg(windows)]
@@ -365,6 +365,7 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     // Every outcome keeps the fetched metadata: the download then reuses it
     // instead of asking the swarm for it a second time.
     let all = torrent::Choice {
+        name: Some(info.name.clone()),
         files: None,
         meta: listing.meta.clone(),
     };
@@ -406,6 +407,7 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
         Ok(Some(sel)) => {
             outln(partial_neighbours_note());
             Use(torrent::Choice {
+                name: Some(info.name.clone()),
                 files: Some(sel),
                 meta: listing.meta,
             })
@@ -472,6 +474,7 @@ fn download_with_discovery(
 enum BatchEvent {
     Line(usize, String),
     Name(usize, String),
+    TorrentName(usize, String),
     Progress(usize, String),
     Finished(usize, String, String, RunResult),
 }
@@ -561,7 +564,7 @@ impl BatchDisplay {
         let mut views = Vec::new();
         for (id, plan) in plans.iter().enumerate() {
             views.push(BatchView {
-                name: batch_name(&plan.url),
+                name: engines::download_name(&plan.url, &plan.torrent),
                 status: tr!("queued", "в очереди").into(),
                 last_printed: None,
             });
@@ -693,7 +696,8 @@ fn read_batch_pipe(
             {
                 continue;
             }
-            if line.starts_with("FILE:") && line.contains("[MEMORY][METADATA]") {
+            if let Some(name) = engines::aria2_metadata_name(line) {
+                let _ = tx.send(BatchEvent::TorrentName(id, name));
                 latest = Some(
                     tr!(
                         "fetching torrent metadata…",
@@ -910,7 +914,12 @@ fn run_batch_with(
                         display.diagnostic(id, &line);
                     }
                 }
-                BatchEvent::Name(id, name) => display.update(id, None, Some(name)),
+                BatchEvent::Name(id, name) => {
+                    if !engines::is_bittorrent_input(&plans[id].url) {
+                        display.update(id, None, Some(name));
+                    }
+                }
+                BatchEvent::TorrentName(id, name) => display.update(id, None, Some(name)),
                 BatchEvent::Progress(id, line) => display.update(id, Some(line), None),
                 BatchEvent::Finished(id, url, dir, result) => {
                     if result.code == 0 {

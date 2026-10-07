@@ -21,6 +21,8 @@
 | `--install-tools` | Скачать yt-dlp, aria2c, ffmpeg и Deno в собственную папку SNATCH (Windows) |
 | `--version` | Версия |
 
+Аудиорежимы по умолчанию встраивают превью и доступные теги из источника. `audio-src` извлекает AAC/Opus без перекодирования (WebM/Opus становится `.opus`). Нужен ffmpeg из `snatch --install-tools`. Если у источника нет картинки, аудио всё равно скачивается. Чтобы отключить обложку, передайте `--yt-dlp-args "--no-embed-thumbnail"`.
+
 ## Пути к внешним загрузчикам
 
 ```powershell
