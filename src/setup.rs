@@ -1,3 +1,4 @@
+use crate::{tr, tr_format};
 use std::fs::{File, OpenOptions};
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -42,11 +43,17 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         .user_agent(concat!("snatch-rs/", env!("CARGO_PKG_VERSION")))
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 10 {
-                return attempt.error("слишком много перенаправлений загрузчика");
+                return attempt.error(tr!(
+                    "too many downloader redirects",
+                    "слишком много перенаправлений загрузчика"
+                ));
             }
             match attempt.previous().first() {
                 Some(initial) if trusted_redirect(initial, attempt.url()) => attempt.follow(),
-                _ => attempt.error("перенаправление загрузчика вне официального HTTPS-источника"),
+                _ => attempt.error(tr!(
+                    "downloader redirect outside the official HTTPS source",
+                    "перенаправление загрузчика вне официального HTTPS-источника"
+                )),
             }
         }))
         // reqwest has NO timeouts by default: a half-dead connection (proxy
@@ -207,8 +214,12 @@ fn send_get(
             req = req.header(reqwest::header::IF_RANGE, validator);
         }
     }
-    req.send()
-        .map_err(|e| DownloadFailure::transient(format!("не удалось скачать {label}: {e}")))
+    req.send().map_err(|e| {
+        DownloadFailure::transient(tr_format!(
+            "could not download {label}: {e}",
+            "не удалось скачать {label}: {e}"
+        ))
+    })
 }
 
 /// Sidecar holding the server version (ETag / Last-Modified) of the bytes in
@@ -279,11 +290,11 @@ pub enum SetupStage {
 impl SetupStage {
     pub fn text(self) -> &'static str {
         match self {
-            Self::Preparing => "подготовка…",
-            Self::Downloading => "скачивание…",
-            Self::Verifying => "проверяю контрольную сумму…",
-            Self::Extracting => "распаковываю…",
-            Self::Installing => "устанавливаю…",
+            Self::Preparing => tr!("preparing…", "подготовка…"),
+            Self::Downloading => tr!("downloading…", "скачивание…"),
+            Self::Verifying => tr!("verifying checksum…", "проверяю контрольную сумму…"),
+            Self::Extracting => tr!("extracting…", "распаковываю…"),
+            Self::Installing => tr!("installing…", "устанавливаю…"),
         }
     }
 }
@@ -392,7 +403,11 @@ fn download_inner(
         // first also means a failed retry cannot leave the same stale part to
         // 416 forever.
         File::create(dest).map_err(|e| {
-            DownloadFailure::permanent(format!("не удалось создать {}: {e}", dest.display()))
+            DownloadFailure::permanent(tr_format!(
+                "could not create {}: {e}",
+                "не удалось создать {}: {e}",
+                dest.display()
+            ))
         })?;
         resp = send_get(c, url, label, 0, None)?;
         plan = resume_plan(0, resp.status().as_u16());
@@ -406,7 +421,8 @@ fn download_inner(
             // well as the start offset, or we might splice two releases.
             // No response validator means we cannot safely append either.
             File::create(dest).map_err(|e| {
-                DownloadFailure::permanent(format!(
+                DownloadFailure::permanent(tr_format!(
+                    "could not remove stale partial file {}: {e}",
                     "не удалось очистить устаревшую часть {}: {e}",
                     dest.display()
                 ))
@@ -419,7 +435,8 @@ fn download_inner(
     let (mut file, offset, expected) = match plan {
         Some(ResumePlan::Append { offset }) => {
             let file = OpenOptions::new().append(true).open(dest).map_err(|e| {
-                DownloadFailure::permanent(format!(
+                DownloadFailure::permanent(tr_format!(
+                    "could not open {} for appending: {e}",
                     "не удалось открыть {} для дозаписи: {e}",
                     dest.display()
                 ))
@@ -428,7 +445,11 @@ fn download_inner(
         }
         Some(ResumePlan::Restart) => {
             let file = File::create(dest).map_err(|e| {
-                DownloadFailure::permanent(format!("не удалось создать {}: {e}", dest.display()))
+                DownloadFailure::permanent(tr_format!(
+                    "could not create {}: {e}",
+                    "не удалось создать {}: {e}",
+                    dest.display()
+                ))
             })?;
             // Record which server version this part holds, for If-Range.
             match response_validator(&resp) {
@@ -447,26 +468,34 @@ fn download_inner(
             let status = resp.status();
             return Err(DownloadFailure::from_http_status(
                 status.as_u16(),
-                format!("не удалось скачать {label}: HTTP {status}"),
+                tr_format!(
+                    "could not download {label}: HTTP {status}",
+                    "не удалось скачать {label}: HTTP {status}"
+                ),
             ));
         }
     };
 
     let total = offset + expected;
     if total > max {
-        return Err(DownloadFailure::permanent(format!(
+        return Err(DownloadFailure::permanent(tr_format!(
+            "{label}: declared size of {total} bytes exceeds the {max} limit",
             "{label}: заявленный размер {total} байт превышает лимит {max}"
         )));
     }
     if offset > 0 && std::io::stdout().is_terminal() {
         // Honest note: the existing part is continued, not restarted.
-        crate::outln(format!("↻ Докачиваю {label} с {offset} Б…"));
+        crate::outln(tr_format!(
+            "↻ Resuming {label} from {offset} B…",
+            "↻ Докачиваю {label} с {offset} Б…"
+        ));
     }
     let bar = if expected > 0 {
         ProgressBar::new(total).with_style(
-            ProgressStyle::with_template(
-                "{spinner} {wide_bar} {bytes}/{total_bytes} (осталось {eta})",
-            )
+            ProgressStyle::with_template(tr!(
+                "{spinner} {wide_bar} {bytes}/{total_bytes} ({eta} remaining)",
+                "{spinner} {wide_bar} {bytes}/{total_bytes} (осталось {eta})"
+            ))
             .unwrap_or_else(|_| ProgressStyle::default_bar()),
         )
     } else {
@@ -487,19 +516,27 @@ fn download_inner(
     let mut buf = [0u8; 65536];
     let mut written = offset;
     loop {
-        let n = resp
-            .read(&mut buf)
-            .map_err(|e| DownloadFailure::transient(format!("сбой чтения {label}: {e}")))?;
+        let n = resp.read(&mut buf).map_err(|e| {
+            DownloadFailure::transient(tr_format!(
+                "could not read {label}: {e}",
+                "сбой чтения {label}: {e}"
+            ))
+        })?;
         if n == 0 {
             break;
         }
         if n as u64 > max - written {
-            return Err(DownloadFailure::permanent(format!(
+            return Err(DownloadFailure::permanent(tr_format!(
+                "{label} exceeds {max} bytes — download stopped",
                 "{label} больше {max} байт — загрузка остановлена"
             )));
         }
-        file.write_all(&buf[..n])
-            .map_err(|e| DownloadFailure::permanent(format!("сбой записи {label}: {e}")))?;
+        file.write_all(&buf[..n]).map_err(|e| {
+            DownloadFailure::permanent(tr_format!(
+                "could not write {label}: {e}",
+                "сбой записи {label}: {e}"
+            ))
+        })?;
         written += n as u64;
         bar.inc(n as u64);
         // GUI feedback: throttled so a fast link cannot flood the channel.
@@ -526,14 +563,23 @@ fn download_inner(
 /// Stream a file through a hasher in 64 KiB chunks: yt-dlp.exe can be up to
 /// MAX_YT_DLP_BYTES, and reading it whole would spike memory for no reason.
 fn file_hash_hex<D: Digest>(path: &Path, what: &str) -> Result<String, String> {
-    let mut file =
-        File::open(path).map_err(|e| format!("не удалось открыть {}: {e}", path.display()))?;
+    let mut file = File::open(path).map_err(|e| {
+        tr_format!(
+            "could not open {}: {e}",
+            "не удалось открыть {}: {e}",
+            path.display()
+        )
+    })?;
     let mut hasher = D::new();
     let mut buf = [0u8; 65536];
     loop {
-        let n = file
-            .read(&mut buf)
-            .map_err(|e| format!("сбой чтения {what} {}: {e}", path.display()))?;
+        let n = file.read(&mut buf).map_err(|e| {
+            tr_format!(
+                "could not read {what} {}: {e}",
+                "сбой чтения {what} {}: {e}",
+                path.display()
+            )
+        })?;
         if n == 0 {
             break;
         }
@@ -547,11 +593,11 @@ fn file_hash_hex<D: Digest>(path: &Path, what: &str) -> Result<String, String> {
 }
 
 fn sha512_hex(path: &Path) -> Result<String, String> {
-    file_hash_hex::<Sha512>(path, "файла")
+    file_hash_hex::<Sha512>(path, tr!("file", "файла"))
 }
 
 fn sha256_hex(path: &Path) -> Result<String, String> {
-    file_hash_hex::<Sha256>(path, "архива")
+    file_hash_hex::<Sha256>(path, tr!("archive", "архива"))
 }
 
 fn aria2_asset(release: &serde_json::Value) -> Result<(String, String), String> {
@@ -564,28 +610,40 @@ fn aria2_asset(release: &serde_json::Value) -> Result<(String, String), String> 
                     .is_some_and(|name| name.contains("win-64bit") && name.ends_with(".zip"))
             })
         })
-        .ok_or("в релизе aria2 не найден win-64bit zip")?;
+        .ok_or(tr!(
+            "aria2 release has no win-64bit ZIP",
+            "в релизе aria2 не найден win-64bit zip"
+        ))?;
     let name = asset["name"].as_str().unwrap_or_default();
-    let size = asset["size"]
-        .as_u64()
-        .ok_or("у aria2 zip нет размера в GitHub API")?;
+    let size = asset["size"].as_u64().ok_or(tr!(
+        "GitHub API has no size for the aria2 ZIP",
+        "у aria2 zip нет размера в GitHub API"
+    ))?;
     if size == 0 || size > MAX_ARIA2_ZIP_BYTES {
-        return Err(format!("размер aria2 zip ({size} байт) выходит за лимит"));
+        return Err(tr_format!(
+            "aria2 ZIP size ({size} bytes) exceeds the limit",
+            "размер aria2 zip ({size} байт) выходит за лимит"
+        ));
     }
     let expected = if name == PINNED_ARIA2_ZIP {
         PINNED_ARIA2_SHA256.to_string()
     } else {
         let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:"))
-            .ok_or("Новый релиз aria2 не публикует SHA-256. Обновите SNATCH или установите aria2 вручную.")?;
+            .ok_or(tr!("The new aria2 release has no SHA-256 checksum. Update SNATCH or install aria2 manually.", "Новый релиз aria2 не публикует SHA-256. Обновите SNATCH или установите aria2 вручную."))?;
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("Некорректная SHA-256 в метаданных aria2".into());
+            return Err(tr!(
+                "Invalid SHA-256 in aria2 metadata",
+                "Некорректная SHA-256 в метаданных aria2"
+            )
+            .into());
         }
         digest.to_string()
     };
     let url = asset["browser_download_url"]
         .as_str()
-        .ok_or("у aria2 zip нет URL")?;
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("некорректный URL aria2: {e}"))?;
+        .ok_or(tr!("aria2 ZIP has no URL", "у aria2 zip нет URL"))?;
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| tr_format!("invalid aria2 URL: {e}", "некорректный URL aria2: {e}"))?;
     if parsed.scheme() != "https"
         || parsed.host_str() != Some("github.com")
         || parsed.username() != ""
@@ -593,7 +651,11 @@ fn aria2_asset(release: &serde_json::Value) -> Result<(String, String), String> 
         || !parsed.path().starts_with("/aria2/aria2/releases/download/")
         || !parsed.path().ends_with(&format!("/{name}"))
     {
-        return Err("aria2 zip должен скачиваться с официального GitHub-релиза".into());
+        return Err(tr!(
+            "aria2 ZIP must come from the official GitHub release",
+            "aria2 zip должен скачиваться с официального GitHub-релиза"
+        )
+        .into());
     }
     Ok((url.to_string(), expected))
 }
@@ -611,9 +673,12 @@ fn read_metadata(resp: impl Read, label: &str) -> Result<Vec<u8>, DownloadFailur
     let mut bytes = Vec::new();
     resp.take(MAX_RELEASE_METADATA + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| DownloadFailure::transient(format!("чтение {label}: {e}")))?;
+        .map_err(|e| {
+            DownloadFailure::transient(tr_format!("reading {label}: {e}", "чтение {label}: {e}"))
+        })?;
     if bytes.len() as u64 > MAX_RELEASE_METADATA {
-        return Err(DownloadFailure::permanent(format!(
+        return Err(DownloadFailure::permanent(tr_format!(
+            "{label}: response exceeds 1 MB",
             "{label}: ответ больше 1 МБ"
         )));
     }
@@ -628,7 +693,7 @@ fn release_json(
         .get(url)
         .timeout(Duration::from_secs(30))
         .send()
-        .map_err(|e| DownloadFailure::transient(format!("релиз: {e}")))?;
+        .map_err(|e| DownloadFailure::transient(tr_format!("release: {e}", "релиз: {e}")))?;
     if !resp.status().is_success() {
         // GitHub uses 403 (not just 429) for exhausted API rate limits.
         // Other 403s remain permanent; transport/rate failures preserve parts.
@@ -639,17 +704,22 @@ fn release_json(
                 .is_some_and(|v| v == "0")
                 || resp.headers().contains_key(reqwest::header::RETRY_AFTER))
         {
-            return Err(DownloadFailure::transient(
-                "GitHub API: превышен лимит запросов; повторите установку позже",
-            ));
+            return Err(DownloadFailure::transient(tr!(
+                "GitHub API rate limit exceeded; retry installation later",
+                "GitHub API: превышен лимит запросов; повторите установку позже"
+            )));
         }
         return Err(DownloadFailure::from_http_status(
             resp.status().as_u16(),
-            format!("релиз: HTTP {}", resp.status()),
+            tr_format!("release: HTTP {}", "релиз: HTTP {}", resp.status()),
         ));
     }
-    serde_json::from_slice(&read_metadata(resp, "API релизов")?)
-        .map_err(|e| DownloadFailure::permanent(format!("ответ API релизов: {e}")))
+    serde_json::from_slice(&read_metadata(resp, tr!("release API", "API релизов"))?).map_err(|e| {
+        DownloadFailure::permanent(tr_format!(
+            "release API response: {e}",
+            "ответ API релизов: {e}"
+        ))
+    })
 }
 
 fn yt_dlp_release_urls(release: &serde_json::Value) -> Result<(String, String), DownloadFailure> {
@@ -664,7 +734,12 @@ fn yt_dlp_release_urls(release: &serde_json::Value) -> Result<(String, String), 
                 && t.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
         })
-        .ok_or_else(|| DownloadFailure::permanent("в API yt-dlp нет допустимого tag_name"))?;
+        .ok_or_else(|| {
+            DownloadFailure::permanent(tr!(
+                "yt-dlp API has no valid tag_name",
+                "в API yt-dlp нет допустимого tag_name"
+            ))
+        })?;
     let base = format!("https://github.com/yt-dlp/yt-dlp/releases/download/{tag}");
     Ok((format!("{base}/yt-dlp.exe"), format!("{base}/SHA2-512SUMS")))
 }
@@ -690,9 +765,10 @@ fn copy_limited(
     max: u64,
 ) -> Result<(), String> {
     let n = std::io::copy(&mut reader.take(max + 1), &mut writer)
-        .map_err(|e| format!("сбой распаковки: {e}"))?;
+        .map_err(|e| tr_format!("extraction failed: {e}", "сбой распаковки: {e}"))?;
     if n > max {
-        return Err(format!(
+        return Err(tr_format!(
+            "{label} exceeds {max} bytes — possible tampering or corrupt archive",
             "{label} больше {max} байт — похоже на подмену или битый архив"
         ));
     }
@@ -715,24 +791,39 @@ fn deno_asset(release: &serde_json::Value) -> Result<(String, String), String> {
                 .iter()
                 .find(|a| a["name"].as_str() == Some(DENO_ZIP_NAME))
         })
-        .ok_or("в релизе Deno нет архива для Windows x64")?;
-    let size = asset["size"]
-        .as_u64()
-        .ok_or("у архива Deno нет размера в GitHub API")?;
+        .ok_or(tr!(
+            "Deno release has no Windows x64 archive",
+            "в релизе Deno нет архива для Windows x64"
+        ))?;
+    let size = asset["size"].as_u64().ok_or(tr!(
+        "GitHub API has no size for the Deno archive",
+        "у архива Deno нет размера в GitHub API"
+    ))?;
     if size == 0 || size > MAX_DENO_ZIP_BYTES {
-        return Err(format!("размер архива Deno ({size} байт) выходит за лимит"));
+        return Err(tr_format!(
+            "Deno archive size ({size} bytes) exceeds the limit",
+            "размер архива Deno ({size} байт) выходит за лимит"
+        ));
     }
     let digest = asset["digest"]
         .as_str()
         .and_then(|d| d.strip_prefix("sha256:"))
-        .ok_or("релиз Deno не публикует SHA-256 — установите Deno вручную")?;
+        .ok_or(tr!(
+            "Deno release has no SHA-256 checksum — install Deno manually",
+            "релиз Deno не публикует SHA-256 — установите Deno вручную"
+        ))?;
     if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("Некорректная SHA-256 в метаданных Deno".into());
+        return Err(tr!(
+            "Invalid SHA-256 in Deno metadata",
+            "Некорректная SHA-256 в метаданных Deno"
+        )
+        .into());
     }
     let url = asset["browser_download_url"]
         .as_str()
-        .ok_or("у архива Deno нет URL")?;
-    let parsed = reqwest::Url::parse(url).map_err(|e| format!("некорректный URL Deno: {e}"))?;
+        .ok_or(tr!("Deno archive has no URL", "у архива Deno нет URL"))?;
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| tr_format!("invalid Deno URL: {e}", "некорректный URL Deno: {e}"))?;
     if parsed.scheme() != "https"
         || parsed.host_str() != Some("github.com")
         || parsed.username() != ""
@@ -742,7 +833,11 @@ fn deno_asset(release: &serde_json::Value) -> Result<(String, String), String> {
             .starts_with("/denoland/deno/releases/download/")
         || !parsed.path().ends_with(&format!("/{DENO_ZIP_NAME}"))
     {
-        return Err("архив Deno должен скачиваться с официального GitHub-релиза".into());
+        return Err(tr!(
+            "Deno archive must come from the official GitHub release",
+            "архив Deno должен скачиваться с официального GitHub-релиза"
+        )
+        .into());
     }
     Ok((url.to_string(), digest.to_string()))
 }
@@ -760,7 +855,11 @@ pub fn install_ffmpeg_with(
     report: &mut dyn FnMut(SetupProgress),
 ) -> Result<PathBuf, String> {
     if !cfg!(windows) {
-        return Err("Автоустановка ffmpeg поддерживается только на Windows.".to_string());
+        return Err(tr!(
+            "Automatic ffmpeg installation is only supported on Windows.",
+            "Автоустановка ffmpeg поддерживается только на Windows."
+        )
+        .to_string());
     }
     let _lock = install_lock(bin, "ffmpeg")?;
     match retry_transient(|| install_ffmpeg_inner(bin, report)) {
@@ -782,7 +881,7 @@ fn install_ffmpeg_inner(
 ) -> Result<PathBuf, DownloadFailure> {
     let c = client().map_err(DownloadFailure::permanent)?;
     if std::io::stdout().is_terminal() {
-        crate::outln("⬇ Скачиваю ffmpeg…");
+        crate::outln(tr!("⬇ Downloading ffmpeg…", "⬇ Скачиваю ffmpeg…"));
     }
     report(SetupProgress {
         label: "ffmpeg".into(),
@@ -803,10 +902,18 @@ fn install_ffmpeg_inner(
             format!("ffmpeg sha256: HTTP {}", resp.status()),
         ));
     }
-    let text = String::from_utf8(read_metadata(resp, "ffmpeg sha256")?)
-        .map_err(|e| DownloadFailure::permanent(format!("ffmpeg sha256 не UTF-8: {e}")))?;
-    let expected = sha256_from_sidecar(&text)
-        .ok_or_else(|| DownloadFailure::permanent("в ffmpeg .sha256 нет корректного хеша"))?;
+    let text = String::from_utf8(read_metadata(resp, "ffmpeg sha256")?).map_err(|e| {
+        DownloadFailure::permanent(tr_format!(
+            "ffmpeg SHA-256 response is not UTF-8: {e}",
+            "ffmpeg sha256 не UTF-8: {e}"
+        ))
+    })?;
+    let expected = sha256_from_sidecar(&text).ok_or_else(|| {
+        DownloadFailure::permanent(tr!(
+            "ffmpeg .sha256 has no valid hash",
+            "в ffmpeg .sha256 нет корректного хеша"
+        ))
+    })?;
 
     let zip_path = bin.join("ffmpeg.zip.part");
     download(
@@ -821,9 +928,10 @@ fn install_ffmpeg_inner(
     let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(&expected) {
         remove_part(&zip_path);
-        return Err(DownloadFailure::permanent(
-            "SHA-256 архива ffmpeg не совпала — установка остановлена",
-        ));
+        return Err(DownloadFailure::permanent(tr!(
+            "ffmpeg archive SHA-256 mismatch — installation stopped",
+            "SHA-256 архива ffmpeg не совпала — установка остановлена"
+        )));
     }
 
     let dest = bin.join("ffmpeg.exe");
@@ -831,9 +939,14 @@ fn install_ffmpeg_inner(
     let probe_tmp = bin.join("ffprobe.exe.part");
     processing.set(SetupStage::Extracting, report);
     let extracted = (|| -> Result<(), String> {
-        let file =
-            File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("битый zip: {e}"))?;
+        let file = File::open(&zip_path).map_err(|e| {
+            tr_format!(
+                "could not open downloaded ZIP: {e}",
+                "не удалось открыть скачанный zip: {e}"
+            )
+        })?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| tr_format!("corrupt ZIP: {e}", "битый zip: {e}"))?;
         for (tool, tool_tmp) in [("ffmpeg.exe", &tmp), ("ffprobe.exe", &probe_tmp)] {
             let idx = (0..archive.len())
                 .filter_map(|i| {
@@ -852,22 +965,36 @@ fn install_ffmpeg_inner(
                 if tool == "ffprobe.exe" {
                     continue;
                 }
-                return Err("внутри zip нет ffmpeg.exe".into());
+                return Err(tr!("ZIP has no ffmpeg.exe", "внутри zip нет ffmpeg.exe").into());
             };
             {
-                let mut entry = archive
-                    .by_index(idx)
-                    .map_err(|e| format!("не удалось прочитать zip: {e}"))?;
-                let mut out = File::create(tool_tmp)
-                    .map_err(|e| format!("не удалось создать {}: {e}", tool_tmp.display()))?;
+                let mut entry = archive.by_index(idx).map_err(|e| {
+                    tr_format!("could not read ZIP: {e}", "не удалось прочитать zip: {e}")
+                })?;
+                let mut out = File::create(tool_tmp).map_err(|e| {
+                    tr_format!(
+                        "could not create {}: {e}",
+                        "не удалось создать {}: {e}",
+                        tool_tmp.display()
+                    )
+                })?;
                 copy_limited(tool, &mut entry, &mut out, MAX_FFMPEG_EXE_BYTES)?;
             }
         }
         processing.set(SetupStage::Installing, report);
-        publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить ffmpeg.exe: {e}"))?;
+        publish_tool(&tmp, &dest).map_err(|e| {
+            tr_format!(
+                "could not install ffmpeg.exe: {e}",
+                "не удалось установить ffmpeg.exe: {e}"
+            )
+        })?;
         if probe_tmp.is_file() {
-            publish_tool(&probe_tmp, &bin.join("ffprobe.exe"))
-                .map_err(|e| format!("не удалось установить ffprobe.exe: {e}"))?;
+            publish_tool(&probe_tmp, &bin.join("ffprobe.exe")).map_err(|e| {
+                tr_format!(
+                    "could not install ffprobe.exe: {e}",
+                    "не удалось установить ffprobe.exe: {e}"
+                )
+            })?;
         }
         Ok(())
     })();
@@ -891,7 +1018,11 @@ pub fn install_deno_with(
     report: &mut dyn FnMut(SetupProgress),
 ) -> Result<PathBuf, String> {
     if !cfg!(windows) {
-        return Err("Автоустановка Deno поддерживается только на Windows.".to_string());
+        return Err(tr!(
+            "Automatic Deno installation is only supported on Windows.",
+            "Автоустановка Deno поддерживается только на Windows."
+        )
+        .to_string());
     }
     let _lock = install_lock(bin, "deno")?;
     match retry_transient(|| install_deno_inner(bin, report)) {
@@ -911,10 +1042,17 @@ fn install_deno_inner(
     report: &mut dyn FnMut(SetupProgress),
 ) -> Result<PathBuf, DownloadFailure> {
     let c = client().map_err(DownloadFailure::permanent)?;
-    recover_tool(&bin.join("deno.exe"))
-        .map_err(|e| DownloadFailure::transient(format!("восстановление deno: {e}")))?;
+    recover_tool(&bin.join("deno.exe")).map_err(|e| {
+        DownloadFailure::transient(tr_format!(
+            "recovering Deno: {e}",
+            "восстановление deno: {e}"
+        ))
+    })?;
     if std::io::stdout().is_terminal() {
-        crate::outln("⬇ Ищу свежий релиз Deno…");
+        crate::outln(tr!(
+            "⬇ Looking for the latest Deno release…",
+            "⬇ Ищу свежий релиз Deno…"
+        ));
     }
     report(SetupProgress {
         label: "Deno".into(),
@@ -938,18 +1076,24 @@ fn install_deno_inner(
     let got = sha256_hex(&zip_path).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(&expected) {
         remove_part(&zip_path);
-        return Err(DownloadFailure::permanent(
-            "SHA-256 архива Deno не совпала — установка остановлена",
-        ));
+        return Err(DownloadFailure::permanent(tr!(
+            "Deno archive SHA-256 mismatch — installation stopped",
+            "SHA-256 архива Deno не совпала — установка остановлена"
+        )));
     }
 
     let dest = bin.join("deno.exe");
     let tmp = bin.join("deno.exe.part");
     processing.set(SetupStage::Extracting, report);
     let extracted = (|| -> Result<(), String> {
-        let file =
-            File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("битый zip: {e}"))?;
+        let file = File::open(&zip_path).map_err(|e| {
+            tr_format!(
+                "could not open downloaded ZIP: {e}",
+                "не удалось открыть скачанный zip: {e}"
+            )
+        })?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| tr_format!("corrupt ZIP: {e}", "битый zip: {e}"))?;
         let idx = (0..archive.len())
             .filter_map(|i| {
                 archive.by_index(i).ok().and_then(|e| {
@@ -958,18 +1102,28 @@ fn install_deno_inner(
                 })
             })
             .min_by_key(|(_, len)| *len)
-            .ok_or("внутри zip нет deno.exe")?
+            .ok_or(tr!("ZIP has no deno.exe", "внутри zip нет deno.exe"))?
             .0;
         {
-            let mut entry = archive
-                .by_index(idx)
-                .map_err(|e| format!("не удалось прочитать zip: {e}"))?;
-            let mut out = File::create(&tmp)
-                .map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
+            let mut entry = archive.by_index(idx).map_err(|e| {
+                tr_format!("could not read ZIP: {e}", "не удалось прочитать zip: {e}")
+            })?;
+            let mut out = File::create(&tmp).map_err(|e| {
+                tr_format!(
+                    "could not create {}: {e}",
+                    "не удалось создать {}: {e}",
+                    tmp.display()
+                )
+            })?;
             copy_limited("deno.exe", &mut entry, &mut out, MAX_DENO_EXE_BYTES)?;
         }
         processing.set(SetupStage::Installing, report);
-        publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить deno.exe: {e}"))
+        publish_tool(&tmp, &dest).map_err(|e| {
+            tr_format!(
+                "could not install deno.exe: {e}",
+                "не удалось установить deno.exe: {e}"
+            )
+        })
     })();
     remove_part(&zip_path);
     if extracted.is_err() {
@@ -989,14 +1143,23 @@ fn install_deno_inner(
 fn install_lock(bin: &Path, tool: &str) -> Result<File, String> {
     use fs4::{FileExt, TryLockError};
     let path = bin.join(format!("{tool}.install.lock"));
-    let file = crate::config::open_lock_file(&path, true)
-        .map_err(|e| format!("блокировка установки {}: {e}", path.display()))?;
+    let file = crate::config::open_lock_file(&path, true).map_err(|e| {
+        tr_format!(
+            "installation lock {}: {e}",
+            "блокировка установки {}: {e}",
+            path.display()
+        )
+    })?;
     match FileExt::try_lock(&file) {
         Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(format!(
+        Err(TryLockError::WouldBlock) => Err(tr_format!(
+            "{tool} is being installed in another SNATCH window — wait for it to finish and retry",
             "{tool} уже устанавливается в другом окне SNATCH — дождитесь окончания и повторите"
         )),
-        Err(TryLockError::Error(e)) => Err(format!("блокировка установки {tool}: {e}")),
+        Err(TryLockError::Error(e)) => Err(tr_format!(
+            "installation lock for {tool}: {e}",
+            "блокировка установки {tool}: {e}"
+        )),
     }
 }
 
@@ -1031,7 +1194,8 @@ fn publish_tool(tmp: &Path, dest: &Path) -> std::io::Result<()> {
         if let Err(restore) = std::fs::rename(&old, dest) {
             return Err(std::io::Error::new(
                 e.kind(),
-                format!(
+                tr_format!(
+                    "installation: {e}; recovery: {restore}; backup: {}",
                     "установка: {e}; восстановление: {restore}; резерв: {}",
                     old.display()
                 ),
@@ -1062,7 +1226,11 @@ pub fn install_yt_dlp_with(
     report: &mut dyn FnMut(SetupProgress),
 ) -> Result<PathBuf, String> {
     if !cfg!(windows) {
-        return Err("Автоустановка yt-dlp поддерживается только на Windows.".to_string());
+        return Err(tr!(
+            "Automatic yt-dlp installation is only supported on Windows.",
+            "Автоустановка yt-dlp поддерживается только на Windows."
+        )
+        .to_string());
     }
     let _lock = install_lock(bin, "yt-dlp")?;
     match retry_transient(|| install_yt_dlp_inner(bin, report)) {
@@ -1086,7 +1254,10 @@ fn install_yt_dlp_inner(
     let dest = bin.join("yt-dlp.exe");
     let tmp = bin.join("yt-dlp.exe.part");
     if std::io::stdout().is_terminal() {
-        crate::outln("⬇ Скачиваю yt-dlp.exe (официальный релиз)…");
+        crate::outln(tr!(
+            "⬇ Downloading yt-dlp.exe (official release)…",
+            "⬇ Скачиваю yt-dlp.exe (официальный релиз)…"
+        ));
     }
     report(SetupProgress {
         label: "yt-dlp.exe".into(),
@@ -1101,19 +1272,36 @@ fn install_yt_dlp_inner(
         .get(&sums_url)
         .timeout(Duration::from_secs(30))
         .send()
-        .map_err(|e| DownloadFailure::transient(format!("не удалось скачать SHA2-512SUMS: {e}")))?;
+        .map_err(|e| {
+            DownloadFailure::transient(tr_format!(
+                "could not download SHA2-512SUMS: {e}",
+                "не удалось скачать SHA2-512SUMS: {e}"
+            ))
+        })?;
     if !sums.status().is_success() {
         // Without this check a 403/404 body gets parsed as the sums file and
         // surfaces as the misleading "no entry for yt-dlp.exe" error.
         return Err(DownloadFailure::from_http_status(
             sums.status().as_u16(),
-            format!("не удалось скачать SHA2-512SUMS: HTTP {}", sums.status()),
+            tr_format!(
+                "could not download SHA2-512SUMS: HTTP {}",
+                "не удалось скачать SHA2-512SUMS: HTTP {}",
+                sums.status()
+            ),
         ));
     }
-    let sums_text = String::from_utf8(read_metadata(sums, "SHA2-512SUMS")?)
-        .map_err(|e| DownloadFailure::permanent(format!("SHA2-512SUMS не UTF-8: {e}")))?;
-    let expected = yt_dlp_checksum(&sums_text)
-        .ok_or_else(|| DownloadFailure::permanent("в SHA2-512SUMS нет записи для yt-dlp.exe"))?;
+    let sums_text = String::from_utf8(read_metadata(sums, "SHA2-512SUMS")?).map_err(|e| {
+        DownloadFailure::permanent(tr_format!(
+            "SHA2-512SUMS is not UTF-8: {e}",
+            "SHA2-512SUMS не UTF-8: {e}"
+        ))
+    })?;
+    let expected = yt_dlp_checksum(&sums_text).ok_or_else(|| {
+        DownloadFailure::permanent(tr!(
+            "SHA2-512SUMS has no entry for yt-dlp.exe",
+            "в SHA2-512SUMS нет записи для yt-dlp.exe"
+        ))
+    })?;
     download(
         &c,
         &payload_url,
@@ -1126,9 +1314,10 @@ fn install_yt_dlp_inner(
     let got = sha512_hex(&tmp).map_err(DownloadFailure::permanent)?;
     if !got.eq_ignore_ascii_case(expected) {
         remove_part(&tmp);
-        return Err(DownloadFailure::permanent(
-            "контрольная сумма SHA-512 не совпала — файл не сохранён",
-        ));
+        return Err(DownloadFailure::permanent(tr!(
+            "SHA-512 checksum mismatch — file was not saved",
+            "контрольная сумма SHA-512 не совпала — файл не сохранён"
+        )));
     }
 
     // Never move aside a running PyInstaller image: it reads modules from its
@@ -1138,7 +1327,7 @@ fn install_yt_dlp_inner(
     processing.set(SetupStage::Installing, report);
     std::fs::rename(&tmp, &dest).map_err(|e| DownloadFailure {
         kind: FailureKind::Deferred,
-        message: format!("не удалось установить yt-dlp.exe (возможно, он занят загрузкой; повторите установку после её завершения): {e}"),
+        message: tr_format!("could not install yt-dlp.exe (it may be downloading; retry installation after the download finishes): {e}", "не удалось установить yt-dlp.exe (возможно, он занят загрузкой; повторите установку после её завершения): {e}"),
     })?;
     let _ = std::fs::remove_file(validator_path(&tmp));
     Ok(dest)
@@ -1154,7 +1343,11 @@ pub fn install_aria2_with(
     report: &mut dyn FnMut(SetupProgress),
 ) -> Result<PathBuf, String> {
     if !cfg!(windows) {
-        return Err("Автоустановка aria2c поддерживается только на Windows.".to_string());
+        return Err(tr!(
+            "Automatic aria2c installation is only supported on Windows.",
+            "Автоустановка aria2c поддерживается только на Windows."
+        )
+        .to_string());
     }
     let _lock = install_lock(bin, "aria2c")?;
     match retry_transient(|| install_aria2_inner(bin, report)) {
@@ -1176,10 +1369,17 @@ fn install_aria2_inner(
     report: &mut dyn FnMut(SetupProgress),
 ) -> Result<PathBuf, DownloadFailure> {
     let c = client().map_err(DownloadFailure::permanent)?;
-    recover_tool(&bin.join("aria2c.exe"))
-        .map_err(|e| DownloadFailure::transient(format!("восстановление aria2c: {e}")))?;
+    recover_tool(&bin.join("aria2c.exe")).map_err(|e| {
+        DownloadFailure::transient(tr_format!(
+            "recovering aria2c: {e}",
+            "восстановление aria2c: {e}"
+        ))
+    })?;
     if std::io::stdout().is_terminal() {
-        crate::outln("⬇ Ищу свежий релиз aria2…");
+        crate::outln(tr!(
+            "⬇ Looking for the latest aria2 release…",
+            "⬇ Ищу свежий релиз aria2…"
+        ));
     }
     report(SetupProgress {
         label: "aria2c".into(),
@@ -1204,18 +1404,24 @@ fn install_aria2_inner(
     if !got.eq_ignore_ascii_case(&expected_sha256) {
         // The archive is unusable and must not be resumed later.
         remove_part(&zip_path);
-        return Err(DownloadFailure::permanent(
-            "SHA-256 архива aria2 не совпала — установка остановлена",
-        ));
+        return Err(DownloadFailure::permanent(tr!(
+            "aria2 archive SHA-256 mismatch — installation stopped",
+            "SHA-256 архива aria2 не совпала — установка остановлена"
+        )));
     }
 
     let dest = bin.join("aria2c.exe");
     let tmp = bin.join("aria2c.exe.part");
     processing.set(SetupStage::Extracting, report);
     let extracted = (|| -> Result<(), String> {
-        let file =
-            File::open(&zip_path).map_err(|e| format!("не удалось открыть скачанный zip: {e}"))?;
-        let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("битый zip: {e}"))?;
+        let file = File::open(&zip_path).map_err(|e| {
+            tr_format!(
+                "could not open downloaded ZIP: {e}",
+                "не удалось открыть скачанный zip: {e}"
+            )
+        })?;
+        let mut archive = zip::ZipArchive::new(file)
+            .map_err(|e| tr_format!("corrupt ZIP: {e}", "битый zip: {e}"))?;
         let entry_idx = (0..archive.len())
             .filter_map(|i| {
                 archive.by_index(i).ok().and_then(|e| {
@@ -1229,18 +1435,28 @@ fn install_aria2_inner(
             })
             .min_by_key(|(_, len)| *len)
             .map(|(i, _)| i)
-            .ok_or("внутри zip нет aria2c.exe")?;
+            .ok_or(tr!("ZIP has no aria2c.exe", "внутри zip нет aria2c.exe"))?;
 
         {
-            let mut entry = archive
-                .by_index(entry_idx)
-                .map_err(|e| format!("не удалось прочитать zip: {e}"))?;
-            let mut out = File::create(&tmp)
-                .map_err(|e| format!("не удалось создать {}: {e}", tmp.display()))?;
+            let mut entry = archive.by_index(entry_idx).map_err(|e| {
+                tr_format!("could not read ZIP: {e}", "не удалось прочитать zip: {e}")
+            })?;
+            let mut out = File::create(&tmp).map_err(|e| {
+                tr_format!(
+                    "could not create {}: {e}",
+                    "не удалось создать {}: {e}",
+                    tmp.display()
+                )
+            })?;
             copy_limited("aria2c.exe", &mut entry, &mut out, MAX_ARIA2C_BYTES)?;
         }
         processing.set(SetupStage::Installing, report);
-        publish_tool(&tmp, &dest).map_err(|e| format!("не удалось установить aria2c.exe: {e}"))
+        publish_tool(&tmp, &dest).map_err(|e| {
+            tr_format!(
+                "could not install aria2c.exe: {e}",
+                "не удалось установить aria2c.exe: {e}"
+            )
+        })
     })();
     // The archive file handle must be dropped before Windows lets us delete
     // it, so cleanup happens after the extraction block regardless of outcome
@@ -1666,7 +1882,7 @@ mod tests {
         let (dir, _) = part_in("installlock");
         let first = install_lock(&dir, "yt-dlp").unwrap();
         let busy = install_lock(&dir, "yt-dlp").unwrap_err();
-        assert!(busy.contains("уже устанавливается"), "{busy}");
+        assert!(busy.contains("is being installed"), "{busy}");
         // Another tool is independent.
         let other = install_lock(&dir, "aria2c").unwrap();
         drop(first);

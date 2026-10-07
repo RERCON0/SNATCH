@@ -1,3 +1,4 @@
+use crate::{tr, tr_format};
 use std::path::{Path, PathBuf};
 
 use crate::config::config_dir;
@@ -143,14 +144,14 @@ pub fn find(name: &str) -> Option<PathBuf> {
             // A UNC candidate would SMB-authenticate to the remote host on
             // the is_file() probe below (NetNTLMv2 leak) - refuse it first.
             if crate::engines::is_unc_path(&p) {
-                crate::errln(format!(
+                crate::errln(tr_format!(
+                    "⚠ {key} points to a network UNC path: {candidate:?} — skipping.",
                     "⚠ {key} указывает на сетевой UNC-путь: {candidate:?} — пропускаю."
                 ));
             } else if is_executable(&p) {
                 return Some(p);
             } else {
-                crate::errln(format!(
-                    "⚠ {key} указывает на отсутствующий, пустой или неисполнимый файл: {candidate:?} — продолжаю обычный поиск."
+                crate::errln(tr_format!("⚠ {key} points to a missing, empty or non-executable file: {candidate:?} — continuing discovery.", "⚠ {key} указывает на отсутствующий, пустой или неисполнимый файл: {candidate:?} — продолжаю обычный поиск."
                 ));
             }
         }
@@ -198,7 +199,11 @@ fn lock_for_spawn_within(
         _ => return Ok(None),
     };
     if crate::engines::is_unc_path(program) {
-        return Err("Сетевой путь загрузчика не поддерживается".into());
+        return Err(tr!(
+            "Network tool paths are not supported",
+            "Сетевой путь загрузчика не поддерживается"
+        )
+        .into());
     }
     let path = parent.join(format!("{tool}.install.lock"));
     let managed = bootstrap_dir().is_ok_and(|dir| dir == parent);
@@ -212,7 +217,12 @@ fn lock_for_spawn_within(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !managed && !recovering => {
             return Ok(None)
         }
-        Err(e) => return Err(format!("блокировка запуска {tool}: {e}")),
+        Err(e) => {
+            return Err(tr_format!(
+                "startup lock for {tool}: {e}",
+                "блокировка запуска {tool}: {e}"
+            ))
+        }
     };
     let deadline = std::time::Instant::now() + wait;
     loop {
@@ -222,7 +232,8 @@ fn lock_for_spawn_within(
                 std::thread::sleep(std::time::Duration::from_millis(25))
             }
             Err(e) => {
-                return Err(format!(
+                return Err(tr_format!(
+                    "{tool} is being installed; retry after installation ({e})",
                     "{tool} устанавливается; повторите запуск после установки ({e})"
                 ))
             }
@@ -231,7 +242,8 @@ fn lock_for_spawn_within(
     if tool == "aria2c" && !program.exists() {
         let old = program.with_extension("exe.old");
         if old.is_file() {
-            std::fs::rename(old, program).map_err(|e| format!("восстановление aria2c: {e}"))?;
+            std::fs::rename(old, program)
+                .map_err(|e| tr_format!("recovering aria2c: {e}", "восстановление aria2c: {e}"))?;
         }
     }
     Ok(Some(lock))
@@ -263,9 +275,17 @@ impl Toolchain {
                 "yt-dlp.yt-dlp"
             };
             let env_hint = env_override(name)
-                .map(|e| format!(" или задайте путь через переменную окружения {e}"))
+                .map(|e| {
+                    tr_format!(
+                        " or set its path with the {e} environment variable",
+                        " или задайте путь через переменную окружения {e}"
+                    )
+                })
                 .unwrap_or_default();
-            format!("Не найден «{name}». Установите его (winget install {pkg}){env_hint}.")
+            tr_format!(
+                "“{name}” not found. Install it (winget install {pkg}){env_hint}.",
+                "Не найден «{name}». Установите его (winget install {pkg}){env_hint}."
+            )
         })
     }
 }
@@ -391,7 +411,7 @@ mod tests {
             .open(&old)
             .unwrap();
         let error = try_lock_for_spawn(&exe).unwrap_err();
-        assert!(error.contains("восстановление aria2c"), "{error}");
+        assert!(error.contains("recovering aria2c"), "{error}");
         assert_eq!(std::fs::read(&old).unwrap(), b"previous build");
         assert!(!exe.exists());
         drop(reader);

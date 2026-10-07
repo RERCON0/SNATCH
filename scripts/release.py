@@ -318,20 +318,43 @@ def build(output: Path, private_key: Path) -> dict:
 def release_readme(version: str, commit: str) -> bytes:
     base = "https://github.com/RERCON0/SNATCH/tree/" + commit
     return (f"# SNATCH {version} — Windows x64\n\n"
+            "A lightweight downloader with a native GUI and CLI.\n"
+            "Run snatch-app.exe for the GUI or snatch.exe in a terminal.\n"
+            "Language: EN / RU next to the theme button in the GUI title bar, or snatch --lang en / snatch --lang ru.\n"
+            "The language preference is shared and saved for future launches.\n"
+            "Tools: install/update in the GUI or snatch --install-tools.\n"
+            "Tools folder: %LOCALAPPDATA%\\snatch\\bin.\n"
+            "Choose a drive and folder in the CLI browser, or use -o.\n\n"
+            'Example: snatch "https://host/file.zip" -y -o "D:\\Downloads"\n\n'
+            "The EXEs have no Authenticode signature. SmartScreen may show 'Windows protected your PC'.\n"
+            "For a trusted download from official Releases, choose More info -> Run anyway.\n"
+            "The Ed25519 package signature does not remove this warning.\n\n"
+            "Verify from a trusted checkout (requires Python 3.13+ and OpenSSL 3):\n"
+            "python scripts/release.py verify <path-to-this-ZIP>\n"
+            "Do not obtain the trusted key only from the archive being checked.\n\n"
+            f"Source and documentation: {base}\n"
+            f"Русская документация: {base}/README.ru.md\n"
+            f"Release verification: {base}/docs/RELEASING.md\n"
+            f"CLI reference: {base}/docs/CLI.md\n\n"
+            "---\n\n# Русский\n\n"
+            "Лёгкий загрузчик с нативным GUI и CLI.\n"
             "Запустите snatch-app.exe для GUI или snatch.exe в терминале.\n"
+            "Язык: EN / RU рядом с темой в шапке GUI или snatch --lang en / snatch --lang ru.\n"
+            "Выбор сохраняется для следующих запусков обеих версий.\n"
             "Инструменты: кнопка установки/обновления в GUI или snatch --install-tools.\n"
             "Папка инструментов: %LOCALAPPDATA%\\snatch\\bin.\n"
-            "В выборе папки CLI выберите нужный диск, затем папку; также доступен -o.\n\n"
-            'Пример: snatch "https://host/file.zip" -y -o "D:\\Downloads"\n\n'
-            "Перед запуском проверьте подпись из доверенного checkout:\n"
+            "В CLI выберите нужный диск, затем папку; также доступен -o.\n\n"
+            "EXE пока без Authenticode-подписи. Для доверенного архива из официальных Releases\n"
+            "в SmartScreen нажмите Подробнее -> Выполнить в любом случае.\n"
+            "Подпись Ed25519 не убирает предупреждение Windows.\n\n"
+            "Проверьте подпись из доверенного checkout (Python 3.13+ и OpenSSL 3):\n"
             "python scripts/release.py verify <путь-к-этому-ZIP>\n"
             "Не берите доверенный ключ только из самого проверяемого архива.\n\n"
-            f"Исходники и полная документация: {base}\n"
-            f"Проверка подписи: {base}/docs/RELEASING.md\n"
-            f"Справка CLI: {base}/docs/CLI.md\n"
+            f"Исходники и документация: {base}/README.ru.md\n"
+            f"Справка CLI: {base}/docs/CLI.ru.md\n\n"
             "LICENSE: GNU GPL v3.0 or later; FONT-LICENSE.txt: Cascadia Mono / SIL OFL.\n"
-            "Подпись Ed25519 охватывает манифест и хеши всех файлов ZIP.\n"
-            "Authenticode-подпись EXE не заявляется.\n").encode("utf-8")
+            "Ed25519 covers the manifest and hashes of all ZIP files.\n"
+            "Подпись Ed25519 охватывает манифест и хеши всех файлов ZIP.\n").encode("utf-8")
 
 
 def keygen(private: Path, public: Path) -> None:

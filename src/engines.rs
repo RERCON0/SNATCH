@@ -1,3 +1,4 @@
+use crate::{tr, tr_format};
 use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -34,7 +35,9 @@ pub const FILE_EXT: &[&str] = &[
 pub const ALLOWED_SCHEMES: &[&str] = &["http", "https", "ftp"];
 pub const TORRENT_FILES: &[&str] = &[".torrent", ".metalink", ".meta4"];
 
-pub const ARIA2_MISSING_CONTROL_HINT: &str = "Файлы этой раздачи уже есть, но файл докачки .aria2 отсутствует. Чтобы не стереть данные, загрузка остановлена. Выберите новую пустую папку; не включайте перезапись существующих файлов.";
+pub fn aria2_missing_control_hint() -> &'static str {
+    tr!("Files from this torrent already exist, but the .aria2 control file is missing. The download was stopped to protect your data. Choose a new empty folder; do not enable overwriting existing files.", "Файлы этой раздачи уже есть, но файл докачки .aria2 отсутствует. Чтобы не стереть данные, загрузка остановлена. Выберите новую пустую папку; не включайте перезапись существующих файлов.")
+}
 
 /// Поиск ASCII-подстроки без временной копии строки (в отличие от
 /// `to_ascii_lowercase().contains(..)`): `needle` обязан быть непустым и уже
@@ -61,27 +64,49 @@ pub const COOKIES_BROWSERS: &[&str] = &[
     "brave", "chrome", "chromium", "edge", "firefox", "opera", "safari", "vivaldi", "whale",
 ];
 
-pub const ENGINE_LABELS: [(&str, &str); 2] = [
-    (
-        "yt-dlp",
-        "yt-dlp — видео и стримы (YouTube и ещё тысячи сайтов)",
-    ),
-    ("aria2", "aria2c — прямые ссылки, torrent, magnet"),
-];
+pub fn engine_labels() -> [(&'static str, &'static str); 2] {
+    [
+        (
+            "yt-dlp",
+            tr!(
+                "yt-dlp — videos and streams (YouTube and thousands of other sites)",
+                "yt-dlp — видео и стримы (YouTube и ещё тысячи сайтов)"
+            ),
+        ),
+        (
+            "aria2",
+            tr!(
+                "aria2c — direct links, torrents, magnets",
+                "aria2c — прямые ссылки, torrent, magnet"
+            ),
+        ),
+    ]
+}
 
-pub const FORMATS: [(&str, &str); 8] = [
-    ("best", "Лучшее качество"),
-    ("2160p", "Видео до 2160p (4K)"),
-    ("1440p", "Видео до 1440p"),
-    ("1080p", "Видео до 1080p"),
-    ("720p", "Видео до 720p"),
-    ("480p", "Видео до 480p"),
-    ("audio", "Аудио — mp3 (перекодирование)"),
-    (
-        "audio-src",
-        "Аудио — исходное (m4a/opus, без перекодирования)",
-    ),
-];
+pub fn formats() -> [(&'static str, &'static str); 8] {
+    [
+        ("best", tr!("Best quality", "Лучшее качество")),
+        (
+            "2160p",
+            tr!("Video up to 2160p (4K)", "Видео до 2160p (4K)"),
+        ),
+        ("1440p", tr!("Video up to 1440p", "Видео до 1440p")),
+        ("1080p", tr!("Video up to 1080p", "Видео до 1080p")),
+        ("720p", tr!("Video up to 720p", "Видео до 720p")),
+        ("480p", tr!("Video up to 480p", "Видео до 480p")),
+        (
+            "audio",
+            tr!("Audio — mp3 (conversion)", "Аудио — mp3 (перекодирование)"),
+        ),
+        (
+            "audio-src",
+            tr!(
+                "Audio — original (m4a/opus, no conversion)",
+                "Аудио — исходное (m4a/opus, без перекодирования)"
+            ),
+        ),
+    ]
+}
 
 const AUTH_HINTS: &[&str] = &[
     "sign in to confirm",
@@ -166,7 +191,8 @@ pub fn aria2_stat(line: &str) -> Option<String> {
     if let Some(start) = line.find("[FileAlloc:") {
         let alloc = line[start..].split(']').next()?.split_whitespace().nth(1)?;
         if !alloc.ends_with("(100%)") {
-            return Some(format!(
+            return Some(tr_format!(
+                "{percent}% · {amount} · allocating space {}",
                 "{percent}% · {amount} · выделение места {}",
                 alloc.replace('(', " (")
             ));
@@ -182,7 +208,8 @@ pub fn aria2_stat(line: &str) -> Option<String> {
     let dl = field("DL:");
     let peers = field("CN:");
     let seeds = field("SD:");
-    Some(format!(
+    Some(tr_format!(
+        "{percent}% · {amount} · ↓{dl}/s · seeds {seeds} · connections {peers}",
         "{percent}% · {amount} · ↓{dl}/с · сиды {seeds} · соединения {peers}"
     ))
 }
@@ -238,7 +265,7 @@ pub fn batch_name(url: &str) -> String {
         }
     }
     if segment.is_empty() {
-        "загрузка".to_string()
+        tr!("download", "загрузка").to_string()
     } else {
         segment.to_string()
     }
@@ -538,33 +565,38 @@ fn has_valid_xt(magnet: &str) -> bool {
 pub fn validate_url(url: &str) -> Result<String, String> {
     let u = clean_url(url);
     if u.is_empty() {
-        return Err("Пустая ссылка.".to_string());
+        return Err(tr!("Empty link.", "Пустая ссылка.").to_string());
     }
     if has_control_chars(&u) {
-        return Err(
+        return Err(tr!(
+            "The link contains control characters (a line break?). Copy it again.",
             "Ссылка содержит управляющие символы (перенос строки?) — скопируйте её заново."
-                .to_string(),
-        );
+        )
+        .to_string());
     }
     if u.starts_with('-') {
-        return Err("Ссылка не может начинаться с «-» (похоже на опцию, а не на URL).".to_string());
+        return Err(tr!(
+            "A link cannot start with “-” (this looks like an option, not a URL).",
+            "Ссылка не может начинаться с «-» (похоже на опцию, а не на URL)."
+        )
+        .to_string());
     }
     // Must come before the .torrent is_file() probe below: stat'ing a UNC
     // path already authenticates to the remote host.
     if is_unc_text(&u) {
         return Err(
-            "Сетевые UNC-пути (\\\\сервер\\шара) не поддерживаются: обращение к ним \
+            tr!("Network UNC paths are not supported: accessing them sends your Windows credentials to a remote server. Save the .torrent file locally or use an http(s)/ftp/magnet link.", "Сетевые UNC-пути (\\\\сервер\\шара) не поддерживаются: обращение к ним \
              отправляет ваши учётные данные Windows на чужой сервер. Сохраните \
-             .torrent-файл локально или используйте http(s)/ftp/magnet-ссылку."
+             .torrent-файл локально или используйте http(s)/ftp/magnet-ссылку.")
                 .to_string(),
         );
     }
     if u.to_lowercase().starts_with("magnet:") {
         if !has_valid_xt(&u) {
             return Err(
-                "Ссылка magnet повреждена (не найден корректный xt=urn:...). Похоже, часть \
+                tr!("Invalid magnet link (no valid xt=urn:...). Some “&” characters may have been lost when pasting into the terminal — paste the link again or use -y.", "Ссылка magnet повреждена (не найден корректный xt=urn:...). Похоже, часть \
                  символов «&» потерялась при вставке в терминал — вставьте ссылку ещё раз \
-                 или передайте её через -y."
+                 или передайте её через -y.")
                     .to_string(),
             );
         }
@@ -574,14 +606,18 @@ pub fn validate_url(url: &str) -> Result<String, String> {
     let netloc = netloc_of(&u);
     if ALLOWED_SCHEMES.contains(&scheme.as_str()) && !netloc.is_empty() {
         if netloc.contains('[') && !netloc.contains(']') {
-            return Err(format!("Не получается разобрать ссылку: {u:?}"));
+            return Err(tr_format!(
+                "Could not parse link: {u:?}",
+                "Не получается разобрать ссылку: {u:?}"
+            ));
         }
         return Ok(u);
     }
     if TORRENT_FILES.contains(&suffix_of(&u).as_str()) && Path::new(&u).is_file() {
         return Ok(u);
     }
-    Err(format!(
+    Err(tr_format!(
+        "Unsupported link: {u:?} (expected http(s)://, ftp://, magnet: or a .torrent file).",
         "Не понимаю ссылку: {u:?} (нужен http(s)://, ftp://, magnet: или .torrent-файл)."
     ))
 }
@@ -630,21 +666,22 @@ pub fn is_bittorrent_input(url: &str) -> bool {
 
 pub fn validate_cookies_browser(value: &str) -> Result<(), String> {
     if has_control_chars(value) {
-        return Err(format!(
+        return Err(tr_format!(
+            "The cookies browser name contains control characters: {value:?}",
             "Имя браузера для куки содержит управляющие символы: {value:?}"
         ));
     }
     let parts: Vec<&str> = value.split(['+', ':']).collect();
     let head = parts[0].to_lowercase();
     if !COOKIES_BROWSERS.contains(&head.as_str()) {
-        return Err(format!(
-            "Неизвестный браузер для куки: {value:?} (поддерживаются: {}; \
+        return Err(tr_format!("Unknown cookies browser: {value:?} (supported: {}; specify a profile as chrome:Profile 1)", "Неизвестный браузер для куки: {value:?} (поддерживаются: {}; \
              профиль можно указать так: chrome:Profile 1)",
             COOKIES_BROWSERS.join(", ")
         ));
     }
     if parts[1..].iter().any(|p| p.contains("..")) {
-        return Err(format!(
+        return Err(tr_format!(
+            "The cookies profile/container cannot contain “..”: {value:?}",
             "Профиль/контейнер для куки не может содержать «..»: {value:?}"
         ));
     }
@@ -707,7 +744,11 @@ pub fn split_cli_args(s: &str) -> Result<Vec<String>, String> {
     let mut token = false;
     for c in s.chars() {
         if c == '\0' {
-            return Err("дополнительные аргументы содержат NUL".into());
+            return Err(tr!(
+                "extra arguments contain NUL",
+                "дополнительные аргументы содержат NUL"
+            )
+            .into());
         }
         match quote {
             Some(q) if c == q => {
@@ -735,7 +776,11 @@ pub fn split_cli_args(s: &str) -> Result<Vec<String>, String> {
         }
     }
     if quote.is_some() {
-        return Err("незакрытая кавычка в дополнительных аргументах".into());
+        return Err(tr!(
+            "unclosed quote in extra arguments",
+            "незакрытая кавычка в дополнительных аргументах"
+        )
+        .into());
     }
     if token || !cur.is_empty() {
         out.push(cur);
@@ -813,12 +858,17 @@ fn validate_aria2_extras(args: &[String]) -> Result<(), String> {
         let a = &args[i];
         if !aria2_extra_allowed(a) {
             let why = if a.starts_with('-') {
-                format!("доп. аргумент aria2 `{a}` вне разрешённого набора")
+                tr_format!(
+                    "extra aria2 argument `{a}` is not allowed",
+                    "доп. аргумент aria2 `{a}` вне разрешённого набора"
+                )
             } else {
-                format!("голый аргумент `{a}` в extras не разрешён (лишний URL?)")
+                tr_format!(
+                    "a positional argument `{a}` is not allowed in extras (an extra URL?)",
+                    "голый аргумент `{a}` в extras не разрешён (лишний URL?)"
+                )
             };
-            return Err(format!(
-                "{why} — имя, папку, режим докачки, конфиг и входные файлы задаёт сам SNATCH; \
+            return Err(tr_format!("{why} — SNATCH controls filenames, folders, resume mode, config and input files; only limits, proxies, headers, timeouts and retries are allowed", "{why} — имя, папку, режим докачки, конфиг и входные файлы задаёт сам SNATCH; \
                  разрешены только лимиты, прокси, заголовки, таймауты и повторы"
             ));
         }
@@ -829,8 +879,7 @@ fn validate_aria2_extras(args: &[String]) -> Result<(), String> {
         if expects_value {
             i += 1;
             if i >= args.len() {
-                return Err(format!(
-                    "доп. аргумент aria2 `{a}` требует значение (например, `{a}=...` или `{a} ...`)"
+                return Err(tr_format!("extra aria2 argument `{a}` needs a value (e.g. `{a}=...` or `{a} ...`)", "доп. аргумент aria2 `{a}` требует значение (например, `{a}=...` или `{a} ...`)"
                 ));
             }
         }
@@ -997,15 +1046,26 @@ fn lock_aria2_target_in(
     }
     let out = absolute_out_dir(&job.out_dir);
     if is_unc_path(&out) || is_unc_path(state_dir) {
-        return Err("Сетевая UNC-папка не подходит для загрузки или блокировок aria2".into());
+        return Err(tr!(
+            "A network UNC folder cannot be used for downloads or aria2 locks",
+            "Сетевая UNC-папка не подходит для загрузки или блокировок aria2"
+        )
+        .into());
     }
-    std::fs::create_dir_all(&out).map_err(|e| format!("папка загрузки aria2: {e}"))?;
+    std::fs::create_dir_all(&out)
+        .map_err(|e| tr_format!("aria2 download folder: {e}", "папка загрузки aria2: {e}"))?;
     if canonical_is_unc(
-        &std::fs::canonicalize(&out).map_err(|e| format!("папка загрузки aria2: {e}"))?,
+        &std::fs::canonicalize(&out)
+            .map_err(|e| tr_format!("aria2 download folder: {e}", "папка загрузки aria2: {e}"))?,
     ) {
-        return Err("Папка загрузки aria2 ведёт на сетевой UNC-путь".into());
+        return Err(tr!(
+            "The aria2 download folder resolves to a network UNC path",
+            "Папка загрузки aria2 ведёт на сетевой UNC-путь"
+        )
+        .into());
     }
-    std::fs::create_dir_all(state_dir).map_err(|e| format!("папка блокировок aria2: {e}"))?;
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| tr_format!("aria2 lock folder: {e}", "папка блокировок aria2: {e}"))?;
     let key = aria2_target_key(&out, &name);
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -1013,18 +1073,21 @@ fn lock_aria2_target_in(
         .write(true)
         .truncate(false)
         .open(state_dir.join(format!("{key}.lock")))
-        .map_err(|e| format!("блокировка aria2: {e}"))?;
+        .map_err(|e| tr_format!("aria2 lock: {e}", "блокировка aria2: {e}"))?;
     if wait {
-        FileExt::lock(&lock).map_err(|e| format!("блокировка aria2: {e}"))?;
+        FileExt::lock(&lock).map_err(|e| tr_format!("aria2 lock: {e}", "блокировка aria2: {e}"))?;
     } else {
         match FileExt::try_lock(&lock) {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                return Err(format!(
+                return Err(tr_format!(
+                    "“{name}” is already downloading to this folder — retry when it finishes",
                     "Файл «{name}» уже скачивается в эту папку — повторите после завершения"
                 ))
             }
-            Err(TryLockError::Error(e)) => return Err(format!("блокировка aria2: {e}")),
+            Err(TryLockError::Error(e)) => {
+                return Err(tr_format!("aria2 lock: {e}", "блокировка aria2: {e}"))
+            }
         }
     }
     // Claim only an empty slot. Never certify an existing file or .aria2 as
@@ -1034,7 +1097,7 @@ fn lock_aria2_target_in(
             aria2_origin_path(&out, &name, state_dir),
             aria2_url_hash(&job.url),
         )
-        .map_err(|e| format!("метка докачки aria2: {e}"))?;
+        .map_err(|e| tr_format!("aria2 resume marker: {e}", "метка докачки aria2: {e}"))?;
     }
     Ok(Some(lock))
 }
@@ -1063,7 +1126,11 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
     // Нативные движки не строят внешнюю команду; без этого guard'а они молча
     // ушли бы по yt-dlp-ветке (else ниже) и получили бы чужие флаги.
     if job.engine != "yt-dlp" && job.engine != "aria2" {
-        return Err(format!("Неизвестный движок: {:?}", job.engine));
+        return Err(tr_format!(
+            "Unknown engine: {:?}",
+            "Неизвестный движок: {:?}",
+            job.engine
+        ));
     }
     if job.engine == "yt-dlp" {
         if let Some(cb) = &job.cookies_browser {
@@ -1077,15 +1144,19 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
     // *successful* one would silently write the user's downloads to a
     // stranger's share (poisoned config/history or a pasted path).
     if is_unc_path(&out) {
-        return Err(format!(
-            "Папка сохранения {} — сетевой UNC-путь. Выберите локальную папку \
+        return Err(tr_format!("Download folder {} is a network UNC path. Choose a local folder (UNC paths are rejected to avoid sending Windows credentials to a remote server).", "Папка сохранения {} — сетевой UNC-путь. Выберите локальную папку \
              (UNC отклоняется, чтобы Windows не отправляла учётные данные на \
              чужой сервер).",
             out.display()
         ));
     }
-    std::fs::create_dir_all(&out)
-        .map_err(|e| format!("Не удалось создать папку {}: {e}", out.display()))?;
+    std::fs::create_dir_all(&out).map_err(|e| {
+        tr_format!(
+            "Could not create folder {}: {e}",
+            "Не удалось создать папку {}: {e}",
+            out.display()
+        )
+    })?;
 
     let mut cmd: Vec<OsString> = Vec::new();
     if job.engine == "aria2" {
@@ -1109,8 +1180,7 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
         // aria2 even without -c, silently mixing two sources' bytes. Our own
         // partials carry an origin fingerprint; anything else must stop here.
         if let Some(name) = aria2_foreign_pair(&job.url, &out) {
-            return Err(format!(
-                "«{name}» и его файл докачки .aria2 оставлены прерванной загрузкой другого URL — \
+            return Err(tr_format!("“{name}” and its .aria2 control file belong to an interrupted download from another URL. aria2 would resume someone else's file. Inspect and remove them (or choose another folder), then retry.", "«{name}» и его файл докачки .aria2 оставлены прерванной загрузкой другого URL — \
                  aria2 продолжил бы чужой файл. Проверьте и удалите их (или выберите другую \
                  папку), после чего повторите."
             ));
@@ -1173,8 +1243,7 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
             // F1: aria2 auto-continues a same-name foreign partial even
             // without -c; refuse instead of mixing two sources' bytes.
             if let Some(name) = aria2_foreign_pair(&job.url, &out) {
-                return Err(format!(
-                    "«{name}» и его файл докачки .aria2 оставлены прерванной загрузкой другого \
+                return Err(tr_format!("“{name}” and its .aria2 control file belong to an interrupted download from another URL. The external aria2 downloader would resume someone else's file. Inspect and remove them (or choose another folder), then retry.", "«{name}» и его файл докачки .aria2 оставлены прерванной загрузкой другого \
                      URL — внешний загрузчик aria2 продолжил бы чужой файл. Проверьте и удалите \
                      их (или выберите другую папку), после чего повторите."
                 ));
@@ -1239,7 +1308,7 @@ pub fn build_for_run_with(
             // content by hash, so aria2 can simply fetch it again; an http(s)
             // .torrent may have changed since, and the picked indices would
             // then select different files.
-            return Err("файлы выбирались по .torrent, которого больше нет — добавьте ссылку и выберите файлы заново".into());
+            return Err(tr!("the .torrent used for file selection no longer exists — add the link and select files again", "файлы выбирались по .torrent, которого больше нет — добавьте ссылку и выберите файлы заново").into());
         }
     }
     if let Some(sel) = &choice.files {
@@ -1300,30 +1369,41 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool, has_js: bool) -> V
     if job.engine != "yt-dlp" {
         if job.cookies_browser.is_some() {
             warns.push(
-                "Куки из браузера применимы только к yt-dlp — для этого движка они проигнорированы."
+                tr!("Browser cookies only apply to yt-dlp — ignored for this engine.", "Куки из браузера применимы только к yt-dlp — для этого движка они проигнорированы.")
                     .to_string(),
             );
         }
         if job.fmt != "best" {
-            warns
-                .push("Формат применим только к yt-dlp — для aria2 он проигнорирован.".to_string());
+            warns.push(
+                tr!(
+                    "Format only applies to yt-dlp — ignored for aria2.",
+                    "Формат применим только к yt-dlp — для aria2 он проигнорирован."
+                )
+                .to_string(),
+            );
         }
     } else {
         if !has_ffmpeg {
             if job.fmt == "audio" {
-                warns.push("Не найден ffmpeg — извлечение mp3 может не сработать.".to_string());
+                warns.push(
+                    tr!(
+                        "ffmpeg not found — mp3 extraction may fail.",
+                        "Не найден ffmpeg — извлечение mp3 может не сработать."
+                    )
+                    .to_string(),
+                );
             } else {
                 warns.push(
-                    "Не найден ffmpeg — склейка видео и аудио недоступна, yt-dlp выберет \
-                      однодорожный формат (качество может быть ниже)."
+                    tr!("ffmpeg not found — video/audio merging is unavailable. yt-dlp will choose a single-track format (quality may be lower).", "Не найден ffmpeg — склейка видео и аудио недоступна, yt-dlp выберет \
+                      однодорожный формат (качество может быть ниже).")
                         .to_string(),
                 );
             }
         }
         if !has_js {
             warns.push(
-                "Не найден JS-рантайм (Deno) — на YouTube часть форматов может быть \
-                  недоступна. Установите загрузчики кнопкой в GUI или `snatch --install-tools`."
+                tr!("JavaScript runtime (Deno) not found — some YouTube formats may be unavailable. Install tools from the GUI or with `snatch --install-tools`.", "Не найден JS-рантайм (Deno) — на YouTube часть форматов может быть \
+                  недоступна. Установите загрузчики кнопкой в GUI или `snatch --install-tools`.")
                     .to_string(),
             );
         }
@@ -1332,20 +1412,25 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool, has_js: bool) -> V
     // file+control pair stops the job (aria2 would auto-continue it).
     let out = absolute_out_dir(&job.out_dir);
     if is_unc_path(&out) {
-        warns.push("Сетевая UNC-папка не поддерживается — выберите локальную папку.".into());
+        warns.push(
+            tr!(
+                "Network UNC folders are not supported — choose a local folder.",
+                "Сетевая UNC-папка не поддерживается — выберите локальную папку."
+            )
+            .into(),
+        );
         return warns;
     }
     if job.engine == "aria2" || (job.engine == "yt-dlp" && is_direct_download(&job.url)) {
         if let Some(name) = aria2_foreign_pair(&job.url, &out) {
-            warns.push(format!(
-                "В папке есть «{name}» с данными докачки от другой загрузки — загрузка будет \
+            warns.push(tr_format!("“{name}” has resume data from another download — downloading will be stopped so aria2 cannot resume someone else's file. Inspect and remove them (or choose another folder).", "В папке есть «{name}» с данными докачки от другой загрузки — загрузка будет \
                  остановлена, чтобы aria2 не продолжил чужой файл. Проверьте и удалите их \
                  (или выберите другую папку)."
             ));
         } else if aria2_foreign_target(&job.url, &out) {
             warns.push(
-                "В папке уже есть файл с таким же именем, но без данных докачки — он не будет \
-                 перезаписан: новая загрузка сохранится рядом под другим именем."
+                tr!("A file with the same name already exists without resume data — it will not be overwritten. The new download will use a different filename.", "В папке уже есть файл с таким же именем, но без данных докачки — он не будет \
+                 перезаписан: новая загрузка сохранится рядом под другим именем.")
                     .to_string(),
             );
         }
@@ -1383,7 +1468,10 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
     let (mut child, proc_job) = match crate::job_object::spawn(&mut command, false) {
         Ok(result) => result,
         Err(e) => {
-            crate::errln(format!("✘ Защита дерева загрузчика: {e}"));
+            crate::errln(tr_format!(
+                "✘ Downloader process tree protection: {e}",
+                "✘ Защита дерева загрузчика: {e}"
+            ));
             return RunResult {
                 code: 127,
                 auth_hint: false,
@@ -1428,13 +1516,20 @@ pub fn run(cmd: &[OsString], capture_stderr: bool) -> RunResult {
     }
     match stdout_thread.join() {
         Ok(Ok(())) => {}
-        Ok(Err(e)) => crate::errln(format!("⚠ Не удалось передать вывод загрузчика: {e}")),
-        Err(_) => crate::errln("⚠ Поток stdout загрузчика завершился с паникой"),
+        Ok(Err(e)) => crate::errln(tr_format!(
+            "⚠ Could not forward downloader output: {e}",
+            "⚠ Не удалось передать вывод загрузчика: {e}"
+        )),
+        Err(_) => crate::errln(tr!(
+            "⚠ Downloader stdout thread panicked",
+            "⚠ Поток stdout загрузчика завершился с паникой"
+        )),
     }
     let auth_hint = stderr_thread.join().unwrap_or_else(|_| {
-        crate::errln(
-            "⚠ Поток stderr загрузчика завершился с паникой; подсказка авторизации недоступна",
-        );
+        crate::errln(tr!(
+            "⚠ Downloader stderr thread panicked; sign-in hints are unavailable",
+            "⚠ Поток stderr загрузчика завершился с паникой; подсказка авторизации недоступна"
+        ));
         false
     });
     RunResult { code, auth_hint }
@@ -1706,7 +1801,7 @@ mod tests {
         assert_eq!(std::fs::read(out.join("file.bin")).unwrap(), b"old data");
         assert!(preflight_warning(&job)
             .iter()
-            .any(|w| w.contains("не будет перезаписан")));
+            .any(|w| w.contains("will not be overwritten")));
 
         // A stray .aria2 is not proof of ownership: it could be another URL's.
         // aria2 auto-continues such a file+control pair EVEN WITHOUT -c
@@ -1714,10 +1809,10 @@ mod tests {
         // bytes mix - for the aria2 engine and the external-downloader branch.
         std::fs::write(out.join("file.bin.aria2"), b"ctl").unwrap();
         let err = build(&job, &tc_aria2()).unwrap_err();
-        assert!(err.contains("докачки"), "{err}");
+        assert!(err.contains("control file"), "{err}");
         assert!(preflight_warning(&job)
             .iter()
-            .any(|w| w.contains("будет остановлена")));
+            .any(|w| w.contains("will be stopped")));
         let as_ytdlp = Job {
             engine: "yt-dlp".into(),
             ..job.clone()
@@ -1755,7 +1850,7 @@ mod tests {
         );
         assert!(!preflight_warning(&job)
             .iter()
-            .any(|w| w.contains("не будет перезаписан")));
+            .any(|w| w.contains("will not be overwritten")));
         std::fs::remove_dir_all(&out).ok();
     }
 
@@ -1795,7 +1890,7 @@ mod tests {
         assert!(build(&job, &tc_aria2()).is_err());
         assert!(preflight_warning(&job)
             .iter()
-            .any(|w| w.contains("будет остановлена")));
+            .any(|w| w.contains("will be stopped")));
         std::fs::remove_file(out.join(format!("{name}.aria2"))).unwrap();
 
         // Without the pair the download may start, but -o must pin the
@@ -2090,7 +2185,7 @@ mod tests {
 
     #[test]
     fn formats_cover_caps_and_source_audio() {
-        let keys: Vec<&str> = FORMATS.iter().map(|(k, _)| *k).collect();
+        let keys: Vec<&str> = formats().iter().map(|(k, _)| *k).collect();
         for k in [
             "best",
             "2160p",
@@ -2223,7 +2318,7 @@ mod tests {
             ..RunExtras::default()
         };
         let err = build_with(&job, &tc_aria2(), &extras).unwrap_err();
-        assert!(err.contains("значение"), "{err}");
+        assert!(err.contains("value"), "{err}");
         std::fs::remove_dir_all(&out).ok();
     }
 
@@ -2390,7 +2485,7 @@ mod tests {
         };
         assert!(preflight_warning_with_ffmpeg(&job, false, true)
             .iter()
-            .any(|w| w.contains("склейка")));
+            .any(|w| w.contains("merging")));
         assert!(preflight_warning_with_ffmpeg(&job, true, true).is_empty());
         assert!(preflight_warning_with_ffmpeg(&job, true, false)
             .iter()
@@ -2472,12 +2567,12 @@ mod tests {
             "[#bc1f6e 0B/6.8GiB(0%) CN:0 SD:0 DL:0B] [FileAlloc:#bc1f6e 1.1GiB/3.3GiB(33%)]";
         assert_eq!(
             aria2_stat(allocating).as_deref(),
-            Some("0% · 0B/6.8GiB · выделение места 1.1GiB/3.3GiB (33%)")
+            Some("0% · 0B/6.8GiB · allocating space 1.1GiB/3.3GiB (33%)")
         );
         let downloading = "[#25017a 361MiB/6.8GiB(5%) CN:30 SD:5 DL:4.1MiB ETA:26m46s]";
         assert_eq!(
             aria2_stat(downloading).as_deref(),
-            Some("5% · 361MiB/6.8GiB · ↓4.1MiB/с · сиды 5 · соединения 30")
+            Some("5% · 361MiB/6.8GiB · ↓4.1MiB/s · seeds 5 · connections 30")
         );
         assert_eq!(
             aria2_name_from_file("FILE: C:/Downloads/Cuphead_1.3.9/setup.bin (7more)").as_deref(),

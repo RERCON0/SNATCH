@@ -14,6 +14,7 @@
 //! `--enable-rpc`, which turns aria2 into a daemon that does not exit after
 //! the download.
 
+use crate::{tr, tr_format};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -38,7 +39,7 @@ const MAX_LISTED_FILES: usize = 50_000;
 // can otherwise expand into millions of nodes despite the input byte cap.
 const MAX_TREE_COMPONENTS: usize = 256_000;
 
-const CANCELLED: &str = "получение списка файлов отменено";
+const CANCELLED: &str = "file listing canceled";
 
 /// Deepest folder level the tree shows; anything below is folded into one
 /// "a/b/c" name. Every tree walk (build, counts, rows, drop) recurses per
@@ -136,7 +137,8 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
         .map(str::trim)
         .find(|l| l.starts_with("Exception:"))
     {
-        return Err(format!(
+        return Err(tr_format!(
+            "aria2 could not read the torrent: {}",
             "aria2 не смог прочитать торрент: {}",
             crate::ui::clip(line, 160)
         ));
@@ -186,7 +188,11 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
             }
             if let Ok(index) = idx.parse::<usize>() {
                 if files.len() >= MAX_LISTED_FILES {
-                    return Err("слишком много файлов для списка — скачайте торрент целиком".into());
+                    return Err(tr!(
+                        "too many files to list — download the entire torrent",
+                        "слишком много файлов для списка — скачайте торрент целиком"
+                    )
+                    .into());
                 }
                 let clean = path.strip_prefix("./").unwrap_or(path);
                 components += clean
@@ -195,10 +201,11 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
                     .count()
                     .min(MAX_TREE_DEPTH);
                 if components > MAX_TREE_COMPONENTS {
-                    return Err(
+                    return Err(tr!(
+                        "file tree is too complex to list — download the entire torrent",
                         "слишком сложное дерево файлов для списка — скачайте торрент целиком"
-                            .into(),
-                    );
+                    )
+                    .into());
                 }
                 // Drop the leading "<name>/" that aria2 adds to every path.
                 let clean = clean.strip_prefix(&format!("{name}/")).unwrap_or(clean);
@@ -211,17 +218,28 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
         }
     }
     if files.is_empty() {
-        return Err("aria2 не вернул список файлов (не удалось получить метаданные?)".into());
+        return Err(tr!(
+            "aria2 returned no file list (could not fetch metadata?)",
+            "aria2 не вернул список файлов (не удалось получить метаданные?)"
+        )
+        .into());
     }
     for (n, file) in files.iter().enumerate() {
         if file.index != n + 1 {
-            return Err("подозрительный список файлов (непоследовательные индексы)".into());
+            return Err(tr!(
+                "suspicious file list (non-sequential indices)",
+                "подозрительный список файлов (непоследовательные индексы)"
+            )
+            .into());
         }
     }
     let summed = files
         .iter()
         .try_fold(0u64, |sum, file| sum.checked_add(file.size))
-        .ok_or("размеры в списке файлов переполняют u64")?;
+        .ok_or(tr!(
+            "file list sizes overflow u64",
+            "размеры в списке файлов переполняют u64"
+        ))?;
     if total == 0 {
         total = summed;
     }
@@ -304,10 +322,14 @@ impl TempDir {
             match builder.create(&dir) {
                 Ok(()) => return Ok(TempDir(dir)),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(e) => return Err(format!("временная папка: {e}")),
+                Err(e) => return Err(tr_format!("temporary folder: {e}", "временная папка: {e}")),
             }
         }
-        Err("временная папка: не удалось подобрать свободное имя".into())
+        Err(tr!(
+            "temporary folder: could not find an unused name",
+            "временная папка: не удалось подобрать свободное имя"
+        )
+        .into())
     }
 
     fn path(&self) -> &Path {
@@ -379,7 +401,12 @@ fn spawn_hidden(mut command: Command) -> Result<(Child, Option<job_object::Job>)
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    job_object::spawn(&mut command, true).map_err(|e| format!("запуск/защита дерева aria2c: {e}"))
+    job_object::spawn(&mut command, true).map_err(|e| {
+        tr_format!(
+            "aria2c startup/process tree protection: {e}",
+            "запуск/защита дерева aria2c: {e}"
+        )
+    })
 }
 
 enum Waited {
@@ -416,7 +443,13 @@ fn wait_child(
         }
         if pipe_failed.is_some_and(|failed| failed.load(Ordering::Acquire)) {
             reap(child);
-            return Waited::Failed("ошибка чтения списка файлов aria2c".into());
+            return Waited::Failed(
+                tr!(
+                    "could not read aria2c file list",
+                    "ошибка чтения списка файлов aria2c"
+                )
+                .into(),
+            );
         }
         if start.elapsed() > timeout {
             reap(child);
@@ -443,9 +476,11 @@ fn resolve(
     // Before is_file(): even probing \\host\share performs SMB auth against
     // that host (NetNTLMv2 leak) - same rule as engines::build.
     if crate::engines::is_unc_path(path) {
-        return Err(
-            "сетевой UNC-путь не поддерживается — скопируйте .torrent на этот компьютер".into(),
-        );
+        return Err(tr!(
+            "network UNC paths are not supported — copy the .torrent to this computer",
+            "сетевой UNC-путь не поддерживается — скопируйте .torrent на этот компьютер"
+        )
+        .into());
     }
     if path.is_file() {
         return Ok(Source::Local(path.to_path_buf()));
@@ -457,7 +492,11 @@ fn resolve(
     if lower.starts_with("http://") || lower.starts_with("https://") {
         return fetch_http(input, cancel).map(Source::Fetched);
     }
-    Err("этот торрент-вход нельзя разобрать заранее".into())
+    Err(tr!(
+        "this torrent input cannot be inspected in advance",
+        "этот торрент-вход нельзя разобрать заранее"
+    )
+    .into())
 }
 
 /// Metadata-only aria2 run: fetches just the .torrent from the swarm into a
@@ -486,14 +525,25 @@ fn fetch_magnet(
     let (mut child, _job) = spawn_hidden(command)?;
     match wait_child(&mut child, timeout, cancel, None) {
         Waited::Exited => {}
-        Waited::TimedOut => return Err("не удалось получить метаданные торрента (таймаут)".into()),
+        Waited::TimedOut => {
+            return Err(tr!(
+                "could not fetch torrent metadata (timeout)",
+                "не удалось получить метаданные торрента (таймаут)"
+            )
+            .into())
+        }
         Waited::Cancelled => return Err(CANCELLED.into()),
         Waited::Failed(e) => return Err(e),
     }
     // The dir is private and fresh, so the only .torrent in it is ours
     // ("<infohash>.torrent").
-    let path = find_torrent(dir.path())
-        .ok_or_else(|| "не удалось получить метаданные торрента из роя".to_string())?;
+    let path = find_torrent(dir.path()).ok_or_else(|| {
+        tr!(
+            "could not fetch torrent metadata from the swarm",
+            "не удалось получить метаданные торрента из роя"
+        )
+        .to_string()
+    })?;
     Ok(Meta(Arc::new(FetchedTorrent { path, _dir: dir })))
 }
 
@@ -526,11 +576,16 @@ fn fetch_http(url: &str, cancel: &AtomicBool) -> Result<Meta, String> {
             }
         })?;
     if !bytes.starts_with(b"d") {
-        return Err("по ссылке не торрент-файл".into());
+        return Err(tr!(
+            "this link is not a torrent file",
+            "по ссылке не торрент-файл"
+        )
+        .into());
     }
     let dir = TempDir::new()?;
     let path = dir.path().join("remote.torrent");
-    std::fs::write(&path, &bytes).map_err(|e| format!("временная папка: {e}"))?;
+    std::fs::write(&path, &bytes)
+        .map_err(|e| tr_format!("temporary folder: {e}", "временная папка: {e}"))?;
     Ok(Meta(Arc::new(FetchedTorrent { path, _dir: dir })))
 }
 
@@ -565,7 +620,11 @@ pub fn show_files(
         return Err(CANCELLED.into());
     }
     if std::fs::metadata(local).map_err(|e| e.to_string())?.len() > MAX_TORRENT_BYTES {
-        return Err("слишком большой торрент для списка — скачайте его целиком".into());
+        return Err(tr!(
+            "torrent is too large to list — download it in full",
+            "слишком большой торрент для списка — скачайте его целиком"
+        )
+        .into());
     }
     let mut command = Command::new(aria2c);
     command
@@ -641,15 +700,29 @@ fn collect_listing(
     if let Some(job) = &proc_job {
         job.terminate();
     }
-    let stdout = out_thread
-        .join()
-        .unwrap_or_else(|_| Err("поток списка файлов завершился с ошибкой".into()));
-    let stderr = err_thread
-        .join()
-        .unwrap_or_else(|_| Err("поток диагностики завершился с ошибкой".into()));
+    let stdout = out_thread.join().unwrap_or_else(|_| {
+        Err(tr!(
+            "file list thread failed",
+            "поток списка файлов завершился с ошибкой"
+        )
+        .into())
+    });
+    let stderr = err_thread.join().unwrap_or_else(|_| {
+        Err(tr!(
+            "diagnostic thread failed",
+            "поток диагностики завершился с ошибкой"
+        )
+        .into())
+    });
     match waited {
         Waited::Exited => {}
-        Waited::TimedOut => return Err("aria2c не выдал список файлов (таймаут)".into()),
+        Waited::TimedOut => {
+            return Err(tr!(
+                "aria2c returned no file list (timeout)",
+                "aria2c не выдал список файлов (таймаут)"
+            )
+            .into())
+        }
         Waited::Cancelled => return Err(CANCELLED.into()),
         Waited::Failed(e) => return Err(stdout.err().or_else(|| stderr.err()).unwrap_or(e)),
     }
@@ -663,9 +736,13 @@ fn read_listing(reader: impl Read, max: u64) -> Result<Vec<u8>, String> {
     reader
         .take(max + 1)
         .read_to_end(&mut bytes)
-        .map_err(|e| format!("чтение списка: {e}"))?;
+        .map_err(|e| tr_format!("reading file list: {e}", "чтение списка: {e}"))?;
     if bytes.len() as u64 > max {
-        return Err("слишком большой список файлов торрента — скачайте всё".into());
+        return Err(tr!(
+            "torrent file list is too large — download everything",
+            "слишком большой список файлов торрента — скачайте всё"
+        )
+        .into());
     }
     Ok(bytes)
 }
@@ -937,10 +1014,11 @@ pub fn select_spec(indices: &[usize]) -> Result<Option<String>, String> {
         return Ok(None);
     }
     if spec.len() > MAX_SELECT_SPEC_LEN {
-        return Err(
+        return Err(tr!(
+            "too many separate files selected — select entire folders or download everything",
             "слишком много разрозненных файлов в выборе — отметьте папки целиком или скачайте всё"
-                .into(),
-        );
+        )
+        .into());
     }
     Ok(Some(spec))
 }
@@ -976,7 +1054,7 @@ mod tests {
         let output = "Name: huge\nFiles:\nidx|path/length\n  1|./huge/a\n   |x (18446744073709551615)\n  2|./huge/b\n   |1B (1)\n";
         assert!(parse_show_files(output)
             .unwrap_err()
-            .contains("переполняют"));
+            .contains(tr!("overflow", "переполняют")));
     }
 
     #[test]
@@ -1041,7 +1119,7 @@ mod tests {
             )
             .unwrap_err();
             assert!(
-                error.contains("слишком большой список"),
+                error.contains(tr!("file list is too large", "слишком большой список")),
                 "{stream}: {error}"
             );
             assert!(
@@ -1078,7 +1156,7 @@ mod tests {
         }
         assert!(parse_show_files(&text)
             .unwrap_err()
-            .contains("слишком много"));
+            .contains(tr!("too many", "слишком много")));
     }
 
     #[test]
@@ -1311,7 +1389,10 @@ idx|path/length
             ..job
         };
         let err = crate::engines::build_for_run(&http, &tc, &choice).unwrap_err();
-        assert!(err.contains("выберите файлы заново"), "{err}");
+        assert!(
+            err.contains(tr!("select files again", "выберите файлы заново")),
+            "{err}"
+        );
         let all = Choice {
             files: None,
             ..choice
@@ -1328,7 +1409,10 @@ idx|path/length
         // can itself be shaped like a listing.
         let out = "Exception: [x.cc:1] errorCode=26 bad path ./evil\nidx|path/length\n===+===\n  1|./small.txt\n   |1B (1)\n";
         let err = parse_show_files(out).unwrap_err();
-        assert!(err.contains("не смог прочитать"), "{err}");
+        assert!(
+            err.contains(tr!("could not read", "не смог прочитать")),
+            "{err}"
+        );
     }
 
     #[test]

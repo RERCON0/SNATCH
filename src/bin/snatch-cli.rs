@@ -3,6 +3,8 @@
 //! `snatch_rs` lib the GUI uses. The old Python-era `down` alias is gone:
 //! it pointed at the exact same entry point and only doubled build/test time.
 
+use snatch_rs::i18n::{self, Language};
+use snatch_rs::{tr, tr_format, tr_write};
 use std::collections::VecDeque;
 use std::fmt;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
@@ -12,14 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use inquire::{Confirm, Select, Text};
 
 use snatch_rs::config::Config;
 use snatch_rs::engines::{
-    self, batch_name, detect_engine, is_unc_path, preflight_warning, validate_cookies_browser,
-    validate_url, Job, RunResult, COOKIES_BROWSERS, ENGINE_LABELS, FORMATS,
+    self, batch_name, detect_engine, engine_labels, formats, is_unc_path, preflight_warning,
+    validate_cookies_browser, validate_url, Job, RunResult, COOKIES_BROWSERS,
 };
 #[cfg(windows)]
 use snatch_rs::setup::{install_aria2, install_deno, install_ffmpeg, install_yt_dlp};
@@ -37,69 +39,84 @@ const MAX_BROWSE_ENTRIES: usize = 100;
 // select, type to filter") with no way to localize it globally - it's a
 // per-prompt-type default text, not something RenderConfig covers - so every
 // Select::new(...) below adds this explicitly.
-const SELECT_HELP: &str = "↑↓ — выбор, Enter — подтвердить, начните печатать — фильтр";
+fn select_help() -> &'static str {
+    tr!(
+        "↑↓ to select, Enter to confirm, type to filter",
+        "↑↓ — выбор, Enter — подтвердить, начните печатать — фильтр"
+    )
+}
 // ask_link's list has no free-text item to filter toward (typing a URL just
 // filters everything out, so Enter has nothing to submit and looks dead -
 // this is the "нажимаю Enter, ноль эмоций" bug); its own help text drops the
 // filter hint to match `.without_filtering()` below.
-const SELECT_HELP_PLAIN: &str = "↑↓ — выбор, Enter — подтвердить";
+fn select_help_plain() -> &'static str {
+    tr!(
+        "↑↓ to select, Enter to confirm",
+        "↑↓ — выбор, Enter — подтвердить"
+    )
+}
 const RETRY_CODE: i32 = 1;
 
 #[derive(Parser)]
 #[command(
     name = "snatch",
+    disable_help_flag = true,
+    disable_version_flag = true,
     version = APP_VERSION,
-    about = "SNATCH — мини-комбайн для скачивания: yt-dlp + aria2c в одном CLI."
+    about = tr!("SNATCH — a lightweight downloader: yt-dlp + aria2c in one CLI.", "SNATCH — лёгкий загрузчик: yt-dlp + aria2c в одном CLI.")
 )]
 struct Args {
-    /// Ссылки; несколько ссылок скачиваются параллельно
+    #[arg(long, value_name = "en|ru", value_parser = Language::parse,
+            help = tr!("Set and remember the interface language", "Выбрать и сохранить язык интерфейса"))]
+    lang: Option<Language>,
+    #[arg(short = 'h', long, help = tr!("Print help", "Показать справку"))]
+    help: bool,
+    #[arg(short = 'V', long, help = tr!("Print version", "Показать версию"))]
+    version: bool,
     #[arg(value_name = "URL")]
+    #[arg(help = tr!("Links; multiple links are downloaded concurrently", "Ссылки; несколько ссылок скачиваются параллельно"))]
     urls: Vec<String>,
-    /// Папка сохранения (без вопросов)
     #[arg(short = 'o', long)]
+    #[arg(help = tr!("Download folder", "Папка сохранения (без вопросов)"))]
     output: Option<String>,
-    /// Движок (по умолчанию — авто-подсказка)
     #[arg(short = 'e', long, value_parser = ["yt-dlp", "aria2"])]
+    #[arg(help = tr!("Downloader (default: automatic)", "Движок (по умолчанию — авто-подсказка)"))]
     engine: Option<String>,
-    /// Формат для yt-dlp
-    #[arg(short = 'f', long, value_parser = ["best", "1080p", "audio"])]
+    #[arg(short = 'f', long, value_parser = ["best", "2160p", "1440p", "1080p", "720p", "480p", "audio", "audio-src"])]
+    #[arg(help = tr!("yt-dlp format", "Формат для yt-dlp"))]
     format: Option<String>,
-    /// Пропустить все вопросы (нужны url и output)
     #[arg(short = 'y', long)]
+    #[arg(help = tr!("Skip prompts (requires a URL and --output)", "Пропустить все вопросы (нужны url и output)"))]
     yes: bool,
-    /// Одновременных загрузок при нескольких ссылках (1–16)
     #[arg(short = 'j', long, default_value_t = 3, value_parser = clap::value_parser!(u8).range(1..=16))]
+    #[arg(help = tr!("Concurrent downloads for multiple links (1–16)", "Одновременных загрузок при нескольких ссылках (1–16)"))]
     jobs: u8,
-    /// Откуда взять куки (chrome, firefox, edge, brave, opera, vivaldi, safari,
-    /// chromium, whale) — для "Sign in to confirm you're not a bot" и
-    /// возрастных ограничений
     #[arg(long = "cookies-from-browser", value_name = "BROWSER")]
+    #[arg(help = tr!("Use a browser session (e.g. chrome or firefox; profile: chrome:Profile 1)", "Откуда взять куки (chrome, firefox, edge, brave, opera, vivaldi, safari, chromium, whale) — для \"Sign in to confirm you're not a bot\" и возрастных ограничений"))]
     cookies_browser: Option<String>,
-    /// Забыть последние ссылки и папки
     #[arg(long)]
+    #[arg(help = tr!("Clear recent links and folders", "Забыть последние ссылки и папки"))]
     clear_history: bool,
-    /// Установить загрузчики и помощники (yt-dlp, aria2c, ffmpeg, Deno)
-    /// в собственную папку SNATCH (Windows)
     #[arg(long)]
+    #[arg(help = tr!("Install yt-dlp, aria2c, ffmpeg and Deno in the SNATCH tools folder (Windows)", "Установить загрузчики и помощники (yt-dlp, aria2c, ffmpeg, Deno) в собственную папку SNATCH (Windows)"))]
     install_tools: bool,
-    /// Не докачивать прерванное, начать файл с начала — лечит протухший .part
-    /// («Invalid data» при склейке). В GUI такой повтор происходит автоматически.
     #[arg(long)]
+    #[arg(help = tr!("Restart an interrupted download from scratch instead of resuming", "Не докачивать прерванное, начать файл с начала — лечит протухший .part («Invalid data» при склейке). В GUI такой повтор происходит автоматически."))]
     no_continue: bool,
-    /// Скачивать субтитры рядом с видео (yt-dlp)
     #[arg(long)]
+    #[arg(help = tr!("Download subtitles alongside the video (yt-dlp)", "Скачивать субтитры рядом с видео (yt-dlp)"))]
     subs: bool,
-    /// Языки субтитров, например ru,en (по умолчанию ru,en)
     #[arg(long, value_name = "LANGS")]
+    #[arg(help = tr!("Subtitle languages (default: ru,en)", "Языки субтитров, например ru,en (по умолчанию ru,en)"))]
     sub_langs: Option<String>,
-    /// Скачивать плейлист целиком (по умолчанию — только одиночное видео)
     #[arg(long)]
+    #[arg(help = tr!("Download the entire playlist (default: single video)", "Скачивать плейлист целиком (по умолчанию — только одиночное видео)"))]
     playlist: bool,
-    /// Дополнительные аргументы yt-dlp, как в командной строке
     #[arg(long, value_name = "ARGS")]
+    #[arg(help = tr!("Extra yt-dlp command-line arguments", "Дополнительные аргументы yt-dlp, как в командной строке"))]
     yt_dlp_args: Option<String>,
-    /// Дополнительные аргументы aria2c
     #[arg(long, value_name = "ARGS")]
+    #[arg(help = tr!("Extra aria2c arguments (safe options only)", "Дополнительные аргументы aria2c"))]
     aria2_args: Option<String>,
 }
 
@@ -139,7 +156,10 @@ fn extras_from_args(args: &Args) -> Result<engines::RunExtras, String> {
 
 fn plan_from_args(args: &Args) -> Option<Plan> {
     let (Some(url), Some(output)) = (args.urls.first(), args.output.as_ref()) else {
-        errln("Для режима -y нужны хотя бы одна ссылка и --output.");
+        errln(tr!(
+            "The -y mode requires at least one URL and --output.",
+            "Для режима -y нужны хотя бы одна ссылка и --output."
+        ));
         return None;
     };
     let engine = args
@@ -305,9 +325,10 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     let Ok(url) = validate_url(&plan.url) else {
         return Use(torrent::Choice::default());
     };
-    outln(
-        "⌛ получаю список файлов торрента (для magnet это может занять минуту; Ctrl+C — отмена)…",
-    );
+    outln(tr!(
+        "⌛ fetching torrent file list (magnets may take a minute; Ctrl+C to cancel)…",
+        "⌛ получаю список файлов торрента (для magnet это может занять минуту; Ctrl+C — отмена)…"
+    ));
     let _interrupt = picker_console::InterruptGuard::new();
     let listing = match torrent::show_files(
         aria2c,
@@ -322,10 +343,16 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
             errln(format!("⚠ {e}"));
             // Ask instead of silently switching to the whole torrent. "Нет"
             // drops only this link; Esc still cancels the whole flow.
-            return match Confirm::new("Список файлов недоступен. Скачать торрент целиком?")
-                .with_default(true)
-                .with_help_message("«нет» — пропустить эту ссылку")
-                .prompt()
+            return match Confirm::new(tr!(
+                "File list is unavailable. Download the entire torrent?",
+                "Список файлов недоступен. Скачать торрент целиком?"
+            ))
+            .with_default(true)
+            .with_help_message(tr!(
+                "answer “no” to skip this link",
+                "«нет» — пропустить эту ссылку"
+            ))
+            .prompt()
             {
                 Ok(true) => Use(torrent::Choice::default()),
                 Ok(false) => Skip,
@@ -344,7 +371,8 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     if info.files.len() <= 1 {
         return Use(all);
     }
-    outln(format!(
+    outln(tr_format!(
+        "Torrent “{}”: {} files, {} total",
         "Торрент «{}»: файлов {}, всего {}",
         clip(&info.name, 50),
         info.files.len(),
@@ -353,12 +381,16 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
     // Default is the whole torrent (what the release intends); the full
     // file picker only opens when the user explicitly asks for it - dumping
     // hundreds of entries unprompted is unreadable.
-    match Confirm::new(&format!(
+    match Confirm::new(&tr_format!(
+        "Download all {} files as shared?",
         "Скачать все {} файлов (как в раздаче)?",
         info.files.len()
     ))
     .with_default(true)
-    .with_help_message("ответьте «нет», чтобы выбрать отдельные файлы")
+    .with_help_message(tr!(
+        "answer “no” to select individual files",
+        "ответьте «нет», чтобы выбрать отдельные файлы"
+    ))
     .prompt()
     {
         Ok(true) => return Use(all),
@@ -366,10 +398,13 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
         Err(_) => return Cancel,
     }
     // Partial selection: interactive folders-and-files tree.
-    outln("↑↓ движение · →/← раскрыть · Space отметить · Enter подтвердить · Esc отмена");
+    outln(tr!(
+        "↑↓ move · →/← expand · Space select · Enter confirm · Esc cancel",
+        "↑↓ движение · →/← раскрыть · Space отметить · Enter подтвердить · Esc отмена"
+    ));
     match pick_torrent_files(info) {
         Ok(Some(sel)) => {
-            outln(PARTIAL_NEIGHBOURS_NOTE);
+            outln(partial_neighbours_note());
             Use(torrent::Choice {
                 files: Some(sel),
                 meta: listing.meta,
@@ -383,8 +418,12 @@ fn ask_torrent_files(tc: &Toolchain, plan: &Plan) -> TorrentAsk {
 /// aria2 downloads whole pieces, and a piece crossing a file boundary also
 /// writes into the unselected neighbour - which then looks full-size but is
 /// incomplete. Said once at pick time and again when the job finishes.
-const PARTIAL_NEIGHBOURS_NOTE: &str =
-    "ℹ соседние невыбранные файлы могут появиться частично скачанными — так устроены торренты";
+fn partial_neighbours_note() -> &'static str {
+    tr!(
+        "ℹ unselected neighboring files may be partially downloaded — this is how torrents work",
+        "ℹ соседние невыбранные файлы могут появиться частично скачанными — так устроены торренты"
+    )
+}
 
 /// `tc: None` discovers lazily, AFTER `validate_url` succeeds - mirrors
 /// Python's `_download(plan, cfg, tc: Toolchain | None = None)`, which only
@@ -523,7 +562,7 @@ impl BatchDisplay {
         for (id, plan) in plans.iter().enumerate() {
             views.push(BatchView {
                 name: batch_name(&plan.url),
-                status: "в очереди".into(),
+                status: tr!("queued", "в очереди").into(),
                 last_printed: None,
             });
             if let Some(multi) = &multi {
@@ -571,7 +610,10 @@ impl BatchDisplay {
         if let Some(status) = status {
             // The generic allocation notice can arrive from stderr after a
             // more useful byte counter on stdout; don't overwrite the latter.
-            if status != "выделение места на диске…" || !view.status.contains("выделение места ")
+            if status != tr!("allocating disk space…", "выделение места на диске…")
+                || !view
+                    .status
+                    .contains(tr!("allocating space ", "выделение места "))
             {
                 view.status = status;
             }
@@ -652,7 +694,13 @@ fn read_batch_pipe(
                 continue;
             }
             if line.starts_with("FILE:") && line.contains("[MEMORY][METADATA]") {
-                latest = Some("получение метаданных торрента…".into());
+                latest = Some(
+                    tr!(
+                        "fetching torrent metadata…",
+                        "получение метаданных торрента…"
+                    )
+                    .into(),
+                );
             } else if let Some(name) = engines::aria2_name_from_file(line) {
                 if last_file.as_deref() != Some(&name) {
                     last_file = Some(name.clone());
@@ -663,7 +711,10 @@ fn read_batch_pipe(
             } else if engines::parse_progress(line).is_some() {
                 latest = Some(clip(line, 90));
             } else if line.contains("Allocating disk space") {
-                let _ = tx.send(BatchEvent::Progress(id, "выделение места на диске…".into()));
+                let _ = tx.send(BatchEvent::Progress(
+                    id,
+                    tr!("allocating disk space…", "выделение места на диске…").into(),
+                ));
             } else if !line.starts_with("[#") && !line.starts_with("[FileAlloc:") {
                 // Нижний регистр не считаем заранее: для yt-dlp он не нужен, а
                 // для aria2 большинство строк ни одного из слов не содержит.
@@ -763,7 +814,10 @@ fn run_batch_job(
         Err(e) => {
             let _ = tx.send(BatchEvent::Line(
                 id,
-                format!("✘ Не удалось запустить загрузчик: {e}"),
+                tr_format!(
+                    "✘ Could not start downloader: {e}",
+                    "✘ Не удалось запустить загрузчик: {e}"
+                ),
             ));
             return RunResult {
                 code: 127,
@@ -826,7 +880,10 @@ fn run_batch_with(
                     break;
                 };
                 let plan = &plans[id];
-                let _ = tx.send(BatchEvent::Progress(id, "подключение…".to_string()));
+                let _ = tx.send(BatchEvent::Progress(
+                    id,
+                    tr!("connecting…", "подключение…").to_string(),
+                ));
                 let result = run(id, plan, tc, &tx);
                 let _ = tx.send(BatchEvent::Finished(
                     id,
@@ -843,7 +900,7 @@ fn run_batch_with(
                     if plans[id].engine == "aria2" && engines::aria2_missing_control(&line) {
                         if !missing_control[id] {
                             missing_control[id] = true;
-                            display.diagnostic(id, engines::ARIA2_MISSING_CONTROL_HINT);
+                            display.diagnostic(id, engines::aria2_missing_control_hint());
                         }
                     } else if plans[id].engine != "aria2"
                         || !(line.contains("Exception caught")
@@ -861,19 +918,27 @@ fn run_batch_with(
                         cfg.remember_dir(&dir);
                         cfg.save();
                         let dir = clip(&engines::sanitize_child_output(&dir), 90);
-                        display.finished(id, format!("✔ Готово: {dir}"));
+                        display.finished(id, tr_format!("✔ Done: {dir}", "✔ Готово: {dir}"));
                         if plans[id].torrent.files.is_some() {
-                            display.diagnostic(id, PARTIAL_NEIGHBOURS_NOTE);
+                            display.diagnostic(id, partial_neighbours_note());
                         }
                     } else if missing_control[id] {
                         display.finished(
                             id,
-                            "✘ Файлы уже есть, но нет .aria2 — выберите пустую папку".into(),
+                            tr!(
+                                "✘ Files exist without .aria2 — choose an empty folder",
+                                "✘ Файлы уже есть, но нет .aria2 — выберите пустую папку"
+                            )
+                            .into(),
                         );
                     } else {
                         display.finished(
                             id,
-                            format!("✘ Ошибка (код {}). См. сообщения выше.", result.code),
+                            tr_format!(
+                                "✘ Error (code {}). See the messages above.",
+                                "✘ Ошибка (код {}). См. сообщения выше.",
+                                result.code
+                            ),
                         );
                     }
                     results[id] = Some(result);
@@ -914,8 +979,8 @@ fn retry_with_cookies(
         || {
             let mut browsers: Vec<&str> = COOKIES_BROWSERS.to_vec();
             browsers.sort_unstable();
-            Select::new("Браузер:", browsers)
-                .with_help_message(SELECT_HELP)
+            Select::new(tr!("Browser:", "Браузер:"), browsers)
+                .with_help_message(select_help())
                 .prompt()
                 .ok()
                 .map(|b| b.to_string())
@@ -939,13 +1004,13 @@ fn retry_with_cookies_inner(
     while should_offer_cookies(&plan, result.code, result.auth_hint) {
         let had_cookies = plan.cookies_browser.is_some();
         let question = if had_cookies {
-            format!(
+            tr_format!(
+                "\nDownload failed (code {}). Try cookies from another browser?",
                 "\nНе скачалось (код {}). Попробовать с куками другого браузера?",
                 result.code
             )
         } else {
-            format!(
-                "\nНе скачалось (код {}). Похоже, сайту нужна авторизация: можно взять куки \
+            tr_format!("\nDownload failed (code {}). This site may require sign-in: retry with your browser cookies?", "\nНе скачалось (код {}). Похоже, сайту нужна авторизация: можно взять куки \
                  из браузера и повторить. Попробовать?",
                 result.code
             )
@@ -972,7 +1037,7 @@ enum LinkChoice {
 impl fmt::Display for LinkChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LinkChoice::New => write!(f, "Вставить новую ссылку"),
+            LinkChoice::New => tr_write!(f, "Enter a new link", "Вставить новую ссылку"),
             LinkChoice::Existing(u) => write!(f, "{}", clip(u, 70)),
         }
     }
@@ -995,7 +1060,10 @@ fn split_links(text: &str) -> Result<Vec<String>, &'static str> {
         }
     }
     if quoted.is_some() {
-        return Err("Не закрыты кавычки вокруг ссылки или пути к .torrent.");
+        return Err(tr!(
+            "Unclosed quote around a URL or .torrent path.",
+            "Не закрыты кавычки вокруг ссылки или пути к .torrent."
+        ));
     }
     if !current.is_empty() {
         urls.push(current);
@@ -1005,9 +1073,12 @@ fn split_links(text: &str) -> Result<Vec<String>, &'static str> {
 
 fn ask_links(cfg: &Config) -> Option<Vec<String>> {
     loop {
-        let text = Text::new("Ссылки через пробел (Enter — история):")
-            .prompt()
-            .ok()?;
+        let text = Text::new(tr!(
+            "Space-separated links (Enter for history):",
+            "Ссылки через пробел (Enter — история):"
+        ))
+        .prompt()
+        .ok()?;
         if !text.trim().is_empty() {
             match split_links(&text) {
                 Ok(urls) if !urls.is_empty() => return Some(urls),
@@ -1025,9 +1096,9 @@ fn ask_links(cfg: &Config) -> Option<Vec<String>> {
         }
         let mut choices = vec![LinkChoice::New];
         choices.extend(cfg.urls.iter().take(6).cloned().map(LinkChoice::Existing));
-        let pick = Select::new("Последние ссылки:", choices)
+        let pick = Select::new(tr!("Recent links:", "Последние ссылки:"), choices)
             .without_filtering()
-            .with_help_message(SELECT_HELP_PLAIN)
+            .with_help_message(select_help_plain())
             .prompt()
             .ok()?;
         if let LinkChoice::Existing(url) = pick {
@@ -1060,7 +1131,7 @@ fn ask_engine(url: &str, tc: &Toolchain) -> Option<String> {
         return Some(list[0].to_string());
     }
     let label_of = |e: &str| -> String {
-        ENGINE_LABELS
+        engine_labels()
             .iter()
             .find(|(k, _)| *k == e)
             .map(|(_, l)| l.to_string())
@@ -1077,15 +1148,15 @@ fn ask_engine(url: &str, tc: &Toolchain) -> Option<String> {
         .enumerate()
         .map(|(i, e)| {
             let label = if i == 0 {
-                format!("{}  (рекомендуется)", label_of(e))
+                tr_format!("{}  (recommended)", "{}  (рекомендуется)", label_of(e))
             } else {
                 label_of(e)
             };
             EngineOpt(e, label)
         })
         .collect();
-    Select::new("Чем скачивать:", choices)
-        .with_help_message(SELECT_HELP)
+    Select::new(tr!("Download with:", "Чем скачивать:"), choices)
+        .with_help_message(select_help())
         .prompt()
         .ok()
         .map(|c| c.0.to_string())
@@ -1098,9 +1169,9 @@ fn ask_format() -> Option<String> {
             write!(f, "{}", self.1)
         }
     }
-    let choices: Vec<FmtOpt> = FORMATS.iter().map(|(k, l)| FmtOpt(k, l)).collect();
-    Select::new("Формат (yt-dlp):", choices)
-        .with_help_message(SELECT_HELP)
+    let choices: Vec<FmtOpt> = formats().iter().map(|(k, l)| FmtOpt(k, l)).collect();
+    Select::new(tr!("Format (yt-dlp):", "Формат (yt-dlp):"), choices)
+        .with_help_message(select_help())
         .prompt()
         .ok()
         .map(|c| c.0.to_string())
@@ -1120,18 +1191,20 @@ impl fmt::Display for DirEntryChoice {
             // File names are remote-controlled (archive contents!): never let
             // them inject raw escape sequences into the terminal menu.
             DirEntryChoice::Select(p) => {
-                write!(
+                tr_write!(
                     f,
+                    "✓ Choose this folder ({})",
                     "✓ Выбрать эту папку ({})",
                     clip(&p.display().to_string(), 90)
                 )
             }
-            DirEntryChoice::Up => write!(f, "↑ Наверх"),
-            DirEntryChoice::Drive(p) => write!(f, "💽 Диск {}", p.display()),
+            DirEntryChoice::Up => tr_write!(f, "↑ Parent folder", "↑ Наверх"),
+            DirEntryChoice::Drive(p) => tr_write!(f, "💽 Drive {}", "💽 Диск {}", p.display()),
             // Honest wording: the list is alphabetical and the tail is never
             // rendered - "поднимитесь выше" could not reveal it.
-            DirEntryChoice::More(n) => write!(
+            DirEntryChoice::More(n) => tr_write!(
                 f,
+                "… showing the first {MAX_BROWSE_ENTRIES} folders alphabetically ({n} total)",
                 "… показаны первые {MAX_BROWSE_ENTRIES} папок по алфавиту (всего {n})"
             ),
             DirEntryChoice::Down(p) => {
@@ -1172,10 +1245,14 @@ fn browse_dir(start: PathBuf) -> Option<String> {
             choices.push(DirEntryChoice::More(all_dirs.len()));
         }
         let ans = Select::new(
-            &format!("Папка: {}", clip(&current.display().to_string(), 90)),
+            &tr_format!(
+                "Folder: {}",
+                "Папка: {}",
+                clip(&current.display().to_string(), 90)
+            ),
             choices,
         )
-        .with_help_message(SELECT_HELP)
+        .with_help_message(select_help())
         .prompt()
         .ok()?;
         match ans {
@@ -1202,11 +1279,11 @@ enum DirChoice {
 impl fmt::Display for DirChoice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DirChoice::Last(d) => write!(f, "Последняя: {}", clip(d, 70)),
-            DirChoice::Downloads => write!(f, "Загрузки"),
-            DirChoice::Desktop => write!(f, "Рабочий стол"),
-            DirChoice::Cwd => write!(f, "Текущая папка"),
-            DirChoice::Browse => write!(f, "Выбрать в проводнике…"),
+            DirChoice::Last(d) => tr_write!(f, "Last used: {}", "Последняя: {}", clip(d, 70)),
+            DirChoice::Downloads => tr_write!(f, "Downloads", "Загрузки"),
+            DirChoice::Desktop => tr_write!(f, "Desktop", "Рабочий стол"),
+            DirChoice::Cwd => tr_write!(f, "Current folder", "Текущая папка"),
+            DirChoice::Browse => tr_write!(f, "Browse folders…", "Выбрать в проводнике…"),
         }
     }
 }
@@ -1226,8 +1303,8 @@ fn ask_dir(cfg: &Config) -> Option<String> {
     choices.push(DirChoice::Cwd);
     choices.push(DirChoice::Browse);
 
-    let pick = Select::new("Куда сохранять:", choices)
-        .with_help_message(SELECT_HELP)
+    let pick = Select::new(tr!("Save to:", "Куда сохранять:"), choices)
+        .with_help_message(select_help())
         .prompt()
         .ok()?;
     match pick {
@@ -1255,14 +1332,14 @@ fn confirm_message(
 ) -> String {
     match engine {
         "yt-dlp" => {
-            let label = FORMATS
+            let label = formats()
                 .iter()
                 .find(|(k, _)| *k == fmt)
                 .map(|(_, l)| *l)
                 .unwrap_or(fmt);
             let mut m = format!(" yt-dlp · {label} · → {}", clip(out_dir, 40));
             if let Some(b) = cookies_browser {
-                m.push_str(&format!(" · 🍪 куки: {b}"));
+                m.push_str(&tr_format!(" · 🍪 cookies: {b}", " · 🍪 куки: {b}"));
             }
             m
         }
@@ -1271,7 +1348,8 @@ fn confirm_message(
 }
 
 fn queue_summary(plans: &[Plan], jobs: u8) -> String {
-    let mut summary = format!(
+    let mut summary = tr_format!(
+        "Jobs: {} · concurrent: {}",
         "Задач: {} · одновременно: {}",
         plans.len(),
         plans.len().min(usize::from(jobs))
@@ -1329,8 +1407,48 @@ fn collect(
 }
 
 fn main() -> std::process::ExitCode {
-    let args = Args::parse();
     let mut cfg = Config::load();
+    i18n::set_language(cfg.language);
+    let args = Args::parse();
+    if let Some(language) = args.lang {
+        i18n::set_language(language);
+    }
+    if args.help {
+        let mut command = Args::command();
+        if i18n::is_russian() {
+            command = command
+                .help_template("{about-with-newline}\nИспользование: {usage}\n\n{all-args}")
+                .mut_args(|arg| {
+                    let positional = arg.is_positional();
+                    arg.help_heading(if positional {
+                        "Аргументы"
+                    } else {
+                        "Опции"
+                    })
+                });
+        }
+        if let Err(e) = command.print_help() {
+            errln(e.to_string());
+            return exit_code(1);
+        }
+        outln("");
+        return std::process::ExitCode::SUCCESS;
+    }
+    if args.version {
+        outln(format!("snatch {APP_VERSION}"));
+        return std::process::ExitCode::SUCCESS;
+    }
+    if let Some(language) = args.lang {
+        cfg.set_language(language);
+        if let Err(e) = cfg.try_save() {
+            errln(e);
+            return exit_code(1);
+        }
+        if args.urls.is_empty() && !args.install_tools && !args.clear_history && !args.yes {
+            outln(tr_format!("Language: {}", "Язык: {}", language.label()));
+            return std::process::ExitCode::SUCCESS;
+        }
+    }
 
     if let Some(browser) = &args.cookies_browser {
         if let Err(e) = validate_cookies_browser(browser) {
@@ -1342,17 +1460,23 @@ fn main() -> std::process::ExitCode {
     if args.clear_history {
         cfg.clear_history();
         if let Err(e) = cfg.try_save() {
-            errln(format!("✘ История не очищена: {e}"));
+            errln(tr_format!(
+                "✘ History was not cleared: {e}",
+                "✘ История не очищена: {e}"
+            ));
             return exit_code(1);
         }
-        outln("История очищена.");
+        outln(tr!("History cleared.", "История очищена."));
         return std::process::ExitCode::SUCCESS;
     }
 
     if args.install_tools {
         #[cfg(not(windows))]
         {
-            errln("Автоустановка загрузчиков поддерживается только на Windows.");
+            errln(tr!(
+                "Automatic tool installation is only supported on Windows.",
+                "Автоустановка загрузчиков поддерживается только на Windows."
+            ));
             return exit_code(2);
         }
         #[cfg(windows)]
@@ -1365,7 +1489,11 @@ fn main() -> std::process::ExitCode {
                 }
             };
             if let Err(e) = std::fs::create_dir_all(&dir) {
-                errln(format!("✘ Не удалось создать {}: {e}", dir.display()));
+                errln(tr_format!(
+                    "✘ Could not create {}: {e}",
+                    "✘ Не удалось создать {}: {e}",
+                    dir.display()
+                ));
                 return exit_code(2);
             }
             let mut failed = false;
@@ -1405,15 +1533,18 @@ fn main() -> std::process::ExitCode {
     // entry - no reason to pay for that scan just to print the refusal.
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         errln(
-            "✘ Интерактивный режим требует настоящий терминал. \
-             Используй Windows Terminal/cmd или режим -y со ссылкой и -o.",
+            tr!("✘ Interactive mode requires a terminal. Use Windows Terminal/cmd or -y with a URL and -o.", "✘ Интерактивный режим требует настоящий терминал. \
+             Используй Windows Terminal/cmd или режим -y со ссылкой и -o."),
         );
         return exit_code(2);
     }
 
     let tc = Toolchain::discover();
     if tc.yt_dlp.is_none() && tc.aria2c.is_none() {
-        errln("✘ Не найдено загрузчиков. Установи через snatch --install-tools или winget.");
+        errln(tr!(
+            "✘ No downloaders found. Install with snatch --install-tools or winget.",
+            "✘ Не найдено загрузчиков. Установи через snatch --install-tools или winget."
+        ));
         return exit_code(2);
     }
 
@@ -1443,7 +1574,7 @@ fn main() -> std::process::ExitCode {
             match ask_links(&cfg) {
                 Some(urls) => urls,
                 None => {
-                    outln("Отменено.");
+                    outln(tr!("Canceled.", "Отменено."));
                     return exit_code(130);
                 }
             }
@@ -1455,7 +1586,7 @@ fn main() -> std::process::ExitCode {
             None => match ask_dir(&cfg) {
                 Some(d) => d,
                 None => {
-                    outln("Отменено.");
+                    outln(tr!("Canceled.", "Отменено."));
                     return exit_code(130);
                 }
             },
@@ -1463,7 +1594,8 @@ fn main() -> std::process::ExitCode {
         let total = urls.len();
         let mut plans = Vec::with_capacity(total);
         for (i, url) in urls.into_iter().enumerate() {
-            outln(format!(
+            outln(tr_format!(
+                "\nSetup {}/{}: {}",
                 "\nНастройка {}/{}: {}",
                 i + 1,
                 total,
@@ -1477,19 +1609,19 @@ fn main() -> std::process::ExitCode {
                 args.engine.as_deref(),
                 args.format.as_deref(),
             ) else {
-                outln("Отменено.");
+                outln(tr!("Canceled.", "Отменено."));
                 return exit_code(130);
             };
             plan.no_continue = args.no_continue;
             plans.push(plan);
         }
         outln(queue_summary(&plans, args.jobs));
-        if !Confirm::new("Скачать всё?")
+        if !Confirm::new(tr!("Download everything?", "Скачать всё?"))
             .with_default(true)
             .prompt()
             .unwrap_or(false)
         {
-            outln("Отменено.");
+            outln(tr!("Canceled.", "Отменено."));
             return exit_code(130);
         }
         // Network metadata is fetched only after the whole queue is confirmed.
@@ -1498,11 +1630,11 @@ fn main() -> std::process::ExitCode {
             match ask_torrent_files(&tc, &plan) {
                 TorrentAsk::Use(choice) => plan.torrent = choice,
                 TorrentAsk::Skip => {
-                    outln("Ссылка пропущена.");
+                    outln(tr!("Link skipped.", "Ссылка пропущена."));
                     continue;
                 }
                 TorrentAsk::Cancel => {
-                    outln("Отменено.");
+                    outln(tr!("Canceled.", "Отменено."));
                     return exit_code(130);
                 }
             }
@@ -1510,7 +1642,7 @@ fn main() -> std::process::ExitCode {
         }
         let mut plans = picked;
         if plans.is_empty() {
-            outln("Нечего скачивать.");
+            outln(tr!("Nothing to download.", "Нечего скачивать."));
             continue;
         }
         let extras = match extras_from_args(&args) {
@@ -1544,9 +1676,12 @@ fn main() -> std::process::ExitCode {
             }
             batch_exit_code(&results)
         };
-        match Confirm::new("\nСкачать ещё что-нибудь?")
-            .with_default(false)
-            .prompt()
+        match Confirm::new(tr!(
+            "\nDownload something else?",
+            "\nСкачать ещё что-нибудь?"
+        ))
+        .with_default(false)
+        .prompt()
         {
             Ok(true) => continue,
             _ => return exit_code(code),
@@ -1674,12 +1809,18 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
             terminal::Clear(clear),
             cursor::Hide
         );
-        let header = "ВЫБОР ФАЙЛОВ — ↑↓ движение · →/← раскрыть · Space отметить · Enter подтвердить · Esc отмена";
+        let header = tr!("FILE SELECTION — ↑↓ move · →/← expand · Space select · Enter confirm · Esc cancel", "ВЫБОР ФАЙЛОВ — ↑↓ движение · →/← раскрыть · Space отметить · Enter подтвердить · Esc отмена");
         if view == 0 {
             let _ = write!(
                 out,
                 "{}",
-                clip_cells("Увеличьте высоту терминала (Esc — отмена)", width)
+                clip_cells(
+                    tr!(
+                        "Increase terminal height (Esc to cancel)",
+                        "Увеличьте высоту терминала (Esc — отмена)"
+                    ),
+                    width
+                )
             );
         } else {
             let _ = write!(out, "{}\r\n\r\n", clip_cells(header, width));
@@ -1803,7 +1944,13 @@ fn pick_torrent_files(info: &torrent::TorrentInfo) -> Result<Option<Vec<usize>>,
                             .collect();
                         // Nothing ticked: keep the picker open (Esc cancels).
                         if chosen.is_empty() {
-                            note = Some("Выберите хотя бы один файл (Esc — отмена)".into());
+                            note = Some(
+                                tr!(
+                                    "Select at least one file (Esc to cancel)",
+                                    "Выберите хотя бы один файл (Esc — отмена)"
+                                )
+                                .into(),
+                            );
                             continue;
                         }
                         if chosen.len() == info.files.len() {
@@ -1899,7 +2046,7 @@ mod tests {
     fn banner_preserves_ascii_art_indent() {
         let first = BANNER.trim_matches(['\r', '\n']).lines().next().unwrap();
         assert!(first.starts_with(" ____"), "{first:?}");
-        assert!(BANNER.contains("ultimate combine"));
+        assert!(BANNER.contains("lightweight downloader"));
     }
 
     fn base_plan() -> Plan {
@@ -1949,6 +2096,9 @@ mod tests {
 
     fn args_with(url: Option<&str>, output: Option<&str>, cookies_browser: Option<&str>) -> Args {
         Args {
+            lang: None,
+            help: false,
+            version: false,
             urls: url.into_iter().map(String::from).collect(),
             output: output.map(String::from),
             engine: None,
@@ -2070,7 +2220,7 @@ mod tests {
         ]);
         let plans = plans_from_args(&args).unwrap();
         let text = queue_summary(&plans, 2);
-        assert!(text.contains("Задач: 3 · одновременно: 2"));
+        assert!(text.contains("Jobs: 3 · concurrent: 2"));
         assert!(text.contains("1/3.") && text.contains("2/3.") && text.contains("3/3."));
         assert_eq!(text.matches("aria2c →").count(), 2);
         assert_eq!(text.matches("yt-dlp ·").count(), 1);
@@ -2117,14 +2267,14 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert!(matches!(&events[1], BatchEvent::Name(0, name) if name == "Cuphead_1.3.9"));
         assert!(
-            matches!(&events[2], BatchEvent::Progress(0, line) if line.contains("выделение места 1.1GiB/3.3GiB (33%)"))
+            matches!(&events[2], BatchEvent::Progress(0, line) if line.contains("allocating space 1.1GiB/3.3GiB (33%)"))
         );
         assert!(!events.iter().any(|e| matches!(e, BatchEvent::Line(..))));
         assert!(!clean_loader_text("\x1b[1;32mNOTICE\x1b[0m").contains("[1;32m"));
         let stat = engines::aria2_stat("[#50e13e 880KiB/0.9MiB(88%) CN:1 SD:4 DL:812KiB UL:14KiB]")
             .unwrap();
         assert!(
-            stat.contains("88% · 880KiB/0.9MiB · ↓812KiB/с · сиды 4 · соединения 1"),
+            stat.contains("88% · 880KiB/0.9MiB · ↓812KiB/s · seeds 4 · connections 1"),
             "{stat}"
         );
     }
@@ -2133,16 +2283,16 @@ mod tests {
     fn batch_colors_only_tty_progress_numbers() {
         let view = BatchView {
             name: "movie.mkv".into(),
-            status: "42% · 420MiB/1GiB · ↓3MiB/с · сиды 8".into(),
+            status: "42% · 420MiB/1GiB · ↓3MiB/s · seeds 8".into(),
             last_printed: None,
         };
         let colored = BatchDisplay::line(0, 2, &view, true);
         assert!(colored.contains("\x1b[92m42%\x1b[0m"));
         assert!(colored.contains("\x1b[92m420MiB\x1b[0m/1GiB"));
-        assert!(colored.contains("\x1b[96m↓3MiB/с\x1b[0m"));
+        assert!(colored.contains("\x1b[96m↓3MiB/s\x1b[0m"));
         let plain = BatchDisplay::line(0, 2, &view, false);
         assert!(!plain.contains('\x1b'));
-        assert!(plain.contains("42% · 420MiB/1GiB · ↓3MiB/с"));
+        assert!(plain.contains("42% · 420MiB/1GiB · ↓3MiB/s"));
     }
 
     #[test]

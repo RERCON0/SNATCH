@@ -1,5 +1,7 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use snatch_rs::i18n::{self, Language};
+use snatch_rs::{tr, tr_format};
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -14,8 +16,8 @@ use snatch_rs::scrollbar::ScrollAreaExt;
 
 use snatch_rs::config::{home_dir, Config};
 use snatch_rs::engines::{
-    self, detect_engine, is_unc_path, looks_like_auth, parse_progress, preflight_warning,
-    validate_url, Job, COOKIES_BROWSERS, FORMATS,
+    self, detect_engine, formats, is_unc_path, looks_like_auth, parse_progress, preflight_warning,
+    validate_url, Job, COOKIES_BROWSERS,
 };
 use snatch_rs::setup::{
     install_aria2_with, install_deno_with, install_ffmpeg_with, install_yt_dlp_with, SetupProgress,
@@ -212,7 +214,7 @@ fn torrent_pick_window(
     let screen_w = ctx.screen_rect().width();
     let frame_w = ctx.style().spacing.window_margin.sum().x + 24.0;
     let width = (screen_w - frame_w).clamp(200.0, 560.0);
-    let shown = egui::Window::new(window_title("ВЫБОР ФАЙЛОВ ТОРРЕНТА"))
+    let shown = egui::Window::new(window_title(tr!("TORRENT FILE SELECTION", "ВЫБОР ФАЙЛОВ ТОРРЕНТА")))
         .collapsible(false)
         .resizable(false)
         .order(egui::Order::Foreground)
@@ -226,8 +228,8 @@ fn torrent_pick_window(
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let accent = ui.visuals().hyperlink_color;
-                        let all = ui.add(accent_button(accent, "[ скачать всё ]"));
-                        let cancel = ui.button("[ отмена ]");
+                        let all = ui.add(accent_button(accent, tr!("[ download all ]", "[ скачать всё ]")));
+                        let cancel = ui.button(tr!("[ cancel ]", "[ отмена ]"));
                         act.download_all = all.clicked();
                         act.cancel = cancel.clicked();
                         act.buttons.extend([all.rect, cancel.rect]);
@@ -236,19 +238,18 @@ fn torrent_pick_window(
                 return;
             }
             let Some(info) = &pick.info else { return };
-            ui.weak(format!(
-                "«{}» · файлов {} · всего {}",
+            ui.weak(tr_format!("“{}” · {} files · {} total", "«{}» · файлов {} · всего {}",
                 clip(&info.name, 60),
                 info.files.len(),
                 torrent::human_size(info.total)
             ));
-            ui.weak(format!("Папка: {}", clip(&pick.job.out_dir.to_string_lossy(), 80)));
+            ui.weak(tr_format!("Folder: {}", "Папка: {}", clip(&pick.job.out_dir.to_string_lossy(), 80)));
             ui.add_space(4.0);
             torrent_tree_rows(ui, &mut pick.tree, &mut pick.selected, &mut pick.view);
             let count = pick.view.selected;
             if count > 0 && count < pick.selected.len() {
                 ui.add_space(4.0);
-                ui.weak("Соседние невыбранные файлы могут появиться частично скачанными — так устроены торренты.");
+                ui.weak(tr!("Unselected neighboring files may be partially downloaded — this is how torrents work.", "Соседние невыбранные файлы могут появиться частично скачанными — так устроены торренты."));
             }
             if let Some(hint) = &pick.hint {
                 ui.add_space(4.0);
@@ -259,8 +260,8 @@ fn torrent_pick_window(
             // 460px width one row cannot hold all four, and the right-aligned
             // pair slid over "снять все" (its clicks landed on "отмена").
             ui.horizontal(|ui| {
-                let all = ui.button("[ все ]");
-                let none = ui.button("[ снять все ]");
+                let all = ui.button(tr!("[ select all ]", "[ все ]"));
+                let none = ui.button(tr!("[ clear all ]", "[ снять все ]"));
                 act.all = all.clicked();
                 act.none = none.clicked();
                 act.buttons.extend([all.rect, none.rect]);
@@ -269,8 +270,8 @@ fn torrent_pick_window(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let accent = ui.visuals().hyperlink_color;
                     let confirm =
-                        ui.add_enabled(count > 0, accent_button(accent, format!("[ скачать ({count}) ]")));
-                    let cancel = ui.button("[ отмена ]");
+                        ui.add_enabled(count > 0, accent_button(accent, tr_format!("[ download ({count}) ]", "[ скачать ({count}) ]")));
+                    let cancel = ui.button(tr!("[ cancel ]", "[ отмена ]"));
                     act.confirm = confirm.clicked();
                     act.cancel = cancel.clicked();
                     act.buttons.extend([confirm.rect, cancel.rect]);
@@ -444,7 +445,10 @@ fn torrent_console_line(id: u64, line: &str) -> Option<Msg> {
         return Some(Msg::TorrentStatus(id, p, stat));
     }
     if line.contains("Allocating disk space") {
-        return Some(Msg::TorrentLog(id, "Выделение места на диске…".into()));
+        return Some(Msg::TorrentLog(
+            id,
+            tr!("Allocating disk space…", "Выделение места на диске…").into(),
+        ));
     }
     let lower = line.to_ascii_lowercase();
     if ["error", "warning", "failed", "aborted", "exception"]
@@ -466,7 +470,11 @@ fn local_torrent_path(path: &Path) -> Result<String, String> {
                 .any(|allowed| ext.eq_ignore_ascii_case(allowed))
         });
     if !supported {
-        return Err("Выберите локальный .torrent, .metalink или .meta4 файл.".into());
+        return Err(tr!(
+            "Choose a local .torrent, .metalink or .meta4 file.",
+            "Выберите локальный .torrent, .metalink или .meta4 файл."
+        )
+        .into());
     }
     // Validation rejects UNC before touching the filesystem; spaces and
     // brackets in a local filename remain ordinary path characters.
@@ -823,13 +831,18 @@ fn accent_button(accent: egui::Color32, text: impl Into<String>) -> egui::Button
 /// whether to wait a minute or ten.
 fn setup_progress_text(p: Option<&SetupProgress>) -> String {
     let Some(p) = p else {
-        return "скачиваю yt-dlp, aria2c, ffmpeg и Deno…".to_string();
+        return tr!(
+            "downloading yt-dlp, aria2c, ffmpeg and Deno…",
+            "скачиваю yt-dlp, aria2c, ffmpeg и Deno…"
+        )
+        .to_string();
     };
     if p.stage != SetupStage::Downloading {
         return format!("{}: {}", p.label, p.stage.text());
     }
     match p.total {
-        Some(total) if total > 0 => format!(
+        Some(total) if total > 0 => tr_format!(
+            "{}: {} of {} ({:.0}%)",
             "{}: {} из {} ({:.0}%)",
             p.label,
             torrent::human_size(p.done),
@@ -1137,6 +1150,7 @@ impl SnatchApp {
             Ok(cfg) => (cfg, None),
             Err(e) => (Config::default(), Some(e)),
         };
+        i18n::set_language(cfg.language);
         setup_theme(&cc.egui_ctx, cfg.dark_mode);
         pin_pixel_scale(&cc.egui_ctx, true);
         let (tx, rx) = channel();
@@ -1157,10 +1171,16 @@ impl SnatchApp {
         });
         let mut app = Self::from_config(cfg, tx, rx);
         if let Some(warning) = warning {
-            app.push_log(format!("⚠ {warning}; файл настроек сохранён без изменений"));
+            app.push_log(tr_format!(
+                "⚠ {warning}; the settings file was left unchanged",
+                "⚠ {warning}; файл настроек сохранён без изменений"
+            ));
             app.set_status(
                 StatusKind::Warn,
-                "Не удалось прочитать настройки — см. журнал",
+                tr!(
+                    "Could not read settings — see log",
+                    "Не удалось прочитать настройки — см. журнал"
+                ),
             );
             app.show_log_window = true;
         }
@@ -1242,7 +1262,13 @@ impl SnatchApp {
         });
         self.cfg.dark_mode = self.dark_mode;
         if !self.save_config() {
-            self.set_status(StatusKind::Warn, "Настройки темы не сохранены — см. журнал");
+            self.set_status(
+                StatusKind::Warn,
+                tr!(
+                    "Theme settings were not saved — see log",
+                    "Настройки темы не сохранены — см. журнал"
+                ),
+            );
         }
     }
 
@@ -1250,7 +1276,10 @@ impl SnatchApp {
         match self.cfg.try_save_now() {
             Ok(()) => true,
             Err(e) => {
-                self.push_log(format!("⚠ Не удалось сохранить настройки: {e}"));
+                self.push_log(tr_format!(
+                    "⚠ Could not save settings: {e}",
+                    "⚠ Не удалось сохранить настройки: {e}"
+                ));
                 self.show_log_window = true;
                 false
             }
@@ -1274,7 +1303,10 @@ impl SnatchApp {
                     .file_name()
                     .map(|n| n.to_string_lossy())
                     .unwrap_or_default();
-                self.set_status(StatusKind::Ok, format!("Выбран файл: {}", clip(&name, 64)));
+                self.set_status(
+                    StatusKind::Ok,
+                    tr_format!("Selected file: {}", "Выбран файл: {}", clip(&name, 64)),
+                );
             }
             Err(e) => self.set_status(StatusKind::Err, e),
         }
@@ -1368,7 +1400,7 @@ impl SnatchApp {
                             if let Some(j) = self.job_mut(id) {
                                 j.missing_control_file = true;
                             }
-                            self.push_job_log(id, engines::ARIA2_MISSING_CONTROL_HINT.to_owned());
+                            self.push_job_log(id, engines::aria2_missing_control_hint().to_owned());
                         }
                     } else if !trimmed.is_empty() {
                         let aria2_exception = trimmed.contains("Exception caught")
@@ -1440,13 +1472,16 @@ impl SnatchApp {
                         j.progress = None;
                     }
                     if !name.is_empty() {
-                        self.push_job_log(id, format!("Торрент: {name}"));
+                        self.push_job_log(id, tr_format!("Torrent: {name}", "Торрент: {name}"));
                         if let Some(j) = self.job_mut(id) {
                             j.label = name;
                         }
                     }
                     if let Some(j) = self.job_mut(id) {
-                        j.set_status(StatusKind::None, "Получаю метаданные торрента…");
+                        j.set_status(
+                            StatusKind::None,
+                            tr!("Fetching torrent metadata…", "Получаю метаданные торрента…"),
+                        );
                     }
                 }
                 Msg::TorrentName(id, name) => {
@@ -1473,9 +1508,18 @@ impl SnatchApp {
                         self.phase = Phase::Idle;
                     }
                     if ok {
-                        self.set_status(StatusKind::Ok, "Загрузчики установлены");
+                        self.set_status(
+                            StatusKind::Ok,
+                            tr!("Tools installed", "Загрузчики установлены"),
+                        );
                     } else {
-                        self.set_status(StatusKind::Err, "Не всё удалось установить — см. журнал");
+                        self.set_status(
+                            StatusKind::Err,
+                            tr!(
+                                "Some tools could not be installed — see log",
+                                "Не всё удалось установить — см. журнал"
+                            ),
+                        );
                         self.show_log_window = true;
                     }
                     self.fill_free_slots(ctx);
@@ -1506,7 +1550,10 @@ impl SnatchApp {
         // "Готово" branch: the file IS complete, claiming "отменено, можно
         // докачать" would send the user to re-download a finished file.
         if aj.cancelled && code != 0 {
-            let text = format!("«{label}» отменено (файл можно докачать)");
+            let text = tr_format!(
+                "“{label}” canceled (download can be resumed)",
+                "«{label}» отменено (файл можно докачать)"
+            );
             self.set_status(StatusKind::Warn, text);
             self.fill_free_slots(ctx);
             return;
@@ -1514,7 +1561,10 @@ impl SnatchApp {
         // Same "still finished on its own" race as cancel above: if it hit
         // code 0 right as pause was requested, treat it as done, not paused.
         if aj.pausing && code != 0 {
-            self.set_status(StatusKind::None, format!("«{label}» на паузе"));
+            self.set_status(
+                StatusKind::None,
+                tr_format!("“{label}” paused", "«{label}» на паузе"),
+            );
             self.paused.push(PausedJob {
                 job: aj.job.clone(),
                 label,
@@ -1529,7 +1579,10 @@ impl SnatchApp {
         if code == 13 && aj.missing_control_file {
             self.set_status(
                 StatusKind::Err,
-                format!("«{label}»: файлы уже есть без .aria2 — выберите новую пустую папку"),
+                tr_format!(
+                    "“{label}”: files exist without .aria2 — choose a new empty folder",
+                    "«{label}»: файлы уже есть без .aria2 — выберите новую пустую папку"
+                ),
             );
             self.show_log_window = true;
             self.fill_free_slots(ctx);
@@ -1540,14 +1593,24 @@ impl SnatchApp {
                 self.cfg.remember_url(&aj.job.url);
                 self.cfg.remember_dir(&aj.job.out_dir.to_string_lossy());
                 let persisted = self.save_config();
-                let mut text = format!("«{label}» готово: {}", aj.job.out_dir.display());
+                let mut text = tr_format!(
+                    "“{label}” done: {}",
+                    "«{label}» готово: {}",
+                    aj.job.out_dir.display()
+                );
                 if aj.select.files.is_some() {
                     // aria2 writes whole pieces: unselected neighbours of the
                     // chosen files can exist yet be incomplete.
-                    text.push_str(" · соседние невыбранные файлы могут быть неполными");
+                    text.push_str(tr!(
+                        " · unselected neighboring files may be incomplete",
+                        " · соседние невыбранные файлы могут быть неполными"
+                    ));
                 }
                 if !persisted {
-                    text.push_str(" · история не сохранена — см. журнал");
+                    text.push_str(tr!(
+                        " · history was not saved — see log",
+                        " · история не сохранена — см. журнал"
+                    ));
                 }
                 self.set_status(
                     if persisted {
@@ -1560,18 +1623,25 @@ impl SnatchApp {
             }
             127 => self.set_status(
                 StatusKind::Err,
-                format!(
+                tr_format!(
+                    "“{label}”: could not start downloader (executable is missing or cannot run)",
                     "«{label}»: не удалось запустить загрузчик (бинарник пропал или не исполняем)"
                 ),
             ),
             130 => self.set_status(
                 StatusKind::Warn,
-                format!("«{label}» прервано (файл можно докачать)"),
+                tr_format!(
+                    "“{label}” interrupted (download can be resumed)",
+                    "«{label}» прервано (файл можно докачать)"
+                ),
             ),
             c => {
                 self.set_status(
                     StatusKind::Err,
-                    format!("«{label}»: ошибка (код {c}) — см. журнал"),
+                    tr_format!(
+                        "“{label}”: error (code {c}) — see log",
+                        "«{label}»: ошибка (код {c}) — см. журнал"
+                    ),
                 );
                 self.show_log_window = true;
                 let offer_retry = c == 1 && aj.auth_seen && aj.job.engine == "yt-dlp";
@@ -1589,7 +1659,10 @@ impl SnatchApp {
                     if self.spawn_job(ctx, aj.job.clone(), true, aj.select.clone()) {
                         self.set_status(
                             StatusKind::Warn,
-                            format!("«{label}»: докачка дала битый файл — повторяю с начала"),
+                            tr_format!(
+                                "“{label}”: resumed file is corrupt — restarting from scratch",
+                                "«{label}»: докачка дала битый файл — повторяю с начала"
+                            ),
                         );
                     } else {
                         self.retain_failed_start(aj.job, aj.select, true);
@@ -1657,11 +1730,20 @@ impl SnatchApp {
     /// shares format/folder.
     fn start_download(&mut self, ctx: &egui::Context) {
         if self.close_requested {
-            self.set_status(StatusKind::Warn, "Приложение закрывается");
+            self.set_status(
+                StatusKind::Warn,
+                tr!("Application is closing", "Приложение закрывается"),
+            );
             return;
         }
         if self.phase == Phase::Setup {
-            self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
+            self.set_status(
+                StatusKind::Err,
+                tr!(
+                    "Wait for tool installation to finish",
+                    "Дождитесь установки загрузчиков"
+                ),
+            );
             return;
         }
         let engine = self.effective_engine().to_string();
@@ -1673,7 +1755,10 @@ impl SnatchApp {
             }
         };
         if self.out_dir.trim().is_empty() {
-            self.set_status(StatusKind::Err, "Укажите папку сохранения");
+            self.set_status(
+                StatusKind::Err,
+                tr!("Choose a download folder", "Укажите папку сохранения"),
+            );
             return;
         }
         let fmt = if engine == "yt-dlp" {
@@ -1692,7 +1777,10 @@ impl SnatchApp {
         if self.url_in_flight(&url) {
             self.set_status(
                 StatusKind::Err,
-                "Эта ссылка уже скачивается, в очереди или на паузе",
+                tr!(
+                    "This link is already downloading, queued or paused",
+                    "Эта ссылка уже скачивается, в очереди или на паузе"
+                ),
             );
             return;
         }
@@ -1712,7 +1800,10 @@ impl SnatchApp {
             if self.torrent_pick.is_some() {
                 self.set_status(
                     StatusKind::Err,
-                    "Сначала завершите выбор файлов открытого торрента",
+                    tr!(
+                        "Finish selecting files for the open torrent first",
+                        "Сначала завершите выбор файлов открытого торрента"
+                    ),
                 );
                 return;
             }
@@ -1747,12 +1838,18 @@ impl SnatchApp {
         if self.url_in_flight(&job.url) {
             self.set_status(
                 StatusKind::Err,
-                "Эта ссылка уже скачивается, в очереди или на паузе",
+                tr!(
+                    "This link is already downloading, queued or paused",
+                    "Эта ссылка уже скачивается, в очереди или на паузе"
+                ),
             );
             return false;
         }
         // Before dispatch: a queued or failed start overrides it.
-        self.set_status(StatusKind::None, "Скачиваю торрент…");
+        self.set_status(
+            StatusKind::None,
+            tr!("Downloading torrent…", "Скачиваю торрент…"),
+        );
         let url = job.url.clone();
         let started = self.dispatch_job(ctx, job, choice);
         if started {
@@ -1791,13 +1888,19 @@ impl SnatchApp {
     /// is now running or queued (false: spawn_job refused it).
     fn dispatch_job(&mut self, ctx: &egui::Context, job: Job, select: torrent::Choice) -> bool {
         if self.close_requested {
-            self.set_status(StatusKind::Warn, "Приложение закрывается");
+            self.set_status(
+                StatusKind::Warn,
+                tr!("Application is closing", "Приложение закрывается"),
+            );
             return false;
         }
         if self.url_in_flight(&job.url) {
             self.set_status(
                 StatusKind::Warn,
-                "Эта ссылка уже скачивается, ожидает или находится в выборе файлов",
+                tr!(
+                    "This link is already downloading, queued or awaiting file selection",
+                    "Эта ссылка уже скачивается, ожидает или находится в выборе файлов"
+                ),
             );
             return false;
         }
@@ -1811,7 +1914,11 @@ impl SnatchApp {
             });
             self.set_status(
                 StatusKind::None,
-                format!("Добавлено в очередь ({})", self.queue.len()),
+                tr_format!(
+                    "Added to queue ({})",
+                    "Добавлено в очередь ({})",
+                    self.queue.len()
+                ),
             );
             true
         }
@@ -1822,7 +1929,10 @@ impl SnatchApp {
         if self.close_requested || self.phase == Phase::Setup {
             self.set_status(
                 StatusKind::Warn,
-                "Новая загрузка недоступна во время закрытия или установки",
+                tr!(
+                    "Cannot start a download while closing or installing tools",
+                    "Новая загрузка недоступна во время закрытия или установки"
+                ),
             );
             return;
         }
@@ -1847,7 +1957,11 @@ impl SnatchApp {
                         },
                     )
                 }
-                None => Err("aria2c не найден — установите загрузчики".to_string()),
+                None => Err(tr!(
+                    "aria2c not found — install tools",
+                    "aria2c не найден — установите загрузчики"
+                )
+                .to_string()),
             };
             let _ = tx.send(Msg::TorrentFiles(id, result));
             ctx_bg.request_repaint();
@@ -1864,7 +1978,13 @@ impl SnatchApp {
             error: None,
             hint: None,
         });
-        self.set_status(StatusKind::None, "Получаю список файлов торрента…");
+        self.set_status(
+            StatusKind::None,
+            tr!(
+                "Fetching torrent file list…",
+                "Получаю список файлов торрента…"
+            ),
+        );
     }
 
     /// Spawns the loader for an already-validated job as a new concurrent
@@ -1887,18 +2007,30 @@ impl SnatchApp {
         if self.close_requested {
             self.set_status(
                 StatusKind::Warn,
-                "Приложение закрывается — загрузка не запущена",
+                tr!(
+                    "Application is closing — download was not started",
+                    "Приложение закрывается — загрузка не запущена"
+                ),
             );
             return false;
         }
         if self.phase == Phase::Setup {
-            self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
+            self.set_status(
+                StatusKind::Err,
+                tr!(
+                    "Wait for tool installation to finish",
+                    "Дождитесь установки загрузчиков"
+                ),
+            );
             return false;
         }
         if self.url_in_flight(&job.url) {
             self.set_status(
                 StatusKind::Warn,
-                "Эта ссылка уже скачивается, ожидает или находится в выборе файлов",
+                tr!(
+                    "This link is already downloading, queued or awaiting file selection",
+                    "Эта ссылка уже скачивается, ожидает или находится в выборе файлов"
+                ),
             );
             return false;
         }
@@ -1981,9 +2113,15 @@ impl SnatchApp {
             Err(e) => {
                 self.set_status(
                     StatusKind::Err,
-                    format!("«{label}»: запуск/защита загрузчика: {e}"),
+                    tr_format!(
+                        "“{label}”: downloader startup/process protection: {e}",
+                        "«{label}»: запуск/защита загрузчика: {e}"
+                    ),
                 );
-                self.push_log(format!("✘ Загрузчик остановлен: {e}"));
+                self.push_log(tr_format!(
+                    "✘ Downloader stopped: {e}",
+                    "✘ Загрузчик остановлен: {e}"
+                ));
                 return false;
             }
         };
@@ -2004,7 +2142,7 @@ impl SnatchApp {
             job: job.clone(),
             label,
             progress: None,
-            status: "Запускаю…".to_string(),
+            status: tr!("Starting…", "Запускаю…").to_string(),
             status_kind: StatusKind::None,
             warns,
             cancel_flag: cancel_flag.clone(),
@@ -2179,7 +2317,10 @@ impl SnatchApp {
         // Keep refused jobs/offers available after installation; spawn_job's
         // Setup guard prevents the old overlapping-installer retry race.
         self.clear_log();
-        self.set_status(StatusKind::None, "Устанавливаю загрузчики…");
+        self.set_status(
+            StatusKind::None,
+            tr!("Installing tools…", "Устанавливаю загрузчики…"),
+        );
         let tx = self.tx.clone();
         let ctx_w = ctx.clone();
         std::thread::spawn(move || {
@@ -2198,7 +2339,8 @@ impl SnatchApp {
             };
             let mut ok = std::fs::create_dir_all(&bin).is_ok();
             if ok {
-                let _ = tx.send(Msg::SetupLog(format!(
+                let _ = tx.send(Msg::SetupLog(tr_format!(
+                    "Installing tools in {}",
                     "Устанавливаю загрузчики в {}",
                     bin.display()
                 )));
@@ -2207,7 +2349,10 @@ impl SnatchApp {
                         let _ = tx.send(Msg::SetupLog(format!("yt-dlp: {}", p.display())));
                     }
                     Err(e) => {
-                        let _ = tx.send(Msg::SetupLog(format!("yt-dlp: ОШИБКА {e}")));
+                        let _ = tx.send(Msg::SetupLog(tr_format!(
+                            "yt-dlp: ERROR {e}",
+                            "yt-dlp: ОШИБКА {e}"
+                        )));
                         ok = false;
                     }
                 }
@@ -2216,7 +2361,10 @@ impl SnatchApp {
                         let _ = tx.send(Msg::SetupLog(format!("aria2c: {}", p.display())));
                     }
                     Err(e) => {
-                        let _ = tx.send(Msg::SetupLog(format!("aria2c: ОШИБКА {e}")));
+                        let _ = tx.send(Msg::SetupLog(tr_format!(
+                            "aria2c: ERROR {e}",
+                            "aria2c: ОШИБКА {e}"
+                        )));
                         ok = false;
                     }
                 }
@@ -2225,7 +2373,10 @@ impl SnatchApp {
                         let _ = tx.send(Msg::SetupLog(format!("ffmpeg: {}", p.display())));
                     }
                     Err(e) => {
-                        let _ = tx.send(Msg::SetupLog(format!("ffmpeg: ОШИБКА {e}")));
+                        let _ = tx.send(Msg::SetupLog(tr_format!(
+                            "ffmpeg: ERROR {e}",
+                            "ffmpeg: ОШИБКА {e}"
+                        )));
                         ok = false;
                     }
                 }
@@ -2234,12 +2385,21 @@ impl SnatchApp {
                         let _ = tx.send(Msg::SetupLog(format!("Deno: {}", p.display())));
                     }
                     Err(e) => {
-                        let _ = tx.send(Msg::SetupLog(format!("Deno: ОШИБКА {e}")));
+                        let _ = tx.send(Msg::SetupLog(tr_format!(
+                            "Deno: ERROR {e}",
+                            "Deno: ОШИБКА {e}"
+                        )));
                         ok = false;
                     }
                 }
             } else {
-                let _ = tx.send(Msg::SetupLog("Не удалось создать папку bin".to_string()));
+                let _ = tx.send(Msg::SetupLog(
+                    tr!(
+                        "Could not create the bin folder",
+                        "Не удалось создать папку bin"
+                    )
+                    .to_string(),
+                ));
             }
             // Re-discover in THIS thread: Toolchain::discover() walks PATH and
             // the WinGet dirs, and doing that on the UI thread froze the
@@ -2261,7 +2421,7 @@ impl SnatchApp {
             let label = j.label.clone();
             self.set_status(
                 StatusKind::Warn,
-                format!("«{}»: останавливаю…", clip(&label, 60)),
+                tr_format!("“{}”: stopping…", "«{}»: останавливаю…", clip(&label, 60)),
             );
         }
     }
@@ -2278,7 +2438,7 @@ impl SnatchApp {
             let label = j.label.clone();
             self.set_status(
                 StatusKind::None,
-                format!("«{}»: ставлю на паузу…", clip(&label, 60)),
+                tr_format!("“{}”: pausing…", "«{}»: ставлю на паузу…", clip(&label, 60)),
             );
         }
     }
@@ -2290,7 +2450,7 @@ impl SnatchApp {
             j.cancelled = true;
             j.cancel_flag.store(true, Ordering::SeqCst);
         }
-        self.set_status(StatusKind::Warn, "Останавливаю…");
+        self.set_status(StatusKind::Warn, tr!("Stopping…", "Останавливаю…"));
     }
 
     fn found_tools_line(&self) -> String {
@@ -2304,7 +2464,32 @@ impl SnatchApp {
         if found.is_empty() {
             String::new()
         } else {
-            format!("$ найдены: {}", found.join(", "))
+            tr_format!("$ found: {}", "$ найдены: {}", found.join(", "))
+        }
+    }
+
+    fn ui_language_button(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, size: [f32; 2]) {
+        if ui
+            .add_sized(size, egui::Button::new(tr!("RU", "EN")).frame(false))
+            .on_hover_text(tr!("Switch to Russian", "Переключить на английский"))
+            .clicked()
+        {
+            let language = match self.cfg.language {
+                Language::En => Language::Ru,
+                Language::Ru => Language::En,
+            };
+            self.cfg.set_language(language);
+            i18n::set_language(language);
+            if !self.save_config() {
+                self.set_status(
+                    StatusKind::Warn,
+                    tr!(
+                        "Language was not saved — see log",
+                        "Язык не сохранён — см. журнал"
+                    ),
+                );
+            }
+            ctx.request_repaint();
         }
     }
 
@@ -2325,7 +2510,7 @@ impl SnatchApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let title_width =
-                        (ui.available_width() - 3.0 * 40.0 - THEME_BTN_WIDTH).max(0.0);
+                        (ui.available_width() - 3.0 * 40.0 - THEME_BTN_WIDTH - 40.0).max(0.0);
                     let (rect, drag) = ui.allocate_exact_size(
                         egui::vec2(title_width, 42.0),
                         egui::Sense::click_and_drag(),
@@ -2353,10 +2538,11 @@ impl SnatchApp {
                     // every other Russian label in the app already. Label
                     // names the mode a click switches *to* (dark is too dark
                     // to read outdoors in daylight, this is the way out).
+                    self.ui_language_button(ui, ctx, [40.0, 38.0]);
                     let label = if self.dark_mode {
-                        "день"
+                        tr!("light", "день")
                     } else {
-                        "ночь"
+                        tr!("dark", "ночь")
                     };
                     if ui
                         .add_sized(
@@ -2364,9 +2550,9 @@ impl SnatchApp {
                             egui::Button::new(label).frame(false),
                         )
                         .on_hover_text(if self.dark_mode {
-                            "Светлая тема"
+                            tr!("Light theme", "Светлая тема")
                         } else {
-                            "Тёмная тема"
+                            tr!("Dark theme", "Тёмная тема")
                         })
                         .clicked()
                     {
@@ -2374,14 +2560,14 @@ impl SnatchApp {
                     }
                     if ui
                         .add_sized([40.0, 38.0], egui::Button::new("─").frame(false))
-                        .on_hover_text("Свернуть")
+                        .on_hover_text(tr!("Minimize", "Свернуть"))
                         .clicked()
                     {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                     }
                     if ui
                         .add_sized([40.0, 38.0], egui::Button::new("□").frame(false))
-                        .on_hover_text("Развернуть / восстановить")
+                        .on_hover_text(tr!("Maximize / restore", "Развернуть / восстановить"))
                         .clicked()
                     {
                         self.maximized =
@@ -2390,7 +2576,7 @@ impl SnatchApp {
                     }
                     if ui
                         .add_sized([40.0, 38.0], egui::Button::new("×").frame(false))
-                        .on_hover_text("Закрыть")
+                        .on_hover_text(tr!("Close", "Закрыть"))
                         .clicked()
                     {
                         self.cancel_torrent_pick();
@@ -2475,7 +2661,7 @@ impl SnatchApp {
     }
 
     fn ui_url_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        tag_label(ui, "ссылка");
+        tag_label(ui, tr!("link", "ссылка"));
         let mut toggle_hist = false;
         #[cfg(windows)]
         let mut pick_torrent = false;
@@ -2487,15 +2673,21 @@ impl SnatchApp {
                 // broken". The window opens anyway and explains itself.
                 if ui
                     .add_enabled(self.phase != Phase::Setup, egui::Button::new("▾"))
-                    .on_hover_text("Последние ссылки")
+                    .on_hover_text(tr!("Recent links", "Последние ссылки"))
                     .clicked()
                 {
                     toggle_hist = true;
                 }
                 #[cfg(windows)]
                 if ui
-                    .add_enabled(self.phase != Phase::Setup, egui::Button::new("файл"))
-                    .on_hover_text("Выбрать локальный .torrent-файл")
+                    .add_enabled(
+                        self.phase != Phase::Setup,
+                        egui::Button::new(tr!("file", "файл")),
+                    )
+                    .on_hover_text(tr!(
+                        "Choose a local .torrent file",
+                        "Выбрать локальный .torrent-файл"
+                    ))
                     .clicked()
                 {
                     pick_torrent = true;
@@ -2506,7 +2698,10 @@ impl SnatchApp {
                     // Default TextEdit margin is (4,2) - the mockup's inputs
                     // use `padding: 9px 11px`, noticeably roomier.
                     .margin(egui::Margin::symmetric(11.0, 9.0))
-                    .hint_text("https://… magnet:… или путь к .torrent");
+                    .hint_text(tr!(
+                        "https://… magnet:… or a .torrent path",
+                        "https://… magnet:… или путь к .torrent"
+                    ));
                 // Stays enabled while a job is Running (not just Idle): a
                 // queue means the next link can be typed/pasted without
                 // waiting for the active download to finish.
@@ -2516,7 +2711,10 @@ impl SnatchApp {
         #[cfg(windows)]
         if pick_torrent {
             if let Some(path) = rfd::FileDialog::new()
-                .add_filter("Торренты и металинки", &["torrent", "metalink", "meta4"])
+                .add_filter(
+                    tr!("Torrents and metalinks", "Торренты и металинки"),
+                    &["torrent", "metalink", "meta4"],
+                )
                 .pick_file()
             {
                 self.set_torrent_file(&path);
@@ -2529,13 +2727,16 @@ impl SnatchApp {
             let urls: Vec<String> = self.cfg.urls.iter().take(8).cloned().collect();
             let mut picked = None;
             let mut open = true;
-            let window = egui::Window::new(window_title("Последние ссылки"))
+            let window = egui::Window::new(window_title(tr!("Recent links", "Последние ссылки")))
                 .open(&mut open)
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 120.0])
                 .show(ctx, |ui| {
                     if urls.is_empty() {
-                        ui.weak("(история пуста — ссылки появятся после успешных скачиваний)");
+                        ui.weak(tr!(
+                            "(history is empty — links appear after successful downloads)",
+                            "(история пуста — ссылки появятся после успешных скачиваний)"
+                        ));
                     }
                     for u in &urls {
                         if ui.selectable_label(false, clip(u, 64)).clicked() {
@@ -2561,12 +2762,18 @@ impl SnatchApp {
         let enabled = self.phase != Phase::Setup;
         let mut dir_history_opened = false;
         ui.add_space(6.0);
-        tag_label(ui, "движок");
+        tag_label(ui, tr!("engine", "движок"));
         ui.horizontal(|ui| {
             let buttons = ui.add_enabled_ui(enabled, |ui| {
                 // Flat "● label" / "○ label" - see engine_choice's doc comment
                 // for why this replaced both radio_value and selectable_value.
-                if engine_choice(ui, "авто", self.engine_mode == EngineMode::Auto).clicked() {
+                if engine_choice(
+                    ui,
+                    tr!("auto", "авто"),
+                    self.engine_mode == EngineMode::Auto,
+                )
+                .clicked()
+                {
                     self.engine_mode = EngineMode::Auto;
                 }
                 if engine_choice(ui, "yt-dlp", self.engine_mode == EngineMode::YtDlp).clicked() {
@@ -2606,24 +2813,24 @@ impl SnatchApp {
         });
         let engine = self.effective_engine();
         ui.add_space(6.0);
-        tag_label(ui, "формат");
+        tag_label(ui, tr!("format", "формат"));
         ui.add_enabled_ui(enabled && engine == "yt-dlp", |ui| {
             egui::ComboBox::from_id_salt("fmt")
                 .selected_text(
-                    FORMATS
+                    formats()
                         .iter()
                         .find(|(k, _)| *k == self.fmt)
                         .map(|(_, l)| *l)
                         .unwrap_or("best"),
                 )
                 .show_ui(ui, |ui| {
-                    for (key, label) in FORMATS {
+                    for (key, label) in formats() {
                         ui.selectable_value(&mut self.fmt, key.to_string(), label);
                     }
                 });
         });
         ui.add_space(6.0);
-        tag_label(ui, "папка");
+        tag_label(ui, tr!("folder", "папка"));
         ui.horizontal(|ui| {
             let mut open_browser = false;
             let mut toggle_hist = false;
@@ -2632,14 +2839,17 @@ impl SnatchApp {
                 // like a dead button.
                 if ui
                     .add_enabled(enabled, egui::Button::new("▾"))
-                    .on_hover_text("Последние папки")
+                    .on_hover_text(tr!("Recent folders", "Последние папки"))
                     .clicked()
                 {
                     toggle_hist = true;
                 }
                 if ui
-                    .add_enabled(enabled, egui::Button::new("обзор"))
-                    .on_hover_text("Выбрать папку для скачивания")
+                    .add_enabled(enabled, egui::Button::new(tr!("browse", "обзор")))
+                    .on_hover_text(tr!(
+                        "Choose a download folder",
+                        "Выбрать папку для скачивания"
+                    ))
                     .clicked()
                 {
                     open_browser = true;
@@ -2674,13 +2884,16 @@ impl SnatchApp {
         let dirs: Vec<String> = self.cfg.dirs.iter().take(8).cloned().collect();
         let mut picked = None;
         let mut open = true;
-        let window = egui::Window::new(window_title("Последние папки"))
+        let window = egui::Window::new(window_title(tr!("Recent folders", "Последние папки")))
             .open(&mut open)
             .resizable(false)
             .anchor(egui::Align2::CENTER_TOP, [0.0, 200.0])
             .show(ctx, |ui| {
                 if dirs.is_empty() {
-                    ui.weak("(история пуста — папки появятся после успешных скачиваний)");
+                    ui.weak(tr!(
+                        "(history is empty — folders appear after successful downloads)",
+                        "(история пуста — папки появятся после успешных скачиваний)"
+                    ));
                 }
                 for d in &dirs {
                     if ui.selectable_label(false, clip(d, 64)).clicked() {
@@ -2713,7 +2926,7 @@ impl SnatchApp {
             self.log_cache_rev = self.log_rev;
         }
         let mut open = true;
-        let window = egui::Window::new(window_title("Журнал"))
+        let window = egui::Window::new(window_title(tr!("Log", "Журнал")))
             .open(&mut open)
             .resizable(true)
             .default_size([560.0, 320.0])
@@ -2748,7 +2961,10 @@ impl SnatchApp {
         if is_unc_path(&typed) {
             self.set_status(
                 StatusKind::Err,
-                "Сетевую UNC-папку нельзя открывать. Выберите локальную папку.",
+                tr!(
+                    "Cannot open a network UNC folder. Choose a local folder.",
+                    "Сетевую UNC-папку нельзя открывать. Выберите локальную папку."
+                ),
             );
             return;
         }
@@ -2828,20 +3044,20 @@ impl SnatchApp {
         let home = home_dir().unwrap_or_default();
         let drives = self.drives.clone();
 
-        let window = egui::Window::new(window_title("Выбор папки"))
+        let window = egui::Window::new(window_title(tr!("Choose folder", "Выбор папки")))
             .open(&mut still_open)
             .resizable(true)
             .default_size([480.0, 440.0])
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .show(ctx, |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.button("Дом").clicked() {
+                    if ui.button(tr!("Home", "Дом")).clicked() {
                         navigate = Some(home.clone());
                     }
-                    if ui.button("Рабочий стол").clicked() {
+                    if ui.button(tr!("Desktop", "Рабочий стол")).clicked() {
                         navigate = Some(home.join("Desktop"));
                     }
-                    if ui.button("Загрузки").clicked() {
+                    if ui.button(tr!("Downloads", "Загрузки")).clicked() {
                         navigate = Some(home.join("Downloads"));
                     }
                     for d in &drives {
@@ -2864,7 +3080,7 @@ impl SnatchApp {
                     .auto_shrink([false, false])
                     .show_terminal(ui, |ui| {
                         if let Some(parent) = cur.parent() {
-                            if ui.selectable_label(false, "↑ Наверх").clicked() {
+                            if ui.selectable_label(false, tr!("↑ Parent folder", "↑ Наверх")).clicked() {
                                 navigate = Some(parent.to_path_buf());
                             }
                         }
@@ -2876,24 +3092,22 @@ impl SnatchApp {
                             }
                         }
                         if loading {
-                            slow_spinner(ui); ui.weak("Читаю каталог…");
+                            slow_spinner(ui); ui.weak(tr!("Reading folder…", "Читаю каталог…"));
                         } else if let Some(error) = &error {
-                            ui.colored_label(ui.visuals().error_fg_color, format!("Не удалось прочитать каталог: {error}"));
+                            ui.colored_label(ui.visuals().error_fg_color, tr_format!("Could not read folder: {error}", "Не удалось прочитать каталог: {error}"));
                         } else if entries.is_empty() {
                             if truncated {
-                                ui.weak(format!(
-                                    "… среди первых {DIR_BROWSER_SCAN_CAP} записей вложенных папок нет"
+                                ui.weak(tr_format!("… no subfolders among the first {DIR_BROWSER_SCAN_CAP} entries", "… среди первых {DIR_BROWSER_SCAN_CAP} записей вложенных папок нет"
                                 ));
                             } else {
-                                ui.weak("(нет вложенных папок)");
+                                ui.weak(tr!("(no subfolders)", "(нет вложенных папок)"));
                             }
                         } else if truncated {
                             // The scan stopped at DIR_BROWSER_SCAN_CAP: the
                             // tail is simply not listed, no navigation
                             // reveals it - say so instead of pretending the
                             // list is complete.
-                            ui.weak(format!(
-                                "… каталог очень большой: из первых {DIR_BROWSER_SCAN_CAP} записей \
+                            ui.weak(tr_format!("… this folder is very large: showing the first {shown} subfolders among {DIR_BROWSER_SCAN_CAP} entries — choose a subfolder or reopen the folder", "… каталог очень большой: из первых {DIR_BROWSER_SCAN_CAP} записей \
                                  показаны первые {shown} папок — выберите подпапку или откройте \
                                  папку заново"
                             ));
@@ -2901,8 +3115,7 @@ impl SnatchApp {
                             // The old "поднимитесь выше" advice was a lie:
                             // the list is alphabetical and the tail is simply
                             // never rendered, no navigation reveals it.
-                            ui.weak(format!(
-                                "… показаны первые {shown} папок по алфавиту (всего {})",
+                            ui.weak(tr_format!("… showing the first {shown} folders alphabetically ({} total)", "… показаны первые {shown} папок по алфавиту (всего {})",
                                 entries.len()
                             ));
                         }
@@ -2915,10 +3128,10 @@ impl SnatchApp {
                     // easy to navigate somewhere and not notice you still
                     // had to confirm.
                     let accent = ui.visuals().hyperlink_color;
-                    if ui.add_enabled(!loading && error.is_none(), accent_button(accent, "Выбрать эту папку")).clicked() {
+                    if ui.add_enabled(!loading && error.is_none(), accent_button(accent, tr!("Choose this folder", "Выбрать эту папку"))).clicked() {
                         chosen = Some(cur.clone());
                     }
-                    if ui.button("Отмена").clicked() {
+                    if ui.button(tr!("Cancel", "Отмена")).clicked() {
                         cancel_clicked = true;
                     }
                 });
@@ -2955,7 +3168,10 @@ impl SnatchApp {
         let yt = engine == "yt-dlp";
         ui.add_enabled_ui(self.phase != Phase::Setup && yt, |ui| {
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.use_cookies, "куки из браузера");
+                ui.checkbox(
+                    &mut self.use_cookies,
+                    tr!("browser cookies", "куки из браузера"),
+                );
                 ui.add_enabled_ui(self.use_cookies, |ui| {
                     egui::ComboBox::from_id_salt("browser")
                         .selected_text(self.cookies_browser.clone())
@@ -2974,27 +3190,36 @@ impl SnatchApp {
         let enabled = self.phase != Phase::Setup;
         let engine = self.effective_engine();
         ui.add_space(6.0);
-        tag_label(ui, "опции");
+        tag_label(ui, tr!("options", "опции"));
         ui.horizontal(|ui| {
             ui.add_enabled_ui(enabled && engine == "yt-dlp", |ui| {
-                ui.checkbox(&mut self.subs, "субтитры")
-                    .on_hover_text("Скачивать субтитры (ручные и автоматические) рядом с видео");
+                ui.checkbox(&mut self.subs, tr!("subtitles", "субтитры"))
+                    .on_hover_text(tr!(
+                        "Download manual and automatic subtitles alongside the video",
+                        "Скачивать субтитры (ручные и автоматические) рядом с видео"
+                    ));
                 if self.subs {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.sub_langs)
                             .font(field_font())
                             .desired_width(70.0),
                     )
-                    .on_hover_text("Языки субтитров, например ru,en");
+                    .on_hover_text(tr!(
+                        "Subtitle languages, e.g. ru,en",
+                        "Языки субтитров, например ru,en"
+                    ));
                 }
             });
             ui.add_enabled_ui(enabled, |ui| {
-                ui.checkbox(&mut self.playlist, "плейлист")
-                    .on_hover_text("Скачать плейлист целиком, а не одиночное видео");
+                ui.checkbox(&mut self.playlist, tr!("playlist", "плейлист"))
+                    .on_hover_text(tr!(
+                        "Download the entire playlist instead of a single video",
+                        "Скачать плейлист целиком, а не одиночное видео"
+                    ));
             });
         });
         ui.add_enabled_ui(enabled, |ui| {
-            ui.collapsing("доп. аргументы", |ui| {
+            ui.collapsing(tr!("extra arguments", "доп. аргументы"), |ui| {
                 ui.horizontal(|ui| {
                     ui.label("yt-dlp");
                     ui.add(
@@ -3036,10 +3261,13 @@ impl SnatchApp {
                     .size(12.0)
                     .color(accent),
             );
-            let waiting = if aj.status.starts_with("Получаю метаданные") {
-                "Метаданные торрента…"
+            // A running job can retain a status written before a language switch.
+            let waiting = if aj.status.starts_with("Fetching metadata")
+                || aj.status.starts_with("Получаю метаданные")
+            {
+                tr!("Torrent metadata…", "Метаданные торрента…")
             } else {
-                "Подключение…"
+                tr!("Connecting…", "Подключение…")
             };
             let (pause, cancel) = job_controls(
                 ui,
@@ -3047,8 +3275,8 @@ impl SnatchApp {
                 accent,
                 false,
                 waiting,
-                ("пауза", ACTIVE_BTN_W),
-                ("отмена", ACTIVE_BTN_W),
+                (tr!("pause", "пауза"), ACTIVE_BTN_W),
+                (tr!("cancel", "отмена"), ACTIVE_BTN_W),
             );
             if pause {
                 pause_id = Some(aj.id);
@@ -3092,8 +3320,8 @@ impl SnatchApp {
                 warn,
                 true,
                 "",
-                ("продолжить", RESUME_BTN_W),
-                ("убрать", REMOVE_BTN_W),
+                (tr!("resume", "продолжить"), RESUME_BTN_W),
+                (tr!("remove", "убрать"), REMOVE_BTN_W),
             );
             if resume {
                 resume_idx = Some(i);
@@ -3113,7 +3341,13 @@ impl SnatchApp {
                 // Resuming during setup would start a loader while the
                 // installer is replacing the same binaries (start_setup
                 // clears retry_offer for this exact hazard).
-                self.set_status(StatusKind::Err, "Дождитесь установки загрузчиков");
+                self.set_status(
+                    StatusKind::Err,
+                    tr!(
+                        "Wait for tool installation to finish",
+                        "Дождитесь установки загрузчиков"
+                    ),
+                );
             } else {
                 let pj = self.paused.remove(i);
                 resumed_row = Some(i);
@@ -3125,7 +3359,10 @@ impl SnatchApp {
                     let started =
                         self.spawn_job(ctx, pj.job.clone(), pj.no_continue, pj.select.clone());
                     if started {
-                        self.set_status(StatusKind::None, format!("«{}»: продолжаю…", pj.label));
+                        self.set_status(
+                            StatusKind::None,
+                            tr_format!("“{}”: resuming…", "«{}»: продолжаю…", pj.label),
+                        );
                     } else {
                         self.paused.insert(i, pj);
                         resumed_row = None;
@@ -3141,7 +3378,11 @@ impl SnatchApp {
                     });
                     self.set_status(
                         StatusKind::None,
-                        format!("Добавлено в очередь ({})", self.queue.len()),
+                        tr_format!(
+                            "Added to queue ({})",
+                            "Добавлено в очередь ({})",
+                            self.queue.len()
+                        ),
                     );
                 }
             }
@@ -3156,7 +3397,8 @@ impl SnatchApp {
             };
             if resume_idx != Some(i) && idx < self.paused.len() {
                 let pj = self.paused.remove(idx);
-                if self.status == format!("«{}» на паузе", pj.label) {
+                if self.status == tr_format!("“{}” paused", "«{}» на паузе", pj.label)
+                {
                     self.set_status(StatusKind::None, "");
                 }
             }
@@ -3179,9 +3421,12 @@ impl SnatchApp {
             let mut cancel = false;
             ui.horizontal(|ui| {
                 slow_spinner(ui);
-                ui.weak("получаю список файлов торрента…");
+                ui.weak(tr!(
+                    "fetching torrent file list…",
+                    "получаю список файлов торрента…"
+                ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    cancel = ui.button("[ отмена ]").clicked();
+                    cancel = ui.button(tr!("[ cancel ]", "[ отмена ]")).clicked();
                 });
             });
             if cancel {
@@ -3219,9 +3464,9 @@ impl SnatchApp {
         // look is "▶ СКАЧАТЬ", not "▶ скачать". Mockup's `.cta` is
         // `font: 600 13px` - 16.0 here was never actually checked against it.
         let label = if self.jobs.len() < MAX_CONCURRENT {
-            "▶ СКАЧАТЬ"
+            tr!("▶ DOWNLOAD", "▶ СКАЧАТЬ")
         } else {
-            "+ В ОЧЕРЕДЬ"
+            tr!("+ ADD TO QUEUE", "+ В ОЧЕРЕДЬ")
         };
         let cta = egui::Button::new(egui::RichText::new(label).color(accent).size(13.0))
             .stroke(egui::Stroke::new(1.0_f32, accent))
@@ -3238,7 +3483,7 @@ impl SnatchApp {
     fn ui_queue_count(&self, ui: &mut egui::Ui) {
         if !self.queue.is_empty() {
             ui.add_space(4.0);
-            ui.weak(format!("В очереди: {}", self.queue.len()));
+            ui.weak(tr_format!("Queued: {}", "В очереди: {}", self.queue.len()));
         }
     }
 
@@ -3261,7 +3506,13 @@ impl SnatchApp {
         // Never start aria2c while the installer is replacing it: keep the
         // pick open and say why.
         if (act.confirm || act.download_all) && self.phase == Phase::Setup {
-            pick.hint = Some("Дождитесь установки загрузчиков".into());
+            pick.hint = Some(
+                tr!(
+                    "Wait for tool installation to finish",
+                    "Дождитесь установки загрузчиков"
+                )
+                .into(),
+            );
             return;
         }
         if act.confirm {
@@ -3274,7 +3525,8 @@ impl SnatchApp {
                 .collect();
             let every = chosen.len() == pick.selected.len();
             if chosen.is_empty() {
-                pick.hint = Some("Выберите хотя бы один файл".into());
+                pick.hint =
+                    Some(tr!("Select at least one file", "Выберите хотя бы один файл").into());
                 return;
             }
             // Refuse a too-scattered selection here, while it can be changed,
@@ -3304,7 +3556,10 @@ impl SnatchApp {
                 self.url = job.url;
             }
         }
-        self.set_status(StatusKind::None, "Выбор файлов отменён");
+        self.set_status(
+            StatusKind::None,
+            tr!("File selection canceled", "Выбор файлов отменён"),
+        );
     }
 }
 
@@ -3391,7 +3646,9 @@ impl eframe::App for SnatchApp {
                     |ui| {
             egui::ScrollArea::vertical().auto_shrink([false, false]).show_terminal(ui, |ui| {
             #[cfg(not(windows))]
-            if ui.button(if self.dark_mode { "Светлая тема" } else { "Тёмная тема" }).clicked() {
+            self.ui_language_button(ui, ctx, [40.0, 24.0]);
+            #[cfg(not(windows))]
+            if ui.button(if self.dark_mode { tr!("Light theme", "Светлая тема") } else { tr!("Dark theme", "Тёмная тема") }).clicked() {
                 self.toggle_theme(ctx);
             }
             ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
@@ -3467,15 +3724,15 @@ impl eframe::App for SnatchApp {
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
                     if cfg!(windows) {
-                        format!("Не найдены загрузчики: {} — могу скачать их сам.", missing.join(", "))
+                        tr_format!("Downloaders not found: {} — I can install them.", "Не найдены загрузчики: {} — могу скачать их сам.", missing.join(", "))
                     } else {
-                        format!("Не найдены загрузчики: {} — установите их вручную.", missing.join(", "))
+                        tr_format!("Downloaders not found: {} — install them manually.", "Не найдены загрузчики: {} — установите их вручную.", missing.join(", "))
                     },
                 );
                 if cfg!(windows) && ui
                     .add_enabled(
                         self.phase != Phase::Setup && self.jobs.is_empty() && self.torrent_pick.is_none(),
-                        egui::Button::new("установить загрузчики"),
+                        egui::Button::new(tr!("install tools", "установить загрузчики")),
                     )
                     .clicked()
                 {
@@ -3494,8 +3751,8 @@ impl eframe::App for SnatchApp {
                             // .small() dropped it to the Small style and made
                             // the button visibly smaller than the HTML one.
                             .add_enabled(self.phase != Phase::Setup && self.jobs.is_empty() && self.torrent_pick.is_none(),
-                                egui::Button::new("обновить").wrap_mode(egui::TextWrapMode::Extend))
-                            .on_hover_text("Перескачать свежие yt-dlp и aria2c")
+                                egui::Button::new(tr!("update", "обновить")).wrap_mode(egui::TextWrapMode::Extend))
+                            .on_hover_text(tr!("Download the latest yt-dlp and aria2c", "Перескачать свежие yt-dlp и aria2c"))
                             .clicked()
                         {
                             self.start_setup(ctx);
@@ -3542,9 +3799,9 @@ impl eframe::App for SnatchApp {
                 ui.add_space(6.0);
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    "Похоже, сайту нужна авторизация (бот-детект или возрастные ограничения).",
+                    tr!("This site may require sign-in (bot detection or age restrictions).", "Похоже, сайту нужна авторизация (бот-детект или возрастные ограничения)."),
                 );
-                if ui.button("Повторить с куками из браузера").clicked() {
+                if ui.button(tr!("Retry with browser cookies", "Повторить с куками из браузера")).clicked() {
                     // One-shot: retry with cookies without flipping the
                     // persistent checkbox. A single (possibly provoked) 403
                     // shouldn't silently opt every future download into
@@ -3568,7 +3825,7 @@ impl eframe::App for SnatchApp {
             ui.add_space(14.0);
             if ui
                 .add(
-                    egui::Button::new(egui::RichText::new("▸ журнал").color(ui.visuals().weak_text_color()))
+                    egui::Button::new(egui::RichText::new(tr!("▸ log", "▸ журнал")).color(ui.visuals().weak_text_color()))
                         .frame(false),
                 )
                 .clicked()
@@ -3656,8 +3913,11 @@ fn main() -> eframe::Result {
     // panics instead of dying silently without a console.
     std::panic::set_hook(Box::new(|info| {
         fatal_dialog(
-            "SNATCH — внутренняя ошибка",
-            &format!("SNATCH не смог продолжить работу.\n\n{info}"),
+            tr!("SNATCH — internal error", "SNATCH — внутренняя ошибка"),
+            &tr_format!(
+                "SNATCH could not continue.\n\n{info}",
+                "SNATCH не смог продолжить работу.\n\n{info}"
+            ),
         );
     }));
 
@@ -3683,9 +3943,8 @@ fn main() -> eframe::Result {
     );
     if let Err(e) = &result {
         fatal_dialog(
-            "SNATCH — не удалось открыть окно",
-            &format!(
-                "Причина: {e}\n\nНа виртуальной машине или в RDP-сеансе это обычно означает, \
+            tr!("SNATCH — could not open window", "SNATCH — не удалось открыть окно"),
+            &tr_format!("Reason: {e}\n\nIn a virtual machine or RDP session, OpenGL 2.1+ may be unavailable. Enable 3D acceleration in your VM settings or run SNATCH on a regular desktop.\n\nThe CLI (snatch.exe) does not require graphics.", "Причина: {e}\n\nНа виртуальной машине или в RDP-сеансе это обычно означает, \
                  что недоступен OpenGL 2.1+. Включите 3D-ускорение в настройках ВМ либо \
                  запустите программу на обычном рабочем столе.\n\n\
                  CLI-версия (snatch.exe) от графики не зависит и работает всегда."
@@ -3755,7 +4014,10 @@ mod tests {
         }
         assert_eq!(
             setup_progress_text(None),
-            "скачиваю yt-dlp, aria2c, ffmpeg и Deno…"
+            tr!(
+                "downloading yt-dlp, aria2c, ffmpeg and Deno…",
+                "скачиваю yt-dlp, aria2c, ffmpeg и Deno…"
+            )
         );
     }
 
@@ -3828,7 +4090,7 @@ mod tests {
         assert_eq!(app.paused.len(), 1);
         assert_eq!(app.paused[0].job.url, job.url);
         assert!(app.paused[0].no_continue);
-        assert!(!app.status.contains("повторяю с начала"));
+        assert!(!app.status.contains("restarting from scratch"));
         assert!(matches!(app.status_kind, StatusKind::Err));
     }
 
@@ -3982,13 +4244,32 @@ mod tests {
                 let green = ui.visuals().hyperlink_color;
                 let yellow = ui.visuals().warn_fg_color;
                 for (progress, paused, fill, labels) in [
-                    (Some(0.3), false, green, (("пауза", 86.0), ("отмена", 86.0))),
-                    (None, false, green, (("пауза", 86.0), ("отмена", 86.0))),
+                    (
+                        Some(0.3),
+                        false,
+                        green,
+                        (
+                            (tr!("pause", "пауза"), 86.0),
+                            (tr!("cancel", "отмена"), 86.0),
+                        ),
+                    ),
+                    (
+                        None,
+                        false,
+                        green,
+                        (
+                            (tr!("pause", "пауза"), 86.0),
+                            (tr!("cancel", "отмена"), 86.0),
+                        ),
+                    ),
                     (
                         Some(0.3),
                         true,
                         yellow,
-                        (("продолжить", 100.0), ("убрать", 72.0)),
+                        (
+                            (tr!("resume", "продолжить"), 100.0),
+                            (tr!("remove", "убрать"), 72.0),
+                        ),
                     ),
                 ] {
                     let top = ui.cursor().top();
@@ -3997,7 +4278,7 @@ mod tests {
                         progress,
                         fill,
                         paused,
-                        "Подключение…",
+                        tr!("Connecting…", "Подключение…"),
                         labels.0,
                         labels.1,
                     );
@@ -4151,7 +4432,13 @@ mod tests {
             };
         check("list", frame(&mut pick), 4);
         pick.info = None;
-        pick.error = Some("не удалось получить метаданные торрента (таймаут)".into());
+        pick.error = Some(
+            tr!(
+                "could not fetch torrent metadata (timeout)",
+                "не удалось получить метаданные торрента (таймаут)"
+            )
+            .into(),
+        );
         check("error", frame(&mut pick), 2);
     }
 

@@ -1,3 +1,4 @@
+use crate::{tr, tr_format};
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 
@@ -37,7 +38,10 @@ pub(crate) fn read_capped(p: &Path, max: u64) -> std::io::Result<Option<String>>
     if !meta.is_file() || meta.len() > max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "config.json не обычный файл или превышает лимит размера",
+            tr!(
+                "config.json is not a regular file or exceeds the size limit",
+                "config.json не обычный файл или превышает лимит размера"
+            ),
         ));
     }
     let mut text = String::new();
@@ -45,7 +49,10 @@ pub(crate) fn read_capped(p: &Path, max: u64) -> std::io::Result<Option<String>>
     if text.len() as u64 > max {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "config.json превышает лимит размера",
+            tr!(
+                "config.json exceeds the size limit",
+                "config.json превышает лимит размера"
+            ),
         ));
     }
     Ok(Some(text))
@@ -75,7 +82,10 @@ pub(crate) fn open_lock_file(path: &Path, create: bool) -> std::io::Result<std::
     if !file.metadata()?.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "файл блокировки не является обычным файлом",
+            tr!(
+                "lock file is not a regular file",
+                "файл блокировки не является обычным файлом"
+            ),
         ));
     }
     Ok(file)
@@ -93,7 +103,10 @@ fn lock_within(file: &std::fs::File, wait: std::time::Duration) -> std::io::Resu
             Err(fs4::TryLockError::WouldBlock) => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
-                    "config.lock занят другим окном SNATCH",
+                    tr!(
+                        "config.lock is in use by another SNATCH window",
+                        "config.lock занят другим окном SNATCH"
+                    ),
                 ));
             }
             Err(fs4::TryLockError::Error(e)) => return Err(e),
@@ -144,11 +157,16 @@ fn config_dir_from(
     if let Some(home) = local_base(home) {
         return Ok(home.join(".config").join("snatch"));
     }
-    Err("Нет безопасной папки настроек: задайте локальный LOCALAPPDATA, XDG_CONFIG_HOME или HOME/USERPROFILE. Общая временная папка не используется.".into())
+    Err(tr!("No safe settings folder: set a local LOCALAPPDATA, XDG_CONFIG_HOME or HOME/USERPROFILE. Shared temporary folders are not used.", "Нет безопасной папки настроек: задайте локальный LOCALAPPDATA, XDG_CONFIG_HOME или HOME/USERPROFILE. Общая временная папка не используется.").into())
 }
 
 #[derive(Serialize)]
 pub struct Config {
+    #[serde(flatten)]
+    additional: serde_json::Map<String, Value>,
+    pub language: crate::i18n::Language,
+    #[serde(skip)]
+    language_dirty: Cell<bool>,
     pub default_dir: String,
     pub last_dir: String,
     pub urls: Vec<String>,
@@ -200,7 +218,27 @@ fn bool_field(obj: Option<&serde_json::Map<String, Value>>, key: &str, default: 
 
 pub fn sanitize(data: &Value) -> Config {
     let obj = data.as_object();
+    let mut additional = obj.cloned().unwrap_or_default();
+    for key in [
+        "default_dir",
+        "last_dir",
+        "urls",
+        "dirs",
+        "history_epoch",
+        "dark_mode",
+        "language",
+    ] {
+        additional.remove(key);
+    }
+    let language = obj
+        .and_then(|o| o.get("language"))
+        .and_then(Value::as_str)
+        .and_then(|s| crate::i18n::Language::parse(s).ok())
+        .unwrap_or_default();
     Config {
+        additional,
+        language,
+        language_dirty: Cell::new(false),
         default_dir: str_field(obj, "default_dir"),
         last_dir: str_field(obj, "last_dir"),
         urls: list_field(obj, "urls"),
@@ -267,14 +305,25 @@ fn merge_history(local: &[String], disk: &[String], same_epoch: bool, dirty: boo
 }
 
 impl Config {
+    /// Explicit changes win; unrelated saves retain a newer disk preference.
+    pub fn set_language(&mut self, language: crate::i18n::Language) {
+        self.language = language;
+        self.language_dirty.set(true);
+    }
+
     pub fn path() -> Result<PathBuf, String> {
         config_dir().map(|p| p.join("config.json"))
     }
 
     pub fn try_load() -> Result<Config, String> {
         let path = Self::path()?;
-        Self::load_checked(&path)
-            .map_err(|e| format!("Не удалось прочитать настройки {}: {e}", path.display()))
+        Self::load_checked(&path).map_err(|e| {
+            tr_format!(
+                "Could not read settings {}: {e}",
+                "Не удалось прочитать настройки {}: {e}",
+                path.display()
+            )
+        })
     }
 
     pub fn load() -> Config {
@@ -291,7 +340,8 @@ impl Config {
         match Self::load_checked(p) {
             Ok(cfg) => cfg,
             Err(e) => {
-                crate::errln(format!(
+                crate::errln(tr_format!(
+                    "⚠ Could not read settings {}: {e}; the file was left unchanged",
                     "⚠ Не удалось прочитать настройки {}: {e}; файл сохранён без изменений",
                     p.display()
                 ));
@@ -308,7 +358,10 @@ impl Config {
         if !data.is_object() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "config.json должен содержать JSON-объект",
+                tr!(
+                    "config.json must contain a JSON object",
+                    "config.json должен содержать JSON-объект"
+                ),
             ));
         }
         Ok(Self::with_default_dir(sanitize(&data)))
@@ -330,7 +383,10 @@ impl Config {
 
     pub fn save(&self) {
         if let Err(e) = self.try_save() {
-            crate::errln(format!("⚠ Не удалось сохранить настройки: {e}"));
+            crate::errln(tr_format!(
+                "⚠ Could not save settings: {e}",
+                "⚠ Не удалось сохранить настройки: {e}"
+            ));
         }
     }
 
@@ -357,7 +413,10 @@ impl Config {
 
     fn save_to_within(&self, p: &Path, lock_wait: std::time::Duration) {
         if let Err(e) = self.try_save_to_within(p, lock_wait) {
-            crate::errln(format!("⚠ Не удалось сохранить настройки: {e}"));
+            crate::errln(tr_format!(
+                "⚠ Could not save settings: {e}",
+                "⚠ Не удалось сохранить настройки: {e}"
+            ));
         }
     }
 
@@ -374,6 +433,11 @@ impl Config {
             let lock = open_lock_file(&lock_path, true)?;
             lock_within(&lock, lock_wait)?;
             let disk = Self::load_checked(p)?;
+            let language = if self.language_dirty.get() {
+                self.language
+            } else {
+                disk.language
+            };
             let default_dir = if self.default_dir != *self.default_dir_snapshot.borrow() {
                 self.default_dir.clone()
             } else {
@@ -386,6 +450,9 @@ impl Config {
             };
             let merged = if self.history_cleared.get() {
                 Config {
+                    additional: disk.additional.clone(),
+                    language,
+                    language_dirty: Cell::new(false),
                     default_dir: default_dir.clone(),
                     last_dir: self.last_dir.clone(),
                     urls: self.urls.clone(),
@@ -401,6 +468,9 @@ impl Config {
             } else {
                 let same_epoch = self.history_epoch == disk.history_epoch;
                 Config {
+                    additional: disk.additional.clone(),
+                    language,
+                    language_dirty: Cell::new(false),
                     default_dir: default_dir.clone(),
                     // Like urls/dirs: only a remember_dir() since the last
                     // save may overwrite last_dir. A stale window saving an
@@ -453,6 +523,7 @@ impl Config {
             })
         })();
         if result.is_ok() {
+            self.language_dirty.set(false);
             self.history_cleared.set(false);
             self.url_dirty.set(false);
             self.dir_dirty.set(false);
@@ -867,5 +938,55 @@ mod tests {
         assert_eq!(cfg.urls[1], "magnet:?xt=urn:btih:abc");
         assert_eq!(cfg.urls[0], "https://host.tld?email=a@b");
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod language_persistence_tests {
+    use super::*;
+    use crate::i18n::Language;
+
+    #[test]
+    fn legacy_and_invalid_languages_fall_back_to_english() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({"language": "fr"}),
+            serde_json::json!({"language": 42}),
+        ] {
+            assert_eq!(sanitize(&value).language, Language::En);
+        }
+        assert_eq!(
+            sanitize(&serde_json::json!({"language": "ru"})).language,
+            Language::Ru
+        );
+    }
+
+    #[test]
+    fn stale_window_preserves_language_and_extension_fields() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "snatch-language-config-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("config.json");
+        std::fs::write(&path, r#"{"language":"en","extension_setting":"keep-me"}"#).unwrap();
+        let mut stale = Config::load_from(&path);
+        let mut fresh = Config::load_from(&path);
+        fresh.set_language(Language::Ru);
+        fresh.try_save_to(&path).unwrap();
+        stale.dark_mode = false;
+        stale.try_save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).language, Language::Ru);
+        let raw: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(raw["extension_setting"], "keep-me");
+        // Explicitly selecting the old value must still win over a newer disk value.
+        stale.set_language(Language::En);
+        stale.try_save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path).language, Language::En);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

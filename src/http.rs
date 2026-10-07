@@ -1,4 +1,5 @@
 //! Size-bounded, cancellable HTTP reads for torrent metadata.
+use crate::tr_write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -18,8 +19,8 @@ impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Cancelled => write!(f, "__cancelled__"),
-            Self::Transport(s) => write!(f, "сеть: {s}"),
-            Self::TooLarge => write!(f, "ответ слишком большой"),
+            Self::Transport(s) => tr_write!(f, "network: {s}", "сеть: {s}"),
+            Self::TooLarge => tr_write!(f, "response is too large", "ответ слишком большой"),
         }
     }
 }

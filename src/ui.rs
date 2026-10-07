@@ -1,3 +1,4 @@
+use crate::tr;
 use std::path::{Path, PathBuf};
 
 /// OS drive mask only: never probe every root, including unavailable mappings.
@@ -92,7 +93,10 @@ pub fn try_read_dirs_limited(
     if crate::engines::is_unc_path(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "Сетевая UNC-папка не поддерживается",
+            tr!(
+                "Network UNC folders are not supported",
+                "Сетевая UNC-папка не поддерживается"
+            ),
         ));
     }
     let mut truncated = false;

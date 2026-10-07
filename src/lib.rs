@@ -1,6 +1,7 @@
 pub mod config;
 pub mod engines;
 mod http;
+pub mod i18n;
 pub mod job_object;
 pub mod scrollbar;
 pub mod setup;
@@ -16,7 +17,7 @@ pub const BANNER: &str = r#"
    /\ \L\ \ \ \`\ \ \ \/\ \ \ \ \ \ \ \L\ \\ \ \ \ \
    \ `\____\ \_\ \_\ \_\ \_\ \ \_\ \ \____/ \ \_\ \_\
     \/_____/\/_/\/_/\/_/\/_/  \/_/  \/___/   \/_/\/_/
-                     yt-dlp + aria2c ultimate combine
+                     yt-dlp + aria2c lightweight downloader
                              by rercon prod.
 "#;
 
