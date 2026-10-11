@@ -28,6 +28,16 @@ The `subs` format downloads subtitles only, without the video: manual and automa
 
 When a yt-dlp download fails in a way that cookies usually fix — sign-in and bot checks, age restrictions, HTTP 429 rate limiting — the interactive CLI offers to retry with browser cookies and asks which browser to read them from. The `-y` mode prints a tip instead, since it cannot ask.
 
+## Link detection and formats
+
+SNATCH checks HTTP(S) links without a recognizable file name using response headers and redirects before recommending an engine. Attachments and direct file responses favor aria2, even if the original URL has no extension; links whose path already ends in a known file extension skip the check. The filename comes from a safe `Content-Disposition` name, then the final URL; it is pinned before download so file locks and resume checks use the same name. Discovery uses no browser cookies or response body, has a six-second timeout, follows at most five redirects and retries once on a network failure; a 5xx or 429 answer is treated as "not checked" rather than a verdict, and the CLI says so instead of pretending the guess was verified. If discovery fails, URL-based detection and naming remain the fallback. An explicit `--engine` choice is always respected.
+
+Downloads refused because the stream is DRM-encrypted (the SoundCloud Go+ catalog, the occasional YouTube format) are reported as such: yt-dlp does not remove DRM, so SNATCH does not offer a cookies retry for them. On SoundCloud such tracks expose a plain 30-second preview only, sometimes with a fresh attempt: SNATCH cannot get the full track, and neither can any tool that does not break DRM.
+
+Threads post and share links are handled by a bundled yt-dlp extractor plugin (`plugins/snatch_threads.py`), which SNATCH installs into its own plugin folder and passes via `--plugin-dirs`; yt-dlp's default plugin folders stay disabled. On Windows, Instagram, Threads and their CDN hosts go through yt-dlp as well: aria2c's TLS client cannot complete a handshake with Meta's servers, and if another host turns aria2c away (that TLS error, or HTTP 403/429 that yt-dlp does not get), the job is retried with yt-dlp and the host is remembered for the rest of the run.
+
+The CLI format menu and GUI dropdown offer best-available video and audio extraction for Instagram, without resolution caps or subtitles. Audio sites such as SoundCloud, Bandcamp and Mixcloud offer original audio and extraction/conversion modes. These are site presets, not a list of formats detected in a particular item. Instagram photo downloads are not supported by yt-dlp; audio extraction needs an audible video and ffmpeg. Other sites keep all format choices, including subtitles. Explicit `--format`, `--subs` and `--yt-dlp-args` remain available.
+
 ## Interface language
 
 ```powershell

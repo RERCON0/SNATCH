@@ -76,12 +76,13 @@ link and a running download.
 
 ## Features
 
+- **Threads posts and share links:** downloaded through a bundled yt-dlp extractor plugin that SNATCH installs into its own plugin folder.
 - **Automatic engine selection** for videos, direct links and torrents.
 - **Quality options:** video up to 2160p, mp3 or original audio, subtitles (including `.srt`-only text downloads) and playlists.
 - **Audio with artwork:** embeds the source thumbnail and available tags in MP3, M4A and Opus downloads. AAC/Opus stays without re-encoding; ffmpeg is required.
 - **Safe resume:** interrupted downloads are checked against their original source.
 - **Concurrent CLI downloads:** three by default, configurable with `-j 1..16`.
-- **History:** the last 15 links and folders; dark and light GUI themes.
+- **History:** up to 15 links and folders are kept (the GUI lists the last 8, the CLI the last 6 links and the last folder); dark and light GUI themes.
 - **Built-in tool installer:** yt-dlp, aria2c, ffmpeg and Deno.
 - **English and Russian:** switch languages in the GUI or with `--lang en|ru`.
 
@@ -181,9 +182,9 @@ subtitle languages and filenames are independent of the interface language.
 |---|---|
 | `--lang en|ru` | Select and remember the interface language |
 | `-o, --output` | Download folder |
-| `-j, --jobs` | Concurrent jobs: 1–16 |
+| `-j, --jobs` | Concurrent jobs: 1–16 (default 3) |
 | `-e, --engine` | Choose an engine manually |
-| `-f, --format` | `best`, 2160p–480p, `audio` (mp3), `audio-src`, `subs` (`.srt` only) |
+| `-f, --format` | `best`, `2160p`, `1440p`, `1080p`, `720p`, `480p`, `audio` (mp3), `audio-src`, `subs` (`.srt` only) |
 | `--subs`, `--playlist` | Subtitles or the full playlist |
 | `--cookies-from-browser` | Browser session for sign-in |
 | `--no-continue` | Restart an interrupted yt-dlp download from scratch |
@@ -195,12 +196,24 @@ See the [CLI reference](docs/CLI.md) or `snatch --help` for all options.
 
 | Link | Engine |
 |---|---|
-| `magnet:…`, local `.torrent` and `.metalink` files | aria2c |
+| `magnet:…`, local `.torrent`, `.metalink` and `.meta4` files | aria2c |
 | Direct file links: `.mp4`, `.zip`, `.iso`, `.pdf` and others | aria2c |
 | Video pages, playlists and streams | yt-dlp |
+| Instagram, Threads and their CDN links | yt-dlp |
 
 When yt-dlp handles a direct link, it may use aria2c as an external downloader.
 Resume is disabled on that path to protect existing files.
+
+On Windows, links on `instagram.com`, `cdninstagram.com`, `fbcdn.net`,
+`facebook.com`, `threads.com` and `threads.net` go through yt-dlp by default
+(picking aria2c yourself, `-e aria2` or the GUI button, still wins):
+aria2c's Windows TLS client cannot complete a handshake with those hosts. If
+aria2c is turned away by any other host (a TLS failure, or HTTP 403/429 that
+yt-dlp does not get - Wikimedia does this), SNATCH retries the download with
+yt-dlp automatically and remembers the host for the rest of the run. Threads posts are read by a bundled extractor plugin
+(`plugins/snatch_threads.py`) that SNATCH installs into its own plugin folder;
+yt-dlp's default plugin folders stay disabled unless you pass your own
+`--plugin-dirs` in `--yt-dlp-args`, which is unrestricted.
 
 ### YouTube sign-in
 
@@ -230,13 +243,15 @@ SNATCH resumes its own interrupted downloads and protects unrelated files with m
 ## Settings and security
 
 Windows settings are stored in `%LOCALAPPDATA%\snatch\config.json`.
-History is limited to 15 entries; `snatch --clear-history` clears it without
-removing your other preferences.
+Up to 15 history entries are stored (the interface shows fewer);
+`snatch --clear-history` clears them without removing your other preferences.
 
 - Tool installation checks checksums, download sizes and extracted executables;
-  archive paths and extraction sizes are constrained.
-- Links and local paths are checked; UNC paths are rejected before they can
-  expose Windows credentials to a remote host.
+  extracted files are written under fixed names (paths inside an archive are
+  never used) and their sizes are capped.
+- Links and local paths are checked; UNC paths (and folders that are symlinks
+  or junctions to one) are rejected before they can expose Windows credentials
+  to a remote host.
 - Downloaders are launched directly, without a shell. Additional aria2c arguments
   are restricted to allowed options.
 - Resume markers bind partial direct downloads to their original URL; file locks
