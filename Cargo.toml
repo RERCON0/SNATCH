@@ -1,6 +1,6 @@
 [package]
 name = "snatch-rs"
-version = "0.5.6"
+version = "0.6.0"
 edition = "2021"
 build = "build.rs"
 description = "SNATCH — lightweight Windows downloader with a native GUI and CLI"
