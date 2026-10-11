@@ -225,8 +225,11 @@ fn lock_for_spawn_within(
         }
     };
     let deadline = std::time::Instant::now() + wait;
+    // Shared: concurrent spawns (GUI + CLI, a parallel batch) must not turn
+    // each other away - only an installer, which takes the lock exclusively
+    // for its whole attempt, excludes them.
     loop {
-        match FileExt::try_lock(&lock) {
+        match FileExt::try_lock_shared(&lock) {
             Ok(()) => break,
             Err(fs4::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(25))
@@ -242,8 +245,17 @@ fn lock_for_spawn_within(
     if tool == "aria2c" && !program.exists() {
         let old = program.with_extension("exe.old");
         if old.is_file() {
-            std::fs::rename(old, program)
-                .map_err(|e| tr_format!("recovering aria2c: {e}", "восстановление aria2c: {e}"))?;
+            match std::fs::rename(&old, program) {
+                Ok(()) => {}
+                // Another spawn holding the shared lock restored it first.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && program.exists() => {}
+                Err(e) => {
+                    return Err(tr_format!(
+                        "recovering aria2c: {e}",
+                        "восстановление aria2c: {e}"
+                    ))
+                }
+            }
         }
     }
     Ok(Some(lock))

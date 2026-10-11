@@ -12,11 +12,11 @@ path = "src/lib.rs"
 
 [[bin]]
 name = "snatch-app"
-path = "src/bin/snatch-app.rs"
+path = "src/bin/snatch-app/main.rs"
 
 [[bin]]
 name = "snatch"
-path = "src/bin/snatch-cli.rs"
+path = "src/bin/snatch-cli/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

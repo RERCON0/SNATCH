@@ -3,6 +3,8 @@ pub mod engines;
 mod http;
 pub mod i18n;
 pub mod job_object;
+pub mod links;
+pub mod motw;
 pub mod scrollbar;
 pub mod setup;
 pub mod tools;

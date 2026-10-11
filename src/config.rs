@@ -121,6 +121,98 @@ pub fn home_dir() -> Option<PathBuf> {
         .filter(|p| !p.as_os_str().is_empty())
 }
 
+#[cfg(windows)]
+mod known_folder {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::PathBuf;
+
+    #[repr(C)]
+    pub struct Guid(u32, u16, u16, [u8; 8]);
+
+    pub const DOWNLOADS: Guid = Guid(
+        0x374D_E290,
+        0x123F,
+        0x4565,
+        [0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B],
+    );
+    pub const DESKTOP: Guid = Guid(
+        0xB4BF_CC3A,
+        0xDB2C,
+        0x424C,
+        [0xB0, 0x29, 0x7F, 0xE9, 0x9A, 0x87, 0xC6, 0x41],
+    );
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHGetKnownFolderPath(
+            id: *const Guid,
+            flags: u32,
+            token: *mut c_void,
+            path: *mut *mut u16,
+        ) -> i32;
+    }
+    #[link(name = "ole32")]
+    extern "system" {
+        fn CoTaskMemFree(memory: *mut c_void);
+    }
+
+    /// The folder the shell itself uses for this user: follows OneDrive
+    /// "known folder move" and a relocated Downloads, unlike `%USERPROFILE%\Downloads`.
+    pub fn path(id: &Guid) -> Option<PathBuf> {
+        let mut raw: *mut u16 = std::ptr::null_mut();
+        // SAFETY: `raw` receives a CoTaskMem-allocated, NUL-terminated UTF-16
+        // string on success (and is released below either way).
+        unsafe {
+            let hr = SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw);
+            let path = if hr == 0 && !raw.is_null() {
+                let mut len = 0;
+                while *raw.add(len) != 0 {
+                    len += 1;
+                }
+                Some(PathBuf::from(std::ffi::OsString::from_wide(
+                    std::slice::from_raw_parts(raw, len),
+                )))
+            } else {
+                None
+            };
+            if !raw.is_null() {
+                CoTaskMemFree(raw.cast());
+            }
+            path
+        }
+    }
+}
+
+/// The user's Downloads folder. Windows asks the shell (a redirected folder
+/// keeps working); elsewhere, and when the shell has no answer or points at a
+/// network share, it is `<home>/Downloads` - unless the home itself is a UNC
+/// share (a redirected profile): that path is never offered as a default.
+pub fn downloads_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(p) =
+        known_folder::path(&known_folder::DOWNLOADS).filter(|p| !crate::engines::is_unc_path(p))
+    {
+        return Some(p);
+    }
+    home_dir()
+        .map(|h| h.join("Downloads"))
+        .filter(|p| !crate::engines::is_unc_path(p))
+}
+
+/// The user's Desktop folder, with the same rules as [`downloads_dir`].
+pub fn desktop_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    if let Some(p) =
+        known_folder::path(&known_folder::DESKTOP).filter(|p| !crate::engines::is_unc_path(p))
+    {
+        return Some(p);
+    }
+    home_dir()
+        .map(|h| h.join("Desktop"))
+        .filter(|p| !crate::engines::is_unc_path(p))
+}
+
 /// A base directory from the environment that may be touched at all: set,
 /// non-empty and NOT a UNC share. Stat'ing `\\host\share` already sends the
 /// user's NetNTLMv2 response to that host, and this dir also holds the
@@ -256,9 +348,12 @@ pub fn sanitize(data: &Value) -> Config {
     }
 }
 /// History is a convenience list, not a credential store: the userinfo part
-/// of an authority (`https://user:token@host/...`) is dropped before a URL
-/// is remembered, so config.json never carries secrets. Running such a link
-/// from the history needs the credentials re-entered - safe by default.
+/// of an authority (`https://user:token@host/...`) and query parameters that
+/// carry a credential or a request signature (`?token=`, `X-Amz-Signature=`)
+/// are dropped before a URL is remembered, so the remembered links carry no
+/// secrets. Running
+/// such a link from the history needs the credentials re-entered - safe by
+/// default.
 fn redact_credentials(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
         return url.to_string();
@@ -267,10 +362,80 @@ fn redact_credentials(url: &str) -> String {
     // (`https://host?email=a@b`) is not userinfo and must not be rewritten.
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(end);
-    match authority.rsplit_once('@') {
-        Some((_, host)) => format!("{scheme}://{host}{tail}"),
-        None => url.to_string(),
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    format!("{scheme}://{host}{}", redact_query(tail))
+}
+
+/// A query key that names a secret. Separators and case are ignored, so
+/// `access_token`, `Access-Token` and `accessToken` are one spelling.
+fn is_secret_query_key(key: &str) -> bool {
+    let key: String = key
+        .chars()
+        .filter(|c| !matches!(c, '_' | '-'))
+        .flat_map(char::to_lowercase)
+        .collect();
+    [
+        "token",
+        "secret",
+        "passw",
+        "signature",
+        "credential",
+        "passkey",
+        "hmac",
+        "keyid",
+        "keypair",
+        "accesskey",
+        "jwt",
+        "bearer",
+    ]
+    .iter()
+    .any(|part| key.contains(part))
+        || matches!(
+            key.as_str(),
+            "sig" | "key" | "apikey" | "auth" | "authkey" | "session" | "sessionid" | "pwd"
+        )
+}
+
+/// `tail` is everything after the authority: `/path?query#fragment`. The
+/// fragment is cut off first (a `?` after `#` belongs to it), because OAuth's
+/// implicit flow returns its token there: `/cb#access_token=...`.
+fn redact_query(tail: &str) -> String {
+    let (before, fragment) = match tail.split_once('#') {
+        Some((before, fragment)) => (before, Some(fragment)),
+        None => (tail, None),
+    };
+    let (path, query) = match before.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (before, None),
+    };
+    let mut out = path.to_string();
+    if let Some(kept) = query.map(public_pairs).filter(|kept| !kept.is_empty()) {
+        out.push('?');
+        out.push_str(&kept);
     }
+    // A fragment made of `key=value` pairs is filtered like a query; a plain
+    // anchor (`#section-2`) has no keys and stays.
+    if let Some(fragment) = fragment {
+        let kept = if fragment.contains('=') {
+            public_pairs(fragment)
+        } else {
+            fragment.to_string()
+        };
+        if !kept.is_empty() {
+            out.push('#');
+            out.push_str(&kept);
+        }
+    }
+    out
+}
+
+/// The `&`-separated pairs whose key does not name a secret.
+fn public_pairs(pairs: &str) -> String {
+    pairs
+        .split('&')
+        .filter(|pair| !is_secret_query_key(pair.split_once('=').map_or(pair, |(key, _)| key)))
+        .collect::<Vec<_>>()
+        .join("&")
 }
 
 fn dedup_front(list: Vec<String>, value: String) -> Vec<String> {
@@ -373,8 +538,8 @@ impl Config {
 
     fn with_default_dir(mut cfg: Config) -> Config {
         if cfg.default_dir.is_empty() {
-            cfg.default_dir = home_dir()
-                .map(|h| h.join("Downloads").to_string_lossy().into_owned())
+            cfg.default_dir = downloads_dir()
+                .map(|d| d.to_string_lossy().into_owned())
                 .unwrap_or_default();
         }
         cfg.default_dir_snapshot.replace(cfg.default_dir.clone());
@@ -448,49 +613,46 @@ impl Config {
             } else {
                 disk.dark_mode
             };
-            let merged = if self.history_cleared.get() {
-                Config {
-                    additional: disk.additional.clone(),
-                    language,
-                    language_dirty: Cell::new(false),
-                    default_dir: default_dir.clone(),
-                    last_dir: self.last_dir.clone(),
-                    urls: self.urls.clone(),
-                    dirs: self.dirs.clone(),
-                    history_epoch: disk.history_epoch.saturating_add(1),
-                    dark_mode,
-                    history_cleared: Cell::new(false),
-                    url_dirty: Cell::new(false),
-                    dir_dirty: Cell::new(false),
-                    default_dir_snapshot: RefCell::new(default_dir),
-                    theme_snapshot: Cell::new(dark_mode),
-                }
+            // Only the history fields differ between "clear" and "merge".
+            let (last_dir, urls, dirs, history_epoch) = if self.history_cleared.get() {
+                (
+                    self.last_dir.clone(),
+                    self.urls.clone(),
+                    self.dirs.clone(),
+                    disk.history_epoch.saturating_add(1),
+                )
             } else {
                 let same_epoch = self.history_epoch == disk.history_epoch;
-                Config {
-                    additional: disk.additional.clone(),
-                    language,
-                    language_dirty: Cell::new(false),
-                    default_dir: default_dir.clone(),
+                (
                     // Like urls/dirs: only a remember_dir() since the last
                     // save may overwrite last_dir. A stale window saving an
                     // unrelated setting must not resurrect a directory that
                     // --clear-history (or a newer download) replaced.
-                    last_dir: if self.dir_dirty.get() {
+                    if self.dir_dirty.get() {
                         self.last_dir.clone()
                     } else {
                         disk.last_dir.clone()
                     },
-                    urls: merge_history(&self.urls, &disk.urls, same_epoch, self.url_dirty.get()),
-                    dirs: merge_history(&self.dirs, &disk.dirs, same_epoch, self.dir_dirty.get()),
-                    history_epoch: disk.history_epoch,
-                    dark_mode,
-                    history_cleared: Cell::new(false),
-                    url_dirty: Cell::new(false),
-                    dir_dirty: Cell::new(false),
-                    default_dir_snapshot: RefCell::new(default_dir),
-                    theme_snapshot: Cell::new(dark_mode),
-                }
+                    merge_history(&self.urls, &disk.urls, same_epoch, self.url_dirty.get()),
+                    merge_history(&self.dirs, &disk.dirs, same_epoch, self.dir_dirty.get()),
+                    disk.history_epoch,
+                )
+            };
+            let merged = Config {
+                additional: disk.additional,
+                language,
+                language_dirty: Cell::new(false),
+                default_dir: default_dir.clone(),
+                last_dir,
+                urls,
+                dirs,
+                history_epoch,
+                dark_mode,
+                history_cleared: Cell::new(false),
+                url_dirty: Cell::new(false),
+                dir_dirty: Cell::new(false),
+                default_dir_snapshot: RefCell::new(default_dir),
+                theme_snapshot: Cell::new(dark_mode),
             };
             // Unique tmp name (pid + nanos): with the old fixed "config.tmp",
             // two instances (GUI + CLI) saving concurrently would truncate
@@ -501,17 +663,25 @@ impl Config {
                 .unwrap_or(0);
             let tmp = p.with_file_name(format!("config-{}-{stamp}.tmp", std::process::id()));
             let payload = serde_json::to_string_pretty(&merged).map_err(std::io::Error::other)?;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
             {
-                let mut opts = std::fs::OpenOptions::new();
-                opts.write(true).create(true).truncate(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    opts.mode(0o600);
-                }
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            // Flush to disk BEFORE the rename: a rename that reaches the disk
+            // ahead of the data leaves an empty config.json after a power loss,
+            // and an unreadable config is (deliberately) never overwritten.
+            let written = (|| -> std::io::Result<()> {
                 use std::io::Write;
                 let mut f = opts.open(&tmp)?;
                 f.write_all(payload.as_bytes())?;
+                f.sync_all()
+            })();
+            if let Err(e) = written {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
             }
             #[cfg(unix)]
             {
@@ -577,7 +747,7 @@ mod tests {
         let oversized = json!({"urls": ["https://example.test/a"], "pad": "x".repeat(MAX_CONFIG_BYTES as usize)}).to_string().into_bytes();
         for bytes in [
             oversized,
-            b"{\"urls\":\"x\"}\xff".to_vec(),
+            b"{\"urls\":[\"x\"]}\xff".to_vec(),
             b"{broken".to_vec(),
         ] {
             std::fs::write(&path, &bytes).unwrap();
@@ -904,24 +1074,6 @@ mod tests {
     }
 
     #[test]
-    fn dark_mode_defaults_true_and_persists() {
-        let cfg = sanitize(&Value::Null);
-        assert!(cfg.dark_mode);
-        let cfg = sanitize(&json!({"dark_mode": false}));
-        assert!(!cfg.dark_mode);
-
-        let dir =
-            std::env::temp_dir().join(format!("snatch-rs-config-theme-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join("config.json");
-        let mut cfg = Config::load_from(&p);
-        cfg.dark_mode = false;
-        cfg.save_to(&p);
-        assert!(!Config::load_from(&p).dark_mode);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn credentials_are_dropped_from_remembered_urls() {
         let dir = std::env::temp_dir().join(format!("snatch-rs-redact-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -937,6 +1089,102 @@ mod tests {
         assert_eq!(cfg.urls[2], "https://host.tld/plain?a=b@c");
         assert_eq!(cfg.urls[1], "magnet:?xt=urn:btih:abc");
         assert_eq!(cfg.urls[0], "https://host.tld?email=a@b");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn secret_query_parameters_are_dropped_from_remembered_urls() {
+        for (raw, expected) in [
+            (
+                "https://h.tld/f.zip?token=abc&x=1",
+                "https://h.tld/f.zip?x=1",
+            ),
+            (
+                "https://h.tld/f.zip?access_token=abc",
+                "https://h.tld/f.zip",
+            ),
+            (
+                "https://b.s3.amazonaws.com/f?X-Amz-Credential=c&X-Amz-Signature=s&a=b#frag",
+                "https://b.s3.amazonaws.com/f?a=b#frag",
+            ),
+            ("https://h.tld/f?apiKey=k&v=2", "https://h.tld/f?v=2"),
+            // Ordinary parameters (and a lone '@' in one) stay untouched.
+            (
+                "https://h.tld/watch?v=1&t=30",
+                "https://h.tld/watch?v=1&t=30",
+            ),
+            ("https://h.tld?email=a@b", "https://h.tld?email=a@b"),
+            (
+                "https://h.tld/f?keyword=cats",
+                "https://h.tld/f?keyword=cats",
+            ),
+        ] {
+            assert_eq!(redact_credentials(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn secrets_in_a_url_fragment_are_dropped_from_remembered_urls() {
+        for (raw, expected) in [
+            // OAuth's implicit flow returns the token in the fragment.
+            (
+                "https://h.tld/cb#access_token=SECRET&token_type=bearer&state=1",
+                "https://h.tld/cb#state=1",
+            ),
+            ("https://h.tld/cb#access_token=SECRET", "https://h.tld/cb"),
+            // Query and fragment are filtered independently, in either order.
+            (
+                "https://h.tld/f?v=1&token=a#id_token=b&x=2",
+                "https://h.tld/f?v=1#x=2",
+            ),
+            // A `?` inside the fragment is part of the fragment, not a query.
+            ("https://h.tld/page#faq?a=b", "https://h.tld/page#faq?a=b"),
+            ("https://h.tld/page#faq?token=x", "https://h.tld/page"),
+            // Plain anchors survive.
+            ("https://h.tld/doc#section-2", "https://h.tld/doc#section-2"),
+            // More signed-link spellings.
+            (
+                "https://b.s3.amazonaws.com/f?AWSAccessKeyId=A&Expires=1&v=2",
+                "https://b.s3.amazonaws.com/f?Expires=1&v=2",
+            ),
+            (
+                "https://cdn.tld/f?Key-Pair-Id=K&hmac=H&q=1",
+                "https://cdn.tld/f?q=1",
+            ),
+        ] {
+            assert_eq!(redact_credentials(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn shell_folders_resolve_to_absolute_paths() {
+        for dir in [downloads_dir(), desktop_dir()].into_iter().flatten() {
+            assert!(dir.is_absolute(), "{dir:?}");
+            assert!(!crate::engines::is_unc_path(&dir), "{dir:?}");
+        }
+        // On Windows the answer comes from the shell, not from a guess.
+        #[cfg(windows)]
+        for id in [&known_folder::DOWNLOADS, &known_folder::DESKTOP] {
+            let dir = known_folder::path(id).expect("the shell knows this folder");
+            assert!(dir.is_absolute(), "{dir:?}");
+        }
+    }
+
+    #[test]
+    fn dark_mode_defaults_true_and_persists() {
+        let cfg = sanitize(&Value::Null);
+        assert!(cfg.dark_mode);
+        let cfg = sanitize(&json!({"dark_mode": false}));
+        assert!(!cfg.dark_mode);
+
+        let dir =
+            std::env::temp_dir().join(format!("snatch-rs-config-theme-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.json");
+        let mut cfg = Config::load_from(&p);
+        cfg.dark_mode = false;
+        cfg.save_to(&p);
+        assert!(!Config::load_from(&p).dark_mode);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -117,7 +117,7 @@ mod tests {
                 }));
                 assert!(crate::engines::formats()
                     .iter()
-                    .all(|(key, _)| key.is_ascii()));
+                    .all(|(key, _)| key.as_str().is_ascii()));
                 assert_eq!(
                     crate::setup::SetupStage::Verifying.text(),
                     if language == Language::En {

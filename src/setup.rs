@@ -58,9 +58,15 @@ fn client() -> Result<reqwest::blocking::Client, String> {
         }))
         // reqwest has NO timeouts by default: a half-dead connection (proxy
         // accepted TCP, then went silent) blocks read() forever - in the GUI
-        // that's the Setup phase hung with no cancel button.
+        // that's the Setup phase hung with no cancel button. The blocking
+        // client only offers a TOTAL timeout (it used to be 10 minutes, which
+        // made a 100 MB ffmpeg unreachable on a slow link even though bytes
+        // kept arriving), so it is generous, and TCP keep-alive probes end a
+        // peer that has silently died long before it. Metadata requests set
+        // their own, short total.
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(600))
+        .tcp_keepalive(Duration::from_secs(30))
+        .timeout(Duration::from_secs(30 * 60))
         .build()
         .map_err(|e| e.to_string())
 }
@@ -236,6 +242,73 @@ fn read_validator(part: &Path) -> Option<String> {
         .flatten()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty() && v.len() <= 256 && v.bytes().all(|b| (0x20..0x7f).contains(&b)))
+}
+
+/// `<tool>.installed`: the SHA-256 of the archive the installed executable came
+/// from, and on a second line the SHA-256 of the executable itself. The
+/// archives' checksums are published, the extracted executables' are not, so
+/// the first line is how "update" can tell the tool is already current without
+/// downloading 100 MB again; the second one makes sure the file on disk is
+/// still the one that was installed.
+fn installed_marker(bin: &Path, tool: &str) -> PathBuf {
+    bin.join(format!("{tool}.installed"))
+}
+
+fn is_current(bin: &Path, tool: &str, exe: &Path, archive_sha256: &str) -> bool {
+    if !exe.is_file() {
+        return false;
+    }
+    let Some(recorded) = crate::config::read_capped(&installed_marker(bin, tool), 256)
+        .ok()
+        .flatten()
+    else {
+        return false;
+    };
+    let mut lines = recorded.lines().map(str::trim).filter(|l| !l.is_empty());
+    if !lines
+        .next()
+        .is_some_and(|archive| archive.eq_ignore_ascii_case(archive_sha256))
+    {
+        return false;
+    }
+    match lines.next() {
+        // A file that no longer matches what was installed (a torn write,
+        // antivirus, a replaced binary) is reinstalled, not kept.
+        Some(recorded_exe) => {
+            sha256_hex(exe).is_ok_and(|actual| actual.eq_ignore_ascii_case(recorded_exe))
+        }
+        // Markers written by older versions carry no executable hash.
+        None => true,
+    }
+}
+
+/// Writes the marker for a tool that was just installed. A failure is only
+/// reported: the tool works, it will just be fetched again on the next update.
+fn record_installed(bin: &Path, tool: &str, exe: &Path, archive_sha256: &str) {
+    let written = sha256_hex(exe)
+        .map_err(std::io::Error::other)
+        .and_then(|exe_sha256| {
+            std::fs::write(
+                installed_marker(bin, tool),
+                format!("{archive_sha256}\n{exe_sha256}\n"),
+            )
+        });
+    if let Err(e) = written {
+        crate::errln(tr_format!(
+            "⚠ Could not record the installed {tool} ({e}); it will be downloaded again on the next update.",
+            "⚠ Не удалось записать отметку об установке {tool} ({e}); при следующем обновлении он скачается заново."
+        ));
+    }
+}
+
+/// Nothing to download: the installed tool already is the published release.
+fn report_up_to_date(label: &str) {
+    if std::io::stdout().is_terminal() {
+        crate::outln(tr_format!(
+            "✔ {label} is already up to date",
+            "✔ {label} уже актуален"
+        ));
+    }
 }
 
 /// A `.part` and its validator always go together.
@@ -863,7 +936,10 @@ pub fn install_ffmpeg_with(
     }
     let _lock = install_lock(bin, "ffmpeg")?;
     match retry_transient(|| install_ffmpeg_inner(bin, report)) {
-        Ok(p) => Ok(p),
+        Ok(p) => {
+            crate::engines::refresh_helper_presence();
+            Ok(p)
+        }
         Err(f) => {
             if !f.kind.keeps_part() {
                 remove_part(&bin.join("ffmpeg.zip.part"));
@@ -880,8 +956,16 @@ fn install_ffmpeg_inner(
     report: &mut dyn FnMut(SetupProgress),
 ) -> Result<PathBuf, DownloadFailure> {
     let c = client().map_err(DownloadFailure::permanent)?;
-    if std::io::stdout().is_terminal() {
-        crate::outln(tr!("⬇ Downloading ffmpeg…", "⬇ Скачиваю ffmpeg…"));
+    // A swap that crashed between its two renames left only `<tool>.exe.old`:
+    // put it back before anything is fetched, as deno and aria2c do, so the
+    // tool works again even if this attempt then fails.
+    for exe in ["ffmpeg.exe", "ffprobe.exe"] {
+        recover_tool(&bin.join(exe)).map_err(|e| {
+            DownloadFailure::transient(tr_format!(
+                "recovering {exe}: {e}",
+                "восстановление {exe}: {e}"
+            ))
+        })?;
     }
     report(SetupProgress {
         label: "ffmpeg".into(),
@@ -915,6 +999,14 @@ fn install_ffmpeg_inner(
         ))
     })?;
 
+    let ffmpeg_exe = bin.join("ffmpeg.exe");
+    if is_current(bin, "ffmpeg", &ffmpeg_exe, &expected) {
+        report_up_to_date("ffmpeg");
+        return Ok(ffmpeg_exe);
+    }
+    if std::io::stdout().is_terminal() {
+        crate::outln(tr!("⬇ Downloading ffmpeg…", "⬇ Скачиваю ffmpeg…"));
+    }
     let zip_path = bin.join("ffmpeg.zip.part");
     download(
         &c,
@@ -1004,6 +1096,7 @@ fn install_ffmpeg_inner(
         let _ = std::fs::remove_file(&probe_tmp);
     }
     extracted.map_err(DownloadFailure::permanent)?;
+    record_installed(bin, "ffmpeg", &dest, &expected);
     Ok(dest)
 }
 
@@ -1026,7 +1119,10 @@ pub fn install_deno_with(
     }
     let _lock = install_lock(bin, "deno")?;
     match retry_transient(|| install_deno_inner(bin, report)) {
-        Ok(p) => Ok(p),
+        Ok(p) => {
+            crate::engines::refresh_helper_presence();
+            Ok(p)
+        }
         Err(f) => {
             if !f.kind.keeps_part() {
                 remove_part(&bin.join("deno.zip.part"));
@@ -1063,6 +1159,11 @@ fn install_deno_inner(
     let release = release_json(&c, DENO_API)?;
     let (url, expected) = deno_asset(&release).map_err(DownloadFailure::permanent)?;
 
+    let deno_exe = bin.join("deno.exe");
+    if is_current(bin, "deno", &deno_exe, &expected) {
+        report_up_to_date("Deno");
+        return Ok(deno_exe);
+    }
     let zip_path = bin.join("deno.zip.part");
     download(
         &c,
@@ -1130,6 +1231,7 @@ fn install_deno_inner(
         let _ = std::fs::remove_file(&tmp);
     }
     extracted.map_err(DownloadFailure::permanent)?;
+    record_installed(bin, "deno", &dest, &expected);
     Ok(dest)
 }
 
@@ -1150,16 +1252,29 @@ fn install_lock(bin: &Path, tool: &str) -> Result<File, String> {
             path.display()
         )
     })?;
-    match FileExt::try_lock(&file) {
-        Ok(()) => Ok(file),
-        Err(TryLockError::WouldBlock) => Err(tr_format!(
-            "{tool} is being installed in another SNATCH window — wait for it to finish and retry",
-            "{tool} уже устанавливается в другом окне SNATCH — дождитесь окончания и повторите"
-        )),
-        Err(TryLockError::Error(e)) => Err(tr_format!(
-            "installation lock for {tool}: {e}",
-            "блокировка установки {tool}: {e}"
-        )),
+    // A download that is just starting holds this lock (shared) for the few
+    // milliseconds of process creation; wait that out instead of reporting a
+    // second installer that does not exist.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        match FileExt::try_lock(&file) {
+            Ok(()) => return Ok(file),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(TryLockError::WouldBlock) => {
+                return Err(tr_format!(
+                    "{tool} is being installed in another SNATCH window — wait for it to finish and retry",
+                    "{tool} уже устанавливается в другом окне SNATCH — дождитесь окончания и повторите"
+                ))
+            }
+            Err(TryLockError::Error(e)) => {
+                return Err(tr_format!(
+                    "installation lock for {tool}: {e}",
+                    "блокировка установки {tool}: {e}"
+                ))
+            }
+        }
     }
 }
 
@@ -1302,6 +1417,14 @@ fn install_yt_dlp_inner(
             "в SHA2-512SUMS нет записи для yt-dlp.exe"
         ))
     })?;
+    // The published SHA-512 is of the executable itself, so "already current"
+    // is a direct comparison - no marker needed.
+    if dest.is_file()
+        && sha512_hex(&dest).is_ok_and(|installed| installed.eq_ignore_ascii_case(expected))
+    {
+        report_up_to_date("yt-dlp.exe");
+        return Ok(dest);
+    }
     download(
         &c,
         &payload_url,
@@ -1390,6 +1513,11 @@ fn install_aria2_inner(
     let release = release_json(&c, ARIA2_API)?;
     let (url, expected_sha256) = aria2_asset(&release).map_err(DownloadFailure::permanent)?;
 
+    let aria2_exe = bin.join("aria2c.exe");
+    if is_current(bin, "aria2c", &aria2_exe, &expected_sha256) {
+        report_up_to_date("aria2c");
+        return Ok(aria2_exe);
+    }
     let zip_path = bin.join("aria2.zip.part");
     download(
         &c,
@@ -1463,6 +1591,7 @@ fn install_aria2_inner(
     // (previously the zip leaked in bin\ on every failure path).
     remove_part(&zip_path);
     extracted.map_err(DownloadFailure::permanent)?;
+    record_installed(bin, "aria2c", &dest, &expected_sha256);
     Ok(dest)
 }
 
@@ -1586,6 +1715,47 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_tool_is_current_only_for_the_archive_it_was_installed_from() {
+        let dir = std::env::temp_dir().join(format!("snatch-current-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("ffmpeg.exe");
+        assert!(
+            !is_current(&dir, "ffmpeg", &exe, "abc"),
+            "nothing installed"
+        );
+        std::fs::write(&exe, b"binary").unwrap();
+        assert!(
+            !is_current(&dir, "ffmpeg", &exe, "abc"),
+            "installed outside SNATCH"
+        );
+        record_installed(&dir, "ffmpeg", &exe, "ABC");
+        assert!(
+            is_current(&dir, "ffmpeg", &exe, "abc"),
+            "hex case is irrelevant"
+        );
+        std::fs::write(&exe, b"binary, but not the one installed").unwrap();
+        assert!(
+            !is_current(&dir, "ffmpeg", &exe, "abc"),
+            "a replaced or damaged executable is reinstalled"
+        );
+        std::fs::write(&exe, b"binary").unwrap();
+        // A marker from an older version has only the archive line.
+        std::fs::write(installed_marker(&dir, "ffmpeg"), "ABC\n").unwrap();
+        assert!(is_current(&dir, "ffmpeg", &exe, "abc"), "legacy marker");
+        assert!(!is_current(&dir, "ffmpeg", &exe, "def"), "a newer release");
+        assert!(
+            !is_current(&dir, "deno", &exe, "abc"),
+            "markers are per tool"
+        );
+        std::fs::remove_file(&exe).unwrap();
+        assert!(
+            !is_current(&dir, "ffmpeg", &exe, "abc"),
+            "the tool was deleted"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

@@ -40,6 +40,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Check all targets without warnings
         run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Check the bundled yt-dlp extractor plugin
+        run: python -m py_compile plugins/snatch_threads.py
       - name: Test CLI, GUI and shared engine
         run: cargo test --locked --all-targets
       - name: Test signed package verification and tamper rejection

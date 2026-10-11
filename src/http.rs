@@ -14,13 +14,15 @@ pub(crate) enum HttpError {
     Cancelled,
     Transport(String),
     TooLarge,
+    Status(reqwest::StatusCode),
 }
 impl std::fmt::Display for HttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Cancelled => write!(f, "__cancelled__"),
+            Self::Cancelled => tr_write!(f, "canceled", "отменено"),
             Self::Transport(s) => tr_write!(f, "network: {s}", "сеть: {s}"),
             Self::TooLarge => tr_write!(f, "response is too large", "ответ слишком большой"),
+            Self::Status(status) => write!(f, "HTTP: {status}"),
         }
     }
 }
@@ -54,12 +56,10 @@ pub(crate) async fn get_bytes(
     url: &str,
     max: u64,
     cancel: &AtomicBool,
-) -> Result<Vec<u8>, String> {
-    let (status, bytes) = request_bytes(client.get(url), max, cancel)
-        .await
-        .map_err(|e| e.to_string())?;
+) -> Result<Vec<u8>, HttpError> {
+    let (status, bytes) = request_bytes(client.get(url), max, cancel).await?;
     if !status.is_success() {
-        return Err(format!("HTTP: {status}"));
+        return Err(HttpError::Status(status));
     }
     Ok(bytes)
 }

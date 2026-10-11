@@ -146,6 +146,8 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
         ));
     }
     let mut name = String::new();
+    // "<name>/", kept in step with `name` instead of formatted per file.
+    let mut name_prefix = String::from("/");
     let mut total = 0u64;
     let mut files: Vec<FileEntry> = Vec::new();
     let mut components = 0usize;
@@ -154,6 +156,7 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
         let line = line.trim_end();
         if let Some(rest) = line.strip_prefix("Name: ") {
             name = rest.trim().to_string();
+            name_prefix = format!("{name}/");
             continue;
         }
         if let Some(rest) = line.strip_prefix("Total Length: ") {
@@ -210,7 +213,7 @@ pub fn parse_show_files(output: &str) -> Result<TorrentInfo, String> {
                     .into());
                 }
                 // Drop the leading "<name>/" that aria2 adds to every path.
-                let clean = clean.strip_prefix(&format!("{name}/")).unwrap_or(clean);
+                let clean = clean.strip_prefix(name_prefix.as_str()).unwrap_or(clean);
                 files.push(FileEntry {
                     index,
                     path: clean.to_string(),
@@ -397,12 +400,7 @@ fn sweep_stale_temp_dirs(base: &Path, max_age: Duration) {
 /// with it instead of leaving a metadata fetch running in the background.
 fn spawn_hidden(mut command: Command) -> Result<(Child, Option<job_object::Job>), String> {
     let _install_lock = crate::tools::lock_for_spawn(Path::new(command.get_program()))?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
+    // `hidden` makes job_object::spawn add CREATE_NO_WINDOW itself.
     job_object::spawn(&mut command, true).map_err(|e| {
         tr_format!(
             "aria2c startup/process tree protection: {e}",
@@ -557,6 +555,23 @@ fn fetch_http(url: &str, cancel: &AtomicBool) -> Result<Meta, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent(concat!("snatch/", env!("CARGO_PKG_VERSION")))
+        // Cross-host redirects are intentional (trackers/CDNs), but a
+        // cleartext downgrade could let a network attacker replace the
+        // torrent the user is about to review; the chain is capped too.
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            let downgrade = attempt.url().scheme() == "http"
+                && attempt.previous().iter().any(|u| u.scheme() == "https");
+            if downgrade {
+                attempt.error(tr!(
+                    "refusing an HTTPS-to-HTTP redirect",
+                    "отказ от редиректа HTTPS → HTTP"
+                ))
+            } else if attempt.previous().len() >= 5 {
+                attempt.error(tr!("too many redirects", "слишком много редиректов"))
+            } else {
+                attempt.follow()
+            }
+        }))
         .build()
         .map_err(|e| e.to_string())?;
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -570,12 +585,9 @@ fn fetch_http(url: &str, cancel: &AtomicBool) -> Result<Meta, String> {
             MAX_TORRENT_BYTES,
             cancel,
         ))
-        .map_err(|e| {
-            if e == "__cancelled__" {
-                CANCELLED.into()
-            } else {
-                e
-            }
+        .map_err(|e| match e {
+            crate::http::HttpError::Cancelled => CANCELLED.to_string(),
+            other => other.to_string(),
         })?;
     if !bytes.starts_with(b"d") {
         return Err(tr!(
@@ -1046,6 +1058,7 @@ pub fn node_at_mut<'a>(nodes: &'a mut [TorrNode], path: &[usize]) -> &'a mut Tor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engines::{Engine, Format};
 
     #[test]
     fn oversized_numeric_sizes_are_rejected_instead_of_wrapping_or_panicking() {
@@ -1358,11 +1371,12 @@ idx|path/length
             _dir: dir,
         }));
         let job = crate::engines::Job {
-            engine: "aria2".into(),
+            engine: Engine::Aria2,
             url: "magnet:?xt=urn:btih:c01abfff06149cb74765dca1b5226003eeb4e877".into(),
             out_dir: out,
-            fmt: "best".into(),
+            fmt: Format::Best,
             cookies_browser: None,
+            download_name: None,
         };
         let tc = crate::tools::Toolchain {
             yt_dlp: None,

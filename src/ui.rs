@@ -53,6 +53,23 @@ pub fn clip(text: &str, width: usize) -> String {
     }
 }
 
+/// Runs `work` on a helper thread and waits at most `timeout` for its answer.
+/// For file-system work on a path the user typed, which may sit on a
+/// disconnected network drive: the OS call can block for tens of seconds, and
+/// the caller (a UI thread) must not. On a timeout the caller gets `None` and
+/// the helper thread stays in the OS call until it returns; whatever it then
+/// produces (a lock guard, say) is dropped, never delivered late.
+pub fn run_bounded<T: Send + 'static>(
+    timeout: std::time::Duration,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.recv_timeout(timeout).ok()
+}
+
 /// Windows: FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM. Explorer hides
 /// these (System Volume Information, Recovery, …); the folder browser
 /// shouldn't show them either - picking one only produces a confusing
@@ -90,7 +107,7 @@ pub fn try_read_dirs_limited(
     path: &Path,
     examine_limit: usize,
 ) -> std::io::Result<(Vec<PathBuf>, bool)> {
-    if crate::engines::is_unc_path(path) {
+    if crate::engines::reaches_unc(path) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             tr!(
@@ -145,6 +162,19 @@ pub fn try_read_dirs_limited(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_bounded_gives_up_on_slow_work_and_returns_fast_work() {
+        use std::time::Duration;
+        assert_eq!(run_bounded(Duration::from_secs(5), || 7), Some(7));
+        let began = std::time::Instant::now();
+        let slow = run_bounded(Duration::from_millis(50), || {
+            std::thread::sleep(Duration::from_millis(600));
+            1
+        });
+        assert_eq!(slow, None);
+        assert!(began.elapsed() < Duration::from_millis(400));
+    }
 
     #[test]
     fn an_unreadable_listing_is_an_error_not_an_empty_directory() {
