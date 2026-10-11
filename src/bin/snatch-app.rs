@@ -121,6 +121,9 @@ struct ActiveJob {
     /// doesn't need any extra IPC to the child, just an ordinary kill+restart.
     pausing: bool,
     auth_seen: bool,
+    /// Subtitles-only runs: did any subtitle file appear, and did yt-dlp
+    /// say none of the requested languages exist (it still exits 0)?
+    subs_watch: engines::SubtitleWatch,
     missing_control_file: bool,
     resumed_seen: bool,
     /// Whether *this* run already used --no-continue (a from-scratch retry
@@ -449,11 +452,10 @@ fn torrent_console_line(id: u64, line: &str) -> Option<Msg> {
             tr!("Allocating disk space…", "Выделение места на диске…").into(),
         ));
     }
-    let lower = line.to_ascii_lowercase();
-    if ["error", "warning", "failed", "aborted", "exception"]
+    let interested = ["error", "warning", "failed", "aborted", "exception"]
         .iter()
-        .any(|hint| lower.contains(hint))
-    {
+        .any(|hint| engines::contains_ignore_ascii_case(line, hint));
+    if interested {
         return Some(Msg::ErrLine(id, line.to_string()));
     }
     None
@@ -1366,6 +1368,9 @@ impl SnatchApp {
                             j.label = title;
                         }
                     }
+                    if let Some(j) = self.job_mut(id) {
+                        j.subs_watch.observe(&trimmed);
+                    }
                     if !trimmed.is_empty() {
                         // yt-dlp's own speed/ETA estimator occasionally comes
                         // up empty for one tick - especially under several
@@ -1590,6 +1595,27 @@ impl SnatchApp {
             return;
         }
         match code {
+            0 if aj.subs_watch.nothing_written(&aj.job.fmt, 0) => {
+                // yt-dlp reports "no subtitles for the requested languages"
+                // as success; for the subtitles-only format an empty folder
+                // is a failure, and the link must not enter history as done.
+                self.set_status(
+                    StatusKind::Err,
+                    tr_format!(
+                        "“{label}”: no subtitles for the requested languages — nothing was written",
+                        "«{label}»: подходящих субтитров нет — ничего не записано"
+                    ),
+                );
+                self.push_job_log(
+                    aj.id,
+                    tr!(
+                        "yt-dlp found no subtitles for the requested languages; the video itself is never downloaded in subs mode.",
+                        "yt-dlp не нашёл субтитров на запрошенных языках; само видео в режиме «только субтитры» не скачивается."
+                    )
+                    .to_string(),
+                );
+                self.show_log_window = true;
+            }
             0 => {
                 self.cfg.remember_url(&aj.job.url);
                 self.cfg.remember_dir(&aj.job.out_dir.to_string_lossy());
@@ -2151,6 +2177,7 @@ impl SnatchApp {
             cancelled: false,
             pausing: false,
             auth_seen: false,
+            subs_watch: engines::SubtitleWatch::default(),
             missing_control_file: false,
             resumed_seen: false,
             no_continue,
@@ -2161,7 +2188,6 @@ impl SnatchApp {
         let ctx_w = ctx.clone();
         std::thread::spawn(move || {
             let tx_out = tx.clone();
-            let ctx_out = ctx_w.clone();
             let h_out = std::thread::spawn(move || {
                 // Read raw bytes and decode lossily - never `BufRead::lines()`.
                 // The frozen yt-dlp.exe writes cp1251 (it ignores the
@@ -2196,7 +2222,10 @@ impl SnatchApp {
                     let line = engines::sanitize_child_output(&decoded);
                     if aria2 {
                         let mut latest = None;
-                        for fragment in line.replace('\r', "\n").lines() {
+                        // split, not replace: a chunk of aria2 output arrives
+                        // with \r-separated fragments, and building a whole
+                        // replaced copy of it per read is pure garbage.
+                        for fragment in line.split(['\r', '\n']) {
                             if let Some(msg) = torrent_console_line(id, fragment) {
                                 match msg {
                                     Msg::TorrentStatus(..) => latest = Some(msg),
@@ -2223,7 +2252,6 @@ impl SnatchApp {
                                 }
                                 last_progress_log = Some(Instant::now());
                                 let _ = tx_out.send(msg);
-                                ctx_out.request_repaint();
                             }
                         }
                         continue;
@@ -2236,12 +2264,14 @@ impl SnatchApp {
                             if due {
                                 last_progress_log = Some(Instant::now());
                                 let _ = tx_out.send(Msg::Log(id, line.to_string()));
-                                ctx_out.request_repaint();
+                                // No request_repaint per line: drain() already
+                                // ticks while jobs run, and a per-line request
+                                // redraws the whole window - the stderr reader
+                                // next door never did this either.
                             }
                         }
                         None => {
                             let _ = tx_out.send(Msg::Log(id, line.to_string()));
-                            ctx_out.request_repaint();
                         }
                     }
                 }
@@ -3200,7 +3230,9 @@ impl SnatchApp {
                         "Download manual and automatic subtitles alongside the video",
                         "Скачивать субтитры (ручные и автоматические) рядом с видео"
                     ));
-                if self.subs {
+                // The subtitles-only format downloads subtitles on its own;
+                // its language field must stay visible without the checkbox.
+                if self.subs || self.fmt == "subs" {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.sub_langs)
                             .font(field_font())
@@ -3801,7 +3833,7 @@ impl eframe::App for SnatchApp {
                 ui.add_space(6.0);
                 ui.colored_label(
                     ui.visuals().warn_fg_color,
-                    tr!("This site may require sign-in (bot detection or age restrictions).", "Похоже, сайту нужна авторизация (бот-детект или возрастные ограничения)."),
+                    tr!("This site may require sign-in or rate-limit the requests (bot detection, age restrictions, HTTP 429).", "Похоже, сайту нужна авторизация или он ограничил запросы (бот-детект, возрастные ограничения, 429)."),
                 );
                 if ui.button(tr!("Retry with browser cookies", "Повторить с куками из браузера")).clicked() {
                     // One-shot: retry with cookies without flipping the
@@ -4083,6 +4115,7 @@ mod tests {
             cancelled: false,
             pausing: false,
             auth_seen: false,
+            subs_watch: engines::SubtitleWatch::default(),
             missing_control_file: false,
             resumed_seen: true,
             no_continue: false,
@@ -4204,6 +4237,7 @@ mod tests {
             cancelled: false,
             pausing: false,
             auth_seen: false,
+            subs_watch: engines::SubtitleWatch::default(),
             missing_control_file: false,
             resumed_seen: false,
             no_continue: false,

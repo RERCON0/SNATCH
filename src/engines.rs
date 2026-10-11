@@ -83,7 +83,7 @@ pub fn engine_labels() -> [(&'static str, &'static str); 2] {
     ]
 }
 
-pub fn formats() -> [(&'static str, &'static str); 8] {
+pub fn formats() -> [(&'static str, &'static str); 9] {
     [
         ("best", tr!("Best quality", "Лучшее качество")),
         (
@@ -103,6 +103,13 @@ pub fn formats() -> [(&'static str, &'static str); 8] {
             tr!(
                 "Audio — original (m4a/opus, no conversion)",
                 "Аудио — исходное (m4a/opus, без перекодирования)"
+            ),
+        ),
+        (
+            "subs",
+            tr!(
+                "Subtitles — .srt only (no video)",
+                "Субтитры — только .srt (без видео)"
             ),
         ),
     ]
@@ -125,20 +132,38 @@ const AUTH_HINTS: &[&str] = &[
     "join this channel",
     "try using --cookies",
     "cookies from a browser",
+    // YouTube's rate limiting (429) is not a login demand, but a signed-in
+    // browser session is the documented practical cure, so it belongs with
+    // the cookie hints: "Download failed. Try cookies?" is the right offer.
+    "http error 429",
+    "too many requests",
 ];
 
+/// Failures whose usual cure is cookies from a signed-in browser: sign-in
+/// and bot checks, age gates, and YouTube's HTTP 429 rate limiting. (The
+/// name says "auth" for history; the 403/429 entries already stretch it,
+/// and every consumer - CLI offer, GUI retry, --yes tip - treats the hint
+/// as "browser cookies may fix this", not as a diagnosis.)
 pub fn looks_like_auth(line: &str) -> bool {
-    // Require a diagnostics context: both loaders prefix real problems
-    // ("ERROR: ..." / "WARNING: ..." in yt-dlp, "... ERROR - ..." in aria2).
-    // Without this, a filename or URI merely containing e.g. "forbidden"
-    // ("https://host/forbidden-songs.mp3" echoed in an unrelated failure)
-    // flips the auth heuristic and the app nags about browser cookies.
-    let dominated =
-        contains_ignore_ascii_case(line, "error") || contains_ignore_ascii_case(line, "warning");
-    dominated
+    // Require the loaders' own diagnostics shape: "ERROR:" / "WARNING:"
+    // lines (yt-dlp), aria2's "... ERROR - ..." and "[ERROR]/[WARNING]"
+    // tags. A bare "error" anywhere is not enough: a video titled
+    // "How to fix HTTP Error 429 - Too Many Requests" arrives inside a
+    // regular Destination line, and such remote text must not arm the
+    // cookie hint for an unrelated later failure.
+    has_diagnostics_context(line)
         && AUTH_HINTS
             .iter()
             .any(|p| contains_ignore_ascii_case(line, p))
+}
+
+fn has_diagnostics_context(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("ERROR:")
+        || trimmed.starts_with("WARNING:")
+        || line.contains(" ERROR - ")
+        || contains_ignore_ascii_case(line, "[error]")
+        || contains_ignore_ascii_case(line, "[warning]")
 }
 
 /// aria2's progress summary starts the line; finding `[#` anywhere would
@@ -322,23 +347,112 @@ pub fn batch_name(url: &str) -> String {
 /// one - used to upgrade a job's label from `batch_name`'s URL guess (which,
 /// for a `/watch` URL, is at best a video id) to the actual title, mirroring
 /// how TorrentMeta/TorrentName upgrade an aria2/torrent job's label.
+/// Subtitle downloads announce subtitles through the generic "Destination:"
+/// line and, before it, "[info] Writing video subtitles to:"; both name the
+/// written file, so either can serve as the title source. Their "<lang>"
+/// segment ("Title [id].en.vtt") is not part of the title.
 pub fn ytdlp_title_from_line(line: &str) -> Option<String> {
-    let path = if let Some(rest) = line.strip_prefix("[download] Destination: ") {
-        rest
-    } else if let Some(rest) = line.strip_prefix("[download] ") {
-        rest.strip_suffix(" has already been downloaded")?
-    } else {
-        let rest = line.strip_prefix("[Merger] Merging formats into \"")?;
-        rest.strip_suffix('"')?
-    };
+    let (path, subtitle) =
+        if let Some(rest) = line.strip_prefix("[info] Writing video subtitles to: ") {
+            (rest, true)
+        } else if let Some(rest) = line.strip_prefix("[download] Destination: ") {
+            (rest, has_subtitle_extension(rest))
+        } else if let Some(rest) = line.strip_prefix("[download] ") {
+            let rest = rest.strip_suffix(" has already been downloaded")?;
+            (rest, has_subtitle_extension(rest))
+        } else {
+            let rest = line.strip_prefix("[Merger] Merging formats into \"")?;
+            (rest.strip_suffix('"')?, false)
+        };
     let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let stem = name.rsplit_once('.').map(|(s, _)| s).unwrap_or(name);
+    let stem = if subtitle {
+        strip_subtitle_language(stem)
+    } else {
+        stem
+    };
     (!stem.is_empty()).then(|| stem.to_string())
+}
+
+/// Extensions yt-dlp writes for subtitles; media files never use them, so a
+/// "Destination:" line with one is a subtitle and may carry a language tag.
+fn has_subtitle_extension(path: &str) -> bool {
+    matches!(
+        path.rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("vtt" | "srt" | "ass" | "lrc" | "ttml" | "dfxp" | "json3")
+    )
+}
+
+/// "<title> [<id>].<lang>" -> "<title> [<id>]" for language-shaped tags
+/// ("en", "ru", "pt-BR", "zh-Hans", "es-419"); anything else is left as is.
+fn strip_subtitle_language(stem: &str) -> &str {
+    let Some((base, tag)) = stem.rsplit_once('.') else {
+        return stem;
+    };
+    let mut parts = tag.split('-');
+    let head = parts.next().unwrap_or_default();
+    let head_ok = (2..=3).contains(&head.len()) && head.chars().all(|c| c.is_ascii_alphabetic());
+    let tail_ok = parts
+        .all(|p| !p.is_empty() && p.len() <= 8 && p.chars().all(|c| c.is_ascii_alphanumeric()));
+    if head_ok && tail_ok {
+        base
+    } else {
+        stem
+    }
 }
 
 pub struct RunResult {
     pub code: i32,
     pub auth_hint: bool,
+}
+
+/// Watches yt-dlp's subtitle lines for the subtitles-only format ("subs").
+/// yt-dlp exits 0 when the video has none of the requested subtitles
+/// ("There are no subtitles for the requested languages"), which for a user
+/// who asked for text files means an empty folder, not a finished download.
+/// Shared by the CLI (pipe readers) and the GUI (log drain).
+#[derive(Default)]
+pub struct SubtitleWatch {
+    written: std::sync::atomic::AtomicBool,
+    missing: std::sync::atomic::AtomicBool,
+}
+
+impl SubtitleWatch {
+    /// Cheap to call for every child-output line: lines that do not mention
+    /// subtitles at all leave after one case-insensitive scan.
+    pub fn observe(&self, line: &str) {
+        use std::sync::atomic::Ordering;
+        if !contains_ignore_ascii_case(line, "subtitle") {
+            return;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("[info] Writing video subtitles to: ")
+            || trimmed.starts_with("[info] Video subtitle")
+        {
+            // A fresh write or a subtitle file that is already on disk:
+            // either way the requested artifact exists.
+            self.written.store(true, Ordering::Relaxed);
+        } else if trimmed.starts_with("[info] There are no subtitles for the requested languages") {
+            self.missing.store(true, Ordering::Relaxed);
+        }
+    }
+
+    pub fn written(&self) -> bool {
+        self.written.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn missing(&self) -> bool {
+        self.missing.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// True when a finished run must be reported as a failure instead of
+    /// success: subtitles-only requested, yt-dlp exited 0, it said none of
+    /// the requested languages exist, and nothing was written.
+    pub fn nothing_written(&self, fmt: &str, code: i32) -> bool {
+        fmt == "subs" && code == 0 && self.missing() && !self.written()
+    }
 }
 
 /// Decode one line of child-pipe bytes best-effort: strict UTF-8 first
@@ -355,14 +469,17 @@ pub fn decode_child_bytes(bytes: &[u8]) -> Cow<'_, str> {
     }
 }
 
-/// Strip terminal escape sequences supplied by downloaded titles/filenames,
-/// preserving CR/LF so a progress line can still update in place in the CLI.
-/// Чистую строку (типичный вывод загрузчиков) возвращает заимствованной —
-/// без аллокации и копирования на каждую строку.
+/// Strip terminal escape sequences and invisible bidi/format characters
+/// supplied by downloaded titles/filenames, preserving CR/LF so a progress
+/// line can still update in place in the CLI. Чистую строку (типичный вывод
+/// загрузчиков) возвращает заимствованной — без аллокации и копирования на
+/// каждую строку.
 pub fn sanitize_child_output(text: &str) -> Cow<'_, str> {
-    let dirty = text
-        .chars()
-        .any(|c| c == '\x1b' || (c.is_control() && !matches!(c, '\r' | '\n' | '\t')));
+    let dirty = text.chars().any(|c| {
+        c == '\x1b'
+            || crate::ui::is_disguising_format(c)
+            || (c.is_control() && !matches!(c, '\r' | '\n' | '\t'))
+    });
     if !dirty {
         return Cow::Borrowed(text);
     }
@@ -387,6 +504,10 @@ pub fn sanitize_child_output(text: &str) -> Cow<'_, str> {
                 }
                 _ => {}
             }
+        } else if crate::ui::is_disguising_format(c) {
+            // Invisible bidi/format controls let a remote title read as a
+            // different one ("Track\u{202E}3pm.exe" shows as "Track exe.mp3").
+            // They render as nothing, so drop them instead of echoing them.
         } else if matches!(c, '\r' | '\n' | '\t') || !c.is_control() {
             out.push(c);
         } else {
@@ -431,7 +552,9 @@ fn cp1251_to_utf8(bytes: &[u8]) -> String {
         '\u{2022}', '\u{2013}', '\u{2014}', '\u{FFFD}', '\u{2122}', '\u{0459}', '\u{203A}',
         '\u{045A}', '\u{045C}', '\u{045B}', '\u{045F}',
     ];
-    let mut out = String::with_capacity(bytes.len());
+    // Every cp1251 byte can become three UTF-8 bytes (…, €, ™): a one-to-one
+    // capacity reallocates on any line with a special character.
+    let mut out = String::with_capacity(bytes.len().saturating_mul(3));
     for &b in bytes {
         let c = match b {
             0x00..=0x7F => b as char,
@@ -979,6 +1102,21 @@ fn url_basename(url: &str) -> String {
     name
 }
 
+/// The name SNATCH pins an aria2 job to. A URL whose path yields no file name
+/// ("https://host/", ".../dir/", ".../..") gets a deterministic synthetic
+/// one: it keeps the lock/origin/foreign-pair records meaningful (all three
+/// are keyed by the target name) and keeps -o pinning the written file.
+/// Without it aria2 itself would pick the name - the server's
+/// Content-Disposition included - and a pre-existing same-name partial pair
+/// would be silently continued, exactly what the F1 guard exists to stop.
+fn aria2_pinned_name(url: &str) -> String {
+    let name = url_basename(url);
+    if !name.is_empty() {
+        return name;
+    }
+    format!("snatch-{}.bin", &aria2_url_hash(url)[..12])
+}
+
 /// Lock and ownership records live outside Downloads, shared by the CLI and
 /// the GUI. A bare .aria2 file does NOT establish that its
 /// source URL matches this job; aria2 -c can overwrite an unrelated partial.
@@ -1030,7 +1168,7 @@ fn canonical_is_unc(path: &Path) -> bool {
 }
 
 fn aria2_owned_partial_in(url: &str, out: &Path, state_dir: &Path) -> bool {
-    let name = url_basename(url);
+    let name = aria2_pinned_name(url);
     !name.is_empty()
         && out.join(&name).is_file()
         && out.join(format!("{name}.aria2")).is_file()
@@ -1043,7 +1181,7 @@ fn aria2_owned_partial(url: &str, out: &Path) -> bool {
 }
 
 fn aria2_foreign_target(url: &str, out: &Path) -> bool {
-    let name = url_basename(url);
+    let name = aria2_pinned_name(url);
     ALLOWED_SCHEMES.contains(&scheme_of(url).as_str())
         && !name.is_empty()
         && out.join(name).exists()
@@ -1059,7 +1197,7 @@ fn aria2_foreign_pair(url: &str, out: &Path) -> Option<String> {
     if !ALLOWED_SCHEMES.contains(&scheme_of(url).as_str()) {
         return None;
     }
-    let name = url_basename(url);
+    let name = aria2_pinned_name(url);
     if name.is_empty() {
         return None;
     }
@@ -1088,7 +1226,7 @@ fn lock_aria2_target_in(
     if job.engine != "aria2" || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) {
         return Ok(None);
     }
-    let name = url_basename(&job.url);
+    let name = aria2_pinned_name(&job.url);
     if name.is_empty() {
         return Ok(None);
     }
@@ -1217,12 +1355,12 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
         // so the name the lock/origin records were computed for is exactly
         // the file aria2 writes - otherwise a foreign same-name pair slips
         // past aria2_foreign_pair and aria2 continues a stranger's bytes.
+        // A URL without a file name in its path gets the deterministic
+        // fallback pin (see aria2_pinned_name): skipping the pin for it
+        // would silently disable every one of those checks.
         if !is_bittorrent_input(&job.url) {
-            let name = url_basename(&job.url);
-            if !name.is_empty() {
-                cmd.push("-o".into());
-                cmd.push(name.into());
-            }
+            cmd.push("-o".into());
+            cmd.push(aria2_pinned_name(&job.url).into());
         }
         // F1: a same-name file WITH a .aria2 control file is auto-continued by
         // aria2 even without -c, silently mixing two sources' bytes. Our own
@@ -1265,7 +1403,15 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
     } else {
         "--no-playlist"
     }));
-    if extras.subs {
+    // The "subs" format is subtitles-only: pure text, no media. yt-dlp
+    // writes the requested sidecar files and skips the video itself with
+    // --skip-download; --convert-subs srt turns captions into plain text
+    // (ffmpeg is required - without it yt-dlp keeps the source vtt).
+    let subs_only = job.fmt == "subs";
+    if extras.subs || subs_only {
+        if subs_only {
+            cmd.push("--skip-download".into());
+        }
         cmd.push("--write-subs".into());
         cmd.push("--write-auto-subs".into());
         cmd.push("--sub-langs".into());
@@ -1275,6 +1421,10 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
             extras.sub_langs.trim()
         };
         cmd.push(langs.into());
+        if subs_only {
+            cmd.push("--convert-subs".into());
+            cmd.push("srt".into());
+        }
     }
     if matches!(job.fmt.as_str(), "audio" | "audio-src") {
         // Use the downloader's existing postprocessors, with no new runtime.
@@ -1459,6 +1609,14 @@ fn preflight_warning_with_ffmpeg(job: &Job, has_ffmpeg: bool, has_js: bool) -> V
                     tr!(
                         "ffmpeg not found — original audio extraction and cover embedding may fail. Install tools from the GUI or with `snatch --install-tools`.",
                         "Не найден ffmpeg — извлечение исходного аудио и встраивание обложки могут не сработать. Установите инструменты в GUI или через `snatch --install-tools`."
+                    )
+                    .to_string(),
+                );
+            } else if job.fmt == "subs" {
+                warns.push(
+                    tr!(
+                        "ffmpeg not found — subtitles will stay in the source format (vtt) instead of .srt. Install tools from the GUI or with `snatch --install-tools`.",
+                        "Не найден ffmpeg — субтитры останутся в исходном формате (vtt), без конвертации в .srt. Установите инструменты в GUI или через `snatch --install-tools`."
                     )
                     .to_string(),
                 );
@@ -1972,6 +2130,41 @@ mod tests {
     }
 
     #[test]
+    fn a_url_without_a_file_name_still_gets_a_pinned_aria2_target() {
+        let out = tmp_out();
+        let job = Job {
+            engine: "aria2".into(),
+            url: "https://h/dir/".into(),
+            out_dir: out.clone(),
+            fmt: "best".into(),
+            cookies_browser: None,
+        };
+        // Without -o, aria2 would follow the server's Content-Disposition
+        // and none of the lock/origin/foreign-pair checks could run.
+        let s = args_of(&build(&job, &tc_aria2()).unwrap());
+        let i = s.iter().position(|a| a == "-o").expect("-o missing");
+        assert!(
+            s[i + 1].starts_with("snatch-") && s[i + 1].ends_with(".bin"),
+            "{}",
+            s[i + 1]
+        );
+        // Deterministic: the same URL always maps to the same target, so
+        // retries and origin records agree.
+        let again = args_of(&build(&job, &tc_aria2()).unwrap());
+        assert_eq!(again[i + 1], s[i + 1]);
+
+        // A URL that has a name keeps it unchanged.
+        let named = Job {
+            url: "https://h/My%20File.zip".into(),
+            ..job
+        };
+        let s = args_of(&build(&named, &tc_aria2()).unwrap());
+        let i = s.iter().position(|a| a == "-o").unwrap();
+        assert_eq!(s[i + 1], "My File.zip");
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
     fn an_encoded_url_resumes_only_its_own_decoded_partial() {
         let out = tmp_out();
         let state = std::env::temp_dir().join(format!("snatch-owned-enc-{}", std::process::id()));
@@ -2322,6 +2515,7 @@ mod tests {
             "480p",
             "audio",
             "audio-src",
+            "subs",
         ] {
             assert!(keys.contains(&k), "{k}");
         }
@@ -2368,9 +2562,51 @@ mod tests {
         assert!(s.contains(&"--yes-playlist".to_string()), "{s:?}");
         assert!(!s.contains(&"--no-playlist".to_string()));
         assert!(s.contains(&"--write-subs".to_string()));
+        // Alongside-the-video subtitles never skip the media download.
+        assert!(!s.contains(&"--skip-download".to_string()));
         let i = s.iter().position(|a| a == "--sub-langs").unwrap();
         assert_eq!(s[i + 1], "ru,en");
         assert!(s.windows(2).any(|w| w == ["--limit-rate", "5M"]));
+        std::fs::remove_dir_all(&out).ok();
+    }
+
+    #[test]
+    fn subs_format_downloads_subtitles_only_and_converts_to_srt() {
+        let out = tmp_out();
+        let job = Job {
+            engine: "yt-dlp".into(),
+            url: "https://youtu.be/x".into(),
+            out_dir: out.clone(),
+            fmt: "subs".into(),
+            cookies_browser: None,
+        };
+        // No --subs checkbox and no explicit languages: the subtitles-only
+        // format itself must request subs, with the documented default.
+        let s = args_of(&build_with(&job, &tc_ytdlp(), &RunExtras::default()).unwrap());
+        for flag in [
+            "--skip-download",
+            "--write-subs",
+            "--write-auto-subs",
+            "--convert-subs",
+        ] {
+            assert!(s.contains(&flag.to_string()), "{flag} missing: {s:?}");
+        }
+        let i = s.iter().position(|a| a == "--sub-langs").unwrap();
+        assert_eq!(s[i + 1], "ru,en");
+        let i = s.iter().position(|a| a == "--convert-subs").unwrap();
+        assert_eq!(s[i + 1], "srt");
+        // No media format selection and no audio artwork postprocessors.
+        assert!(!s.contains(&"-f".to_string()), "{s:?}");
+        assert!(!s.contains(&"--embed-thumbnail".to_string()), "{s:?}");
+
+        // An explicit language list still wins.
+        let extras = RunExtras {
+            sub_langs: "de".into(),
+            ..RunExtras::default()
+        };
+        let s = args_of(&build_with(&job, &tc_ytdlp(), &extras).unwrap());
+        let i = s.iter().position(|a| a == "--sub-langs").unwrap();
+        assert_eq!(s[i + 1], "de");
         std::fs::remove_dir_all(&out).ok();
     }
 
@@ -2622,11 +2858,20 @@ mod tests {
             .any(|w| w.contains("Deno")));
         let audio = Job {
             fmt: "audio".into(),
-            ..job
+            ..job.clone()
         };
         assert!(preflight_warning_with_ffmpeg(&audio, false, true)
             .iter()
             .any(|w| w.contains("mp3")));
+        let subs = Job {
+            fmt: "subs".into(),
+            ..job
+        };
+        let warns = preflight_warning_with_ffmpeg(&subs, false, true);
+        assert!(warns.iter().any(|w| w.contains(".srt")), "{warns:?}");
+        // Subtitles-only downloads never mention video/audio merging.
+        assert!(!warns.iter().any(|w| w.contains("merging")), "{warns:?}");
+        assert!(preflight_warning_with_ffmpeg(&subs, true, true).is_empty());
     }
 
     #[test]
@@ -2640,6 +2885,11 @@ mod tests {
             "ERROR: unable to download video data: HTTP Error 403: Forbidden",
             "ERROR: requires authentication",
             "ERROR: [youtube] x: Join this channel to get access",
+            // Rate limiting is treated as a cookie hint: the retry offer is
+            // "try cookies from your browser", which is YouTube's own cure.
+            "ERROR: Unable to download video subtitles for 'ru': HTTP Error 429: Too Many Requests",
+            "ERROR: unable to download video data: HTTP Error 429: Too Many Requests",
+            "09/27 03:10:34 [ERROR] CUID#7 - Download aborted. HTTP Error 403: Forbidden",
         ] {
             assert!(looks_like_auth(line), "{line}");
         }
@@ -2652,6 +2902,12 @@ mod tests {
             // to contain a hint phrase must not flip the heuristic
             "CUID#7 - Download aborted. URI=`https://host/forbidden-songs.mp3'",
             "Sign in to confirm you're not a bot",
+            // A file title containing the phrase, without the "ERROR:" /
+            // "WARNING:" diagnostics context, must not arm the offer.
+            "/out/How To Handle Too Many Requests.mp4 has already been downloaded",
+            // A real 429 line, but a Destination path - the title happens to
+            // say "Error 429"; only the loaders' own prefixes count.
+            "[download] Destination: C:\\v\\How to Fix HTTP Error 429 - Too Many Requests.mp4",
         ] {
             assert!(!looks_like_auth(line), "{line}");
         }
@@ -2859,7 +3115,71 @@ mod tests {
             ),
             Some("Already Downloaded".to_string())
         );
+        assert_eq!(
+            ytdlp_title_from_line(
+                "[info] Writing video subtitles to: C:\\out\\Rick Astley - Never Gonna Give You Up [dQw4w9WgXcQ].en.vtt"
+            ),
+            Some("Rick Astley - Never Gonna Give You Up [dQw4w9WgXcQ]".to_string())
+        );
+        assert_eq!(
+            ytdlp_title_from_line("[info] Writing video subtitles to: /out/Клип.zh-Hans.srt"),
+            Some("Клип".to_string())
+        );
+        // The real subtitle download repeats it as a generic "Destination:"
+        // line - same stripping there; a media file whose stem merely looks
+        // like a language tag must stay intact.
+        assert_eq!(
+            ytdlp_title_from_line(
+                "[download] Destination: C:\\out\\Rick Astley - Never Gonna Give You Up [dQw4w9WgXcQ].en.vtt"
+            ),
+            Some("Rick Astley - Never Gonna Give You Up [dQw4w9WgXcQ]".to_string())
+        );
+        assert_eq!(
+            ytdlp_title_from_line("[download] Destination: /out/Interview.en.mp4"),
+            Some("Interview.en".to_string())
+        );
         assert_eq!(ytdlp_title_from_line("[download]  42.0% of 10.00MiB"), None);
         assert_eq!(ytdlp_title_from_line("some unrelated line"), None);
+    }
+
+    #[test]
+    fn subtitle_language_suffixes_are_stripped_but_real_dots_are_kept() {
+        assert_eq!(strip_subtitle_language("Title [id].en"), "Title [id]");
+        assert_eq!(strip_subtitle_language("Title [id].ru"), "Title [id]");
+        assert_eq!(strip_subtitle_language("Title [id].pt-BR"), "Title [id]");
+        assert_eq!(strip_subtitle_language("Title [id].zh-Hans"), "Title [id]");
+        assert_eq!(strip_subtitle_language("Title [id].es-419"), "Title [id]");
+        // Not language-shaped: kept whole.
+        assert_eq!(strip_subtitle_language("Title [id]"), "Title [id]");
+        assert_eq!(strip_subtitle_language("Title [id].mp4"), "Title [id].mp4");
+        assert_eq!(strip_subtitle_language("Версия 2.0"), "Версия 2.0");
+    }
+
+    #[test]
+    fn subtitle_watch_separates_written_from_no_subtitles() {
+        let watch = SubtitleWatch::default();
+        watch.observe("[info] There are no subtitles for the requested languages");
+        assert!(watch.missing() && !watch.written());
+        assert!(watch.nothing_written("subs", 0));
+        // Only the subtitles-only format and a clean exit turn this into a
+        // failure; a failed run already reports its own error.
+        assert!(!watch.nothing_written("best", 0));
+        assert!(!watch.nothing_written("subs", 1));
+
+        // A written (or already present) subtitle file is the success shape.
+        let watch = SubtitleWatch::default();
+        watch.observe("[info] Writing video subtitles to: C:\\out\\Clip [id].en.vtt");
+        assert!(watch.written() && !watch.missing());
+        assert!(!watch.nothing_written("subs", 0));
+
+        let watch = SubtitleWatch::default();
+        watch.observe("[info] Video subtitle en.vtt is already present");
+        assert!(watch.written());
+
+        // Unrelated lines are ignored entirely, subtitle-ish ones too.
+        let watch = SubtitleWatch::default();
+        watch.observe("[download] Destination: C:\\out\\Clip.en.mp4");
+        watch.observe("[info] Writing video description to: C:\\out\\Clip.en.description");
+        assert!(!watch.written() && !watch.missing());
     }
 }

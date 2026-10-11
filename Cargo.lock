@@ -2635,7 +2635,7 @@ dependencies = [
 
 [[package]]
 name = "snatch-rs"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "clap",
  "crossterm",

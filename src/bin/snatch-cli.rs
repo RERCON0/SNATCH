@@ -82,7 +82,7 @@ struct Args {
     #[arg(short = 'e', long, value_parser = ["yt-dlp", "aria2"])]
     #[arg(help = tr!("Downloader (default: automatic)", "Движок (по умолчанию — авто-подсказка)"))]
     engine: Option<String>,
-    #[arg(short = 'f', long, value_parser = ["best", "2160p", "1440p", "1080p", "720p", "480p", "audio", "audio-src"])]
+    #[arg(short = 'f', long, value_parser = ["best", "2160p", "1440p", "1080p", "720p", "480p", "audio", "audio-src", "subs"])]
     #[arg(help = tr!("yt-dlp format", "Формат для yt-dlp"))]
     format: Option<String>,
     #[arg(short = 'y', long)]
@@ -101,7 +101,7 @@ struct Args {
     #[arg(help = tr!("Install yt-dlp, aria2c, ffmpeg and Deno in the SNATCH tools folder (Windows)", "Установить загрузчики и помощники (yt-dlp, aria2c, ffmpeg, Deno) в собственную папку SNATCH (Windows)"))]
     install_tools: bool,
     #[arg(long)]
-    #[arg(help = tr!("Restart an interrupted download from scratch instead of resuming", "Не докачивать прерванное, начать файл с начала — лечит протухший .part («Invalid data» при склейке). В GUI такой повтор происходит автоматически."))]
+    #[arg(help = tr!("Restart an interrupted yt-dlp download from scratch instead of resuming", "Не докачивать прерванное (yt-dlp), начать файл с начала — лечит протухший .part («Invalid data» при склейке). В GUI такой повтор происходит автоматически."))]
     no_continue: bool,
     #[arg(long)]
     #[arg(help = tr!("Download subtitles alongside the video (yt-dlp)", "Скачивать субтитры рядом с видео (yt-dlp)"))]
@@ -673,6 +673,7 @@ fn read_batch_pipe(
     aria2: bool,
     tx: &mpsc::Sender<BatchEvent>,
     auth: &AtomicBool,
+    subs: &engines::SubtitleWatch,
 ) {
     let mut reader = BufReader::new(reader);
     let mut buf = Vec::new();
@@ -691,6 +692,7 @@ fn read_batch_pipe(
             if engines::looks_like_auth(line) {
                 auth.store(true, Ordering::Relaxed);
             }
+            subs.observe(line);
             if line.contains("Download Progress Summary as of")
                 || line.chars().all(|c| c == '-' || c == '=')
             {
@@ -831,25 +833,52 @@ fn run_batch_job(
     };
     drop(install_guard);
     let auth = Arc::new(AtomicBool::new(false));
+    let subs = Arc::new(engines::SubtitleWatch::default());
     let stderr = child.stderr.take().expect("stderr piped");
     let stdout = child.stdout.take().expect("stdout piped");
     let err_tx = tx.clone();
     let err_auth = auth.clone();
+    let err_subs = subs.clone();
     let aria2 = job.engine == "aria2";
-    let err_reader =
-        std::thread::spawn(move || read_batch_pipe(stderr, id, aria2, &err_tx, &err_auth));
+    let err_reader = std::thread::spawn(move || {
+        read_batch_pipe(stderr, id, aria2, &err_tx, &err_auth, &err_subs)
+    });
     let out_tx = tx.clone();
     let out_auth = auth.clone();
-    let out_reader =
-        std::thread::spawn(move || read_batch_pipe(stdout, id, aria2, &out_tx, &out_auth));
+    let out_subs = subs.clone();
+    let out_reader = std::thread::spawn(move || {
+        read_batch_pipe(stdout, id, aria2, &out_tx, &out_auth, &out_subs)
+    });
     let status = child.wait();
     if let Some(job) = &proc_job {
         job.terminate();
     }
     let _ = out_reader.join();
     let _ = err_reader.join();
+    let code = status.map(|s| s.code().unwrap_or(130)).unwrap_or(127);
+    if subs.nothing_written(&plan.fmt, code) {
+        // yt-dlp treats "no subtitles for the requested languages" as
+        // success; for the subtitles-only format that is an empty folder,
+        // not a finished request - report it instead of claiming "Done".
+        let langs = if plan.extras.sub_langs.trim().is_empty() {
+            "ru,en"
+        } else {
+            plan.extras.sub_langs.trim()
+        };
+        let _ = tx.send(BatchEvent::Line(
+            id,
+            tr_format!(
+                "✘ No subtitles in {langs}: nothing was written (the video itself is never downloaded in subs mode).",
+                "✘ Субтитров на языках {langs} нет: ничего не записано (в режиме «только субтитры» само видео не скачивается)."
+            ),
+        ));
+        return RunResult {
+            code: RETRY_CODE,
+            auth_hint: false,
+        };
+    }
     RunResult {
-        code: status.map(|s| s.code().unwrap_or(130)).unwrap_or(127),
+        code,
         auth_hint: auth.load(Ordering::Relaxed),
     }
 }
@@ -1019,8 +1048,8 @@ fn retry_with_cookies_inner(
                 result.code
             )
         } else {
-            tr_format!("\nDownload failed (code {}). This site may require sign-in: retry with your browser cookies?", "\nНе скачалось (код {}). Похоже, сайту нужна авторизация: можно взять куки \
-                 из браузера и повторить. Попробовать?",
+            tr_format!("\nDownload failed (code {}). This site may require sign-in or rate-limit the requests: retry with your browser cookies?", "\nНе скачалось (код {}). Возможно, нужен вход или сайт ограничил запросы: можно взять \
+                 куки из браузера и повторить. Попробовать?",
                 result.code
             )
         };
@@ -1526,14 +1555,36 @@ fn main() -> std::process::ExitCode {
     }
 
     if args.yes {
-        let code = match plans_from_args(&args) {
-            Some(plans) if plans.len() == 1 => download(&plans[0], &mut cfg, None).code,
+        let (code, cookies_hint) = match plans_from_args(&args) {
+            Some(plans) if plans.len() == 1 => {
+                let result = download(&plans[0], &mut cfg, None);
+                (
+                    result.code,
+                    result.auth_hint
+                        && plans[0].engine == "yt-dlp"
+                        && plans[0].cookies_browser.is_none(),
+                )
+            }
             Some(plans) => {
                 let tc = Toolchain::discover();
-                batch_exit_code(&run_batch(&plans, &mut cfg, &tc, usize::from(args.jobs)))
+                let results = run_batch(&plans, &mut cfg, &tc, usize::from(args.jobs));
+                // -y cannot ask interactively; results all share the one
+                // --cookies-from-browser value, so "already using cookies"
+                // applies to the whole batch. Cookies are a yt-dlp remedy
+                // only - an aria2 failure must not advertise them.
+                let cookies_hint = plans.iter().zip(&results).any(|(plan, result)| {
+                    result.auth_hint && plan.engine == "yt-dlp" && plan.cookies_browser.is_none()
+                });
+                (batch_exit_code(&results), cookies_hint)
             }
-            None => 2,
+            None => (2, false),
         };
+        if cookies_hint && code != 0 {
+            errln(tr!(
+                "Tip: the site may require sign-in or rate-limit the requests (HTTP 429). Retry with `--cookies-from-browser chrome` — or run without -y to pick a browser interactively.",
+                "Подсказка: сайту может требоваться вход или он ограничил запросы (429). Повторите с `--cookies-from-browser chrome` — либо запустите без -y и выберите браузер из списка."
+            ));
+        }
         return exit_code(code);
     }
 
@@ -2271,7 +2322,14 @@ mod tests {
                        FILE: C:/Downloads/Cuphead_1.3.9/setup-1.bin (7more)\n\
                        *** Download Progress Summary as of now ***\n\
                        [#bc1f6e 0B/6.8GiB(0%) CN:0 SD:0 DL:0B] [FileAlloc:#bc1f6e 1.1GiB/3.3GiB(33%)]\n";
-        read_batch_pipe(&output[..], 0, true, &tx, &auth);
+        read_batch_pipe(
+            &output[..],
+            0,
+            true,
+            &tx,
+            &auth,
+            &engines::SubtitleWatch::default(),
+        );
         let events: Vec<_> = rx.try_iter().collect();
         assert_eq!(events.len(), 3);
         assert!(matches!(&events[1], BatchEvent::Name(0, name) if name == "Cuphead_1.3.9"));
@@ -2286,6 +2344,47 @@ mod tests {
             stat.contains("88% · 880KiB/0.9MiB · ↓812KiB/s · seeds 4 · connections 1"),
             "{stat}"
         );
+    }
+
+    #[test]
+    fn batch_pipe_flags_rate_limited_subtitles_as_a_cookies_hint() {
+        // The exact shape a real run produced: subtitles, HTTP 429. The pipe
+        // reader must arm the cookies retry ("try cookies from a browser?")
+        // and still report the line to the user.
+        let (tx, rx) = mpsc::channel();
+        let auth = AtomicBool::new(false);
+        let output = b"ERROR: Unable to download video subtitles for 'ru': HTTP Error 429: Too Many Requests\n";
+        read_batch_pipe(
+            &output[..],
+            0,
+            false,
+            &tx,
+            &auth,
+            &engines::SubtitleWatch::default(),
+        );
+        assert!(auth.load(Ordering::Relaxed));
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BatchEvent::Line(0, l) if l.contains("429"))),
+            "no 429 line among {} events",
+            events.len()
+        );
+    }
+
+    #[test]
+    fn batch_pipe_feeds_the_subtitle_watch() {
+        let (tx, _rx) = mpsc::channel();
+        let auth = AtomicBool::new(false);
+        let subs = engines::SubtitleWatch::default();
+        let output =
+            b"[info] There are no subtitles for the requested languages\n[info] Downloading 1 format(s)\n";
+        read_batch_pipe(&output[..], 0, false, &tx, &auth, &subs);
+        assert!(subs.missing() && !subs.written());
+        assert!(subs.nothing_written("subs", 0));
+        // The same line must not arm the cookie offer.
+        assert!(!auth.load(Ordering::Relaxed));
     }
 
     #[test]

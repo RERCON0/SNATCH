@@ -78,7 +78,7 @@ SNATCH создан, чтобы быстро получить нужный ма�
 
 - **English / Русский**: кнопка EN / RU рядом с темой в шапке GUI или `snatch --lang en|ru`.
 - **Автовыбор движка** для видео, прямых ссылок и торрентов.
-- **Качество на выбор**: до 2160p, mp3 или исходное аудио, субтитры и плейлисты.
+- **Качество на выбор**: до 2160p, mp3 или исходное аудио, субтитры (в том числе только текст в `.srt`) и плейлисты.
 - **Музыка с обложкой**: превью и доступные теги из источника встраиваются в MP3, M4A и Opus. Исходные AAC/Opus сохраняются без перекодирования; нужен ffmpeg.
 - **Докачка после сбоя** с проверкой принадлежности файла исходной загрузке.
 - **Несколько задач в CLI**: до трёх одновременно по умолчанию, `-j 1..16`.
@@ -169,6 +169,7 @@ snatch "magnet:?xt=urn:btih:..."
 snatch "https://host/file.zip" -y -o "D:\Downloads"
 snatch "https://youtube.com/watch?v=..." -y -o "D:\Video" -f 1080p
 snatch "https://youtube.com/watch?v=..." -y -o "D:\Music" -f audio
+snatch "https://youtube.com/watch?v=..." -y -o "D:\Text" -f subs
 snatch "magnet:?xt=urn:btih:..." "https://host/file.zip" -y -o "D:\Downloads" -j 2
 ```
 
@@ -177,10 +178,10 @@ snatch "magnet:?xt=urn:btih:..." "https://host/file.zip" -y -o "D:\Downloads" -j
 | `-o, --output` | Папка сохранения |
 | `-j, --jobs` | Число одновременных задач: 1–16 |
 | `-e, --engine` | Выбрать движок вручную |
-| `-f, --format` | `best`, 2160p–480p, `audio` (mp3), `audio-src` |
+| `-f, --format` | `best`, 2160p–480p, `audio` (mp3), `audio-src`, `subs` (только `.srt`) |
 | `--subs`, `--playlist` | Субтитры или весь плейлист |
 | `--cookies-from-browser` | Сессия браузера для авторизации |
-| `--no-continue` | Повторить прерванную загрузку с начала |
+| `--no-continue` | Повторить прерванную загрузку yt-dlp с начала |
 | `--clear-history` | Очистить историю ссылок и папок |
 
 Полный список, дополнительные аргументы и настройка путей —

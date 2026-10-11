@@ -77,7 +77,7 @@ link and a running download.
 ## Features
 
 - **Automatic engine selection** for videos, direct links and torrents.
-- **Quality options:** video up to 2160p, mp3 or original audio, subtitles and playlists.
+- **Quality options:** video up to 2160p, mp3 or original audio, subtitles (including `.srt`-only text downloads) and playlists.
 - **Audio with artwork:** embeds the source thumbnail and available tags in MP3, M4A and Opus downloads. AAC/Opus stays without re-encoding; ffmpeg is required.
 - **Safe resume:** interrupted downloads are checked against their original source.
 - **Concurrent CLI downloads:** three by default, configurable with `-j 1..16`.
@@ -159,6 +159,7 @@ Unattended downloads:
 snatch "https://host/file.zip" -y -o "D:\Downloads"
 snatch "https://youtube.com/watch?v=..." -y -o "D:\Video" -f 1080p
 snatch "https://youtube.com/watch?v=..." -y -o "D:\Music" -f audio
+snatch "https://youtube.com/watch?v=..." -y -o "D:\Text" -f subs
 snatch "magnet:?xt=urn:btih:..." "https://host/file.zip" -y -o "D:\Downloads" -j 2
 ```
 
@@ -182,10 +183,10 @@ subtitle languages and filenames are independent of the interface language.
 | `-o, --output` | Download folder |
 | `-j, --jobs` | Concurrent jobs: 1–16 |
 | `-e, --engine` | Choose an engine manually |
-| `-f, --format` | `best`, 2160p–480p, `audio` (mp3), `audio-src` |
+| `-f, --format` | `best`, 2160p–480p, `audio` (mp3), `audio-src`, `subs` (`.srt` only) |
 | `--subs`, `--playlist` | Subtitles or the full playlist |
 | `--cookies-from-browser` | Browser session for sign-in |
-| `--no-continue` | Restart an interrupted download from scratch |
+| `--no-continue` | Restart an interrupted yt-dlp download from scratch |
 | `--clear-history` | Clear recent links and folders |
 
 See the [CLI reference](docs/CLI.md) or `snatch --help` for all options.

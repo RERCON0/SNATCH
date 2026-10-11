@@ -8,13 +8,13 @@
 | `-o, --output <folder>` | Download folder |
 | `-j, --jobs <1..16>` | Concurrent downloads for multiple links (default: 3) |
 | `-e, --engine {yt-dlp,aria2}` | Engine (default: automatic) |
-| `-f, --format {best,2160p,1440p,1080p,720p,480p,audio,audio-src}` | yt-dlp format; `audio` converts to mp3, `audio-src` keeps the original audio |
+| `-f, --format {best,2160p,1440p,1080p,720p,480p,audio,audio-src,subs}` | yt-dlp format; `audio` converts to mp3, `audio-src` keeps the original audio, `subs` downloads subtitles only (`.srt`, no video) |
 | `--subs` | Download subtitles alongside the video (yt-dlp) |
 | `--sub-langs <ru,en>` | Subtitle languages (default: ru,en; independent of interface language) |
 | `--playlist` | Download the entire playlist instead of a single video |
 | `--yt-dlp-args <ARGS>` | Unrestricted yt-dlp arguments, including its config, output naming and `--exec`; SNATCH's safety guarantees apply to its own flags and the aria2 allowlist |
-| `--aria2-args <ARGS>` | Allowed aria2c options: speed/connection limits, proxies, headers, User-Agent/Referer, timeouts and retries. Values accept `=` or a space (`--max-tries=3`, `-x 16`). Options affecting filenames, folders, resume, config or input files, including abbreviations, are rejected |
-| `--no-continue` | Restart an interrupted download from scratch (useful for corrupt `.part` files; the GUI retries automatically) |
+| `--aria2-args <ARGS>` | Allowed aria2c options: speed/connection limits, proxies, headers, User-Agent/Referer, a cookie file (`--load-cookies`), timeouts and retries. Values accept `=` or a space (`--max-tries=3`, `-x 16`). Options affecting filenames, folders, resume, config or input files, including abbreviations, are rejected |
+| `--no-continue` | Restart an interrupted yt-dlp download from scratch (useful for corrupt `.part` files; aria2c verifies its own parts; the GUI retries automatically) |
 | `--cookies-from-browser <browser[:profile]>` | Pass a browser session to yt-dlp; e.g. `chrome:Profile 1` |
 | `-y, --yes` | Skip prompts (requires a URL and `-o`) |
 | `--clear-history` | Clear recent links and folders |
@@ -23,6 +23,10 @@
 | `-V, --version` | Show version |
 
 Audio modes embed the source thumbnail and available metadata by default. `audio-src` extracts AAC/Opus without re-encoding (WebM/Opus becomes `.opus`). This needs ffmpeg from `snatch --install-tools`. If the source has no thumbnail, audio still downloads. To omit artwork, pass `--yt-dlp-args "--no-embed-thumbnail"`.
+
+The `subs` format downloads subtitles only, without the video: manual and automatic captions in the `--sub-langs` languages (default `ru,en`), converted to `.srt`. This needs ffmpeg from `snatch --install-tools`; without it yt-dlp keeps the source `.vtt`. If the video has none of the requested subtitles, the job is reported as failed with a clear message: nothing is written, and the video itself is never downloaded in this mode.
+
+When a yt-dlp download fails in a way that cookies usually fix — sign-in and bot checks, age restrictions, HTTP 429 rate limiting — the interactive CLI offers to retry with browser cookies and asks which browser to read them from. The `-y` mode prints a tip instead, since it cannot ask.
 
 ## Interface language
 
