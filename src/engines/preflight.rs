@@ -156,6 +156,12 @@ pub(super) fn preflight_warning_with_ffmpeg(
         );
         return warns;
     }
+    if let Some(part) = ytdlp_foreign_part(job, &out) {
+        warns.push(tr_format!(
+            "“{part}” is a partial download from another link — downloading will be stopped so yt-dlp cannot continue it. Inspect and remove it (or choose another folder).",
+            "«{part}» — незавершённая загрузка с другой ссылки: загрузка будет остановлена, чтобы yt-dlp не продолжил её. Проверьте и удалите файл (или выберите другую папку)."
+        ));
+    }
     if job.engine == Engine::Aria2 || (job.engine == Engine::YtDlp && direct_via_aria2(&job.url)) {
         if let Some(name) = aria2_foreign_pair(job, &out) {
             warns.push(tr_format!("“{name}” has resume data from another download — downloading will be stopped so aria2 cannot resume someone else's file. Inspect and remove them (or choose another folder).", "В папке есть «{name}» с данными докачки от другой загрузки — загрузка будет \

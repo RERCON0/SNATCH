@@ -207,6 +207,14 @@ pub fn build_with(job: &Job, tc: &Toolchain, extras: &RunExtras) -> Result<Vec<O
     if let Some(name) = ytdlp_direct_output(job) {
         cmd.push("-o".into());
         cmd.push(name.into());
+        // yt-dlp would continue a stranger's `<name>.part`, mixing two links'
+        // bytes into one file: refuse instead (see ytdlp_foreign_part).
+        if let Some(part) = ytdlp_foreign_part(job, &out) {
+            return Err(tr_format!(
+                "“{part}” is a partial download from another link - yt-dlp would continue it and mix two sources. Inspect and remove it (or choose another folder), then retry.",
+                "«{part}» — незавершённая загрузка с другой ссылки: yt-dlp продолжил бы её и смешал бы два источника. Проверьте и удалите файл (или выберите другую папку), после чего повторите."
+            ));
+        }
     }
     cmd.push(OsString::from(if extras.playlist {
         "--yes-playlist"

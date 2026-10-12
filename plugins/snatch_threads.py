@@ -129,6 +129,21 @@ class SnatchThreadsIE(InfoExtractor):
             return cached
         return {'doc_id': _BUILT_IN_DOC_ID, 'flags': list(_BUILT_IN_FLAGS)}
 
+    def _shell_opener(self):
+        """An opener for the one request made outside yt-dlp (see _discover_query).
+
+        It must go where yt-dlp's own requests go: through --proxy when one is given. urllib
+        speaks HTTP(S) proxies only, so any other kind (socks...) makes this request fail
+        rather than leave the proxy - the caller then falls back to the page yt-dlp already
+        fetched.
+        """
+        proxy = self.get_param('proxy')
+        if not proxy:
+            return urllib.request.build_opener()
+        if not proxy.lower().startswith(('http://', 'https://')):
+            raise ValueError('the configured proxy is not an HTTP(S) proxy')
+        return urllib.request.build_opener(urllib.request.ProxyHandler({'http': proxy, 'https': proxy}))
+
     def _discover_query(self, page_url, webpage, code):
         """Find the current query id and its variables in the page's JavaScript bundles."""
         # The app shell differs by user agent (some get a crawler-oriented page whose script
@@ -136,10 +151,11 @@ class SnatchThreadsIE(InfoExtractor):
         # yt-dlp's own request headers (Sec-Fetch-Mode: navigate, Accept-Language) make Threads
         # serve the full server-rendered variant instead, so this one request is made with
         # the bare minimum a browser's first visit sends. The standard library honours the
-        # system proxy settings just like yt-dlp does.
+        # system proxy settings just like yt-dlp does, but not yt-dlp's own --proxy, so that
+        # one is applied by hand (see _shell_opener).
         try:
             request = urllib.request.Request(page_url, headers={'User-Agent': _BROWSER_UA})
-            with urllib.request.urlopen(request, timeout=30) as response:
+            with self._shell_opener().open(request, timeout=30) as response:
                 raw = response.read(_MAX_SHELL_BYTES + 1)
             if len(raw) > _MAX_SHELL_BYTES:
                 raise ValueError('the page is larger than expected')

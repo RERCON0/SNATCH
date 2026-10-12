@@ -2065,3 +2065,99 @@ fn an_older_file_of_the_same_name_is_never_touched_and_blocks_the_retry() {
     assert!(!out.join("photo.1.jpg.aria2").exists());
     std::fs::remove_dir_all(&out).ok();
 }
+
+fn ytdlp_direct_job(out: &Path) -> Job {
+    Job {
+        engine: Engine::YtDlp,
+        url: "https://example.com/files/file.zip".into(),
+        out_dir: out.to_path_buf(),
+        fmt: Format::Best,
+        cookies_browser: None,
+        download_name: None,
+    }
+}
+
+#[test]
+fn yt_dlp_never_continues_another_links_part_file() {
+    let out = tmp_out();
+    let state = out.join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let job = ytdlp_direct_job(&out);
+    // Nothing there: nothing to guard.
+    assert_eq!(ytdlp_foreign_part_in(&job, &out, &state), None);
+    assert!(build(&job, &tc_ytdlp()).is_ok());
+    // A stranger's partial (no origin record): yt-dlp would continue it.
+    let part = out.join("file.zip.part");
+    std::fs::write(&part, b"another link's bytes").unwrap();
+    assert_eq!(
+        ytdlp_foreign_part_in(&job, &out, &state).as_deref(),
+        Some("file.zip.part")
+    );
+    // The command is refused with and without aria2c as the downloader, and
+    // the stranger's file is left alone.
+    assert!(build(&job, &tc_ytdlp()).is_err());
+    assert!(build(&job, &tc_both()).is_err());
+    assert_eq!(std::fs::read(&part).unwrap(), b"another link's bytes");
+    // The origin record for the SAME link makes the partial ours to continue...
+    std::fs::write(
+        aria2_origin_path(&out, "file.zip", &state),
+        aria2_url_hash(&job.url),
+    )
+    .unwrap();
+    assert_eq!(ytdlp_foreign_part_in(&job, &out, &state), None);
+    // ...but not for another link that happens to save under the same name.
+    let other = Job {
+        url: "https://other.example/dl/file.zip".into(),
+        ..job.clone()
+    };
+    assert!(ytdlp_foreign_part_in(&other, &out, &state).is_some());
+    // A media page is not a pinned download: no such guard (yt-dlp names the
+    // file itself).
+    let page = Job {
+        url: "https://youtube.com/watch?v=1".into(),
+        ..job
+    };
+    assert_eq!(ytdlp_foreign_part_in(&page, &out, &state), None);
+    std::fs::remove_dir_all(&out).ok();
+}
+
+#[test]
+fn a_pinned_yt_dlp_download_takes_the_same_lock_and_origin_record_as_aria2() {
+    let out = tmp_out();
+    let state = out.join("state");
+    let job = ytdlp_direct_job(&out);
+    let lock = lock_aria2_target_in(&job, false, &state)
+        .unwrap()
+        .expect("a pinned direct download is locked");
+    assert!(
+        lock_aria2_target_in(&job, false, &state).is_err(),
+        "two downloads must not share a name"
+    );
+    // An empty slot is claimed for this link.
+    assert_eq!(
+        std::fs::read_to_string(aria2_origin_path(&out, "file.zip", &state)).unwrap(),
+        aria2_url_hash(&job.url)
+    );
+    drop(lock);
+    // A media page is not locked.
+    let page = Job {
+        url: "https://youtube.com/watch?v=1".into(),
+        ..job.clone()
+    };
+    assert!(lock_aria2_target_in(&page, false, &state)
+        .unwrap()
+        .is_none());
+    std::fs::remove_dir_all(&out).ok();
+
+    // A slot that already holds someone's `.part` is NOT claimed: the record
+    // must not turn a stranger's partial into ours.
+    let busy = tmp_out();
+    let state = busy.join("state");
+    std::fs::create_dir_all(&busy).unwrap();
+    std::fs::write(busy.join("file.zip.part"), b"stranger").unwrap();
+    let job = ytdlp_direct_job(&busy);
+    drop(lock_aria2_target_in(&job, false, &state).unwrap());
+    assert!(!aria2_origin_path(&busy, "file.zip", &state).exists());
+    assert!(ytdlp_foreign_part_in(&job, &busy, &state).is_some());
+    std::fs::remove_dir_all(&busy).ok();
+}

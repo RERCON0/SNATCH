@@ -199,6 +199,57 @@ pub(super) fn aria2_owned_partial(job: &Job, out: &Path) -> bool {
     aria2_state_dir().is_ok_and(|state| aria2_owned_partial_in(job, out, &state))
 }
 
+/// The file yt-dlp keeps a pinned direct download in until it is complete:
+/// `<-o name>.part`. `None` for anything that is not such a download.
+fn ytdlp_part_path(job: &Job, out: &Path) -> Option<PathBuf> {
+    ytdlp_direct_output(job)?;
+    let name = limit_name(&aria2_job_name(job), YTDLP_OUTPUT_LIMIT);
+    Some(out.join(format!("{name}.part")))
+}
+
+/// yt-dlp continues whatever `<name>.part` it finds, whoever left it, and never
+/// asks where the bytes came from: a partial of another link under the same
+/// name ends up inside this one's file, with a clean exit. Only a partial this
+/// app recorded for the SAME URL (the origin record the lock writes) may be
+/// continued; anything else must stop before yt-dlp runs. Returns the file
+/// name for messages.
+pub(super) fn ytdlp_foreign_part_in(job: &Job, out: &Path, state_dir: &Path) -> Option<String> {
+    let part = ytdlp_part_path(job, out)?;
+    if !part.is_file() {
+        return None;
+    }
+    let owned = std::fs::read_to_string(aria2_origin_path(out, &aria2_job_name(job), state_dir))
+        .is_ok_and(|fingerprint| fingerprint == aria2_url_hash(&job.url));
+    (!owned).then(|| {
+        part.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned()
+    })
+}
+
+pub(super) fn ytdlp_foreign_part(job: &Job, out: &Path) -> Option<String> {
+    match aria2_state_dir() {
+        Ok(state) => ytdlp_foreign_part_in(job, out, &state),
+        // Ownership cannot be checked: treat the partial as someone else's.
+        Err(_) => ytdlp_part_path(job, out)
+            .filter(|part| part.is_file())
+            .map(|part| {
+                part.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+    }
+}
+
+/// Jobs whose target is guarded by the same-name lock and the origin record:
+/// aria2's own downloads, and direct links yt-dlp saves under a pinned name.
+fn needs_target_lock(job: &Job) -> bool {
+    (job.engine == Engine::Aria2 || ytdlp_direct_output(job).is_some())
+        && ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str())
+}
+
 pub(super) fn aria2_foreign_target(job: &Job, out: &Path) -> bool {
     let name = aria2_job_name(job);
     ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str())
@@ -232,7 +283,7 @@ pub(super) fn aria2_foreign_pair(job: &Job, out: &Path) -> Option<String> {
 /// inode while an earlier download still holds the old one; only a record idle
 /// for [`ARIA2_STATE_MAX_AGE`] (and not held) is swept.
 pub fn lock_aria2_target(job: &Job, wait: bool) -> Result<Option<std::fs::File>, String> {
-    if job.engine != Engine::Aria2 || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) {
+    if !needs_target_lock(job) {
         return Ok(None);
     }
     let state_dir = aria2_state_dir()?;
@@ -287,7 +338,7 @@ pub(super) fn lock_aria2_target_in(
     wait: bool,
     state_dir: &Path,
 ) -> Result<Option<std::fs::File>, String> {
-    if job.engine != Engine::Aria2 || !ALLOWED_SCHEMES.contains(&scheme_of(&job.url).as_str()) {
+    if !needs_target_lock(job) {
         return Ok(None);
     }
     let name = aria2_job_name(job);
@@ -337,7 +388,9 @@ pub(super) fn lock_aria2_target_in(
     }
     // Claim only an empty slot. Never certify an existing file or .aria2 as
     // ours just because the URL currently points at the same basename.
-    if !out.join(&name).exists() && !out.join(format!("{name}.aria2")).exists() {
+    // (a yt-dlp download also needs its `<name>.part` slot to be free)
+    let part_taken = ytdlp_part_path(job, &out).is_some_and(|part| part.exists());
+    if !out.join(&name).exists() && !out.join(format!("{name}.aria2")).exists() && !part_taken {
         std::fs::write(
             aria2_origin_path(&out, &name, state_dir),
             aria2_url_hash(&job.url),
