@@ -1043,7 +1043,7 @@ fn install_ffmpeg_inner(
             let idx = (0..archive.len())
                 .filter_map(|i| {
                     archive.by_index(i).ok().and_then(|e| {
-                        let name = e.name().to_string();
+                        let name = e.name().ok()?.into_owned();
                         if !e.is_dir() && name.ends_with(tool) {
                             Some((i, name.len()))
                         } else {
@@ -1198,7 +1198,7 @@ fn install_deno_inner(
         let idx = (0..archive.len())
             .filter_map(|i| {
                 archive.by_index(i).ok().and_then(|e| {
-                    let name = e.name().to_string();
+                    let name = e.name().ok()?.into_owned();
                     (!e.is_dir() && name.ends_with("deno.exe")).then_some((i, name.len()))
                 })
             })
@@ -1553,7 +1553,7 @@ fn install_aria2_inner(
         let entry_idx = (0..archive.len())
             .filter_map(|i| {
                 archive.by_index(i).ok().and_then(|e| {
-                    let name = e.name().to_string();
+                    let name = e.name().ok()?.into_owned();
                     if !e.is_dir() && name.ends_with("aria2c.exe") {
                         Some((i, name.len()))
                     } else {

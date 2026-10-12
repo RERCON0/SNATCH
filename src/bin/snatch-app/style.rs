@@ -35,7 +35,9 @@ pub(super) fn setup_theme(ctx: &egui::Context, dark: bool) {
         ..Default::default()
     };
     let data = egui::FontData::from_static(BUNDLED_MONO).tweak(tweak);
-    fonts.font_data.insert("mono-system".to_owned(), data);
+    fonts
+        .font_data
+        .insert("mono-system".to_owned(), data.into());
     for family in [egui::FontFamily::Monospace, egui::FontFamily::Proportional] {
         if let Some(list) = fonts.families.get_mut(&family) {
             list.insert(0, "mono-system".to_owned());
@@ -46,10 +48,12 @@ pub(super) fn setup_theme(ctx: &egui::Context, dark: bool) {
     // rows remain aligned while popup captions clear the separator below.
     fonts.font_data.insert(
         "mono-button".to_owned(),
-        egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
-            y_offset_factor: 0.0,
-            ..Default::default()
-        }),
+        egui::FontData::from_static(BUNDLED_MONO)
+            .tweak(egui::FontTweak {
+                y_offset_factor: 0.0,
+                ..Default::default()
+            })
+            .into(),
     );
     fonts.families.insert(
         egui::FontFamily::Name("button".into()),
@@ -61,10 +65,12 @@ pub(super) fn setup_theme(ctx: &egui::Context, dark: bool) {
     // boxed controls should also share one baseline with each other.
     fonts.font_data.insert(
         "mono-field".to_owned(),
-        egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
-            y_offset_factor: 0.0,
-            ..Default::default()
-        }),
+        egui::FontData::from_static(BUNDLED_MONO)
+            .tweak(egui::FontTweak {
+                y_offset_factor: 0.0,
+                ..Default::default()
+            })
+            .into(),
     );
     fonts.families.insert(
         egui::FontFamily::Name("field".into()),
@@ -72,10 +78,12 @@ pub(super) fn setup_theme(ctx: &egui::Context, dark: bool) {
     );
     fonts.font_data.insert(
         "mono-title".to_owned(),
-        egui::FontData::from_static(BUNDLED_MONO).tweak(egui::FontTweak {
-            y_offset_factor: -0.08,
-            ..Default::default()
-        }),
+        egui::FontData::from_static(BUNDLED_MONO)
+            .tweak(egui::FontTweak {
+                y_offset_factor: -0.08,
+                ..Default::default()
+            })
+            .into(),
     );
     fonts.families.insert(
         egui::FontFamily::Name("title".into()),
@@ -115,7 +123,7 @@ pub(super) fn setup_theme(ctx: &egui::Context, dark: bool) {
         // glyphs were sitting on. Roomier vertical window margin pushes that
         // line away from the text in every popup; the horizontal part just
         // gives popup content some air.
-        style.spacing.window_margin = egui::Margin::symmetric(10.0, 15.0);
+        style.spacing.window_margin = egui::Margin::symmetric(10, 15);
         // Default egui scrollbars are a floating, translucent overlay that
         // pops up over content and hides when idle - fine for a generic app,
         // but it breaks this app's whole premise that nothing overlaps and
@@ -194,8 +202,8 @@ pub(super) fn terminal_visuals(dark: bool) -> egui::Visuals {
     } else {
         egui::Visuals::light()
     };
-    v.window_rounding = egui::Rounding::ZERO;
-    v.menu_rounding = egui::Rounding::ZERO;
+    v.window_corner_radius = egui::CornerRadius::ZERO;
+    v.menu_corner_radius = egui::CornerRadius::ZERO;
     v.window_fill = bg_lift;
     v.window_stroke = egui::Stroke::new(1.0_f32, line);
     v.window_shadow = egui::Shadow::NONE;
@@ -221,7 +229,7 @@ pub(super) fn terminal_visuals(dark: bool) -> egui::Visuals {
         &mut v.widgets.active,
         &mut v.widgets.open,
     ] {
-        w.rounding = egui::Rounding::ZERO;
+        w.corner_radius = egui::CornerRadius::ZERO;
         // bg_fill backs checkboxes/sliders and must stay visible; weak_bg_fill
         // backs plain buttons and is what makes them "ghost" (border only).
         w.bg_fill = field;
@@ -355,7 +363,7 @@ pub(super) fn job_controls(
             if let Some(p) = progress {
                 bar_ui.add(
                     egui::ProgressBar::new(p)
-                        .rounding(egui::Rounding::ZERO)
+                        .corner_radius(egui::CornerRadius::ZERO)
                         .fill(fill)
                         .desired_width(bar_w)
                         .desired_height(HEIGHT),
@@ -363,7 +371,7 @@ pub(super) fn job_controls(
             } else if paused {
                 bar_ui.add(
                     egui::ProgressBar::new(0.0)
-                        .rounding(egui::Rounding::ZERO)
+                        .corner_radius(egui::CornerRadius::ZERO)
                         .fill(fill)
                         .desired_width(bar_w)
                         .desired_height(HEIGHT),
@@ -377,8 +385,9 @@ pub(super) fn job_controls(
             if paused {
                 ui.painter().rect_stroke(
                     rect,
-                    egui::Rounding::ZERO,
+                    egui::CornerRadius::ZERO,
                     egui::Stroke::new(1.0_f32, fill),
+                    egui::StrokeKind::Middle,
                 );
             }
             (

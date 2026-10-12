@@ -169,15 +169,25 @@ pub(super) fn aria2_target_key(out: &Path, name: &str) -> String {
         }
         .as_bytes(),
     );
-    format!("{:x}", hash.finalize())
+    hex_digest(&hash.finalize())
 }
 
 pub(super) fn aria2_origin_path(out: &Path, name: &str, state_dir: &Path) -> PathBuf {
     state_dir.join(format!("{}.origin", aria2_target_key(out, name)))
 }
 
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        result.push(HEX[(byte >> 4) as usize] as char);
+        result.push(HEX[(byte & 15) as usize] as char);
+    }
+    result
+}
+
 pub(super) fn aria2_url_hash(url: &str) -> String {
-    format!("{:x}", Sha256::digest(url.as_bytes()))
+    hex_digest(&Sha256::digest(url.as_bytes()))
 }
 
 pub(super) fn canonical_is_unc(path: &Path) -> bool {

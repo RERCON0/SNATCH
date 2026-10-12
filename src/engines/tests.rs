@@ -2161,3 +2161,14 @@ fn a_pinned_yt_dlp_download_takes_the_same_lock_and_origin_record_as_aria2() {
     assert!(ytdlp_foreign_part_in(&job, &busy, &state).is_some());
     std::fs::remove_dir_all(&busy).ok();
 }
+#[test]
+fn sha256_upgrade_preserves_resume_origin_fingerprints() {
+    assert_eq!(
+        aria2_url_hash("abc"),
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    );
+    assert_eq!(
+        aria2_url_hash(""),
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    );
+}

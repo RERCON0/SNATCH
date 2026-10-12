@@ -6,8 +6,13 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     groups:
+      interface:
+        patterns: ["eframe", "egui*", "epaint*", "emath", "ecolor", "image"]
+      network:
+        patterns: ["reqwest", "hyper*", "native-tls", "schannel", "tokio*"]
       rust-dependencies:
         patterns: ["*"]
+        exclude-patterns: ["eframe", "egui*", "epaint*", "emath", "ecolor", "image", "reqwest", "hyper*", "native-tls", "schannel", "tokio*"]
   - package-ecosystem: github-actions
     directory: /
     schedule:

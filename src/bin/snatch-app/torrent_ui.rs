@@ -9,8 +9,8 @@ pub(super) fn torrent_pick_window(
     let mut act = PickActions::default();
     // Never wider than the window: at the default 460px a fixed 560px dialog
     // pushed the folder toggles/checkboxes off-screen. Frame margins + a gap.
-    let screen_w = ctx.screen_rect().width();
-    let frame_w = ctx.style().spacing.window_margin.sum().x + 24.0;
+    let screen_w = ctx.content_rect().width();
+    let frame_w = ctx.global_style().spacing.window_margin.sum().x + 24.0;
     let width = (screen_w - frame_w).clamp(200.0, 560.0);
     let shown = egui::Window::new(window_title(tr!("TORRENT FILE SELECTION", "ВЫБОР ФАЙЛОВ ТОРРЕНТА")))
         .collapsible(false)

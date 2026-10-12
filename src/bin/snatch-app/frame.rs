@@ -1,16 +1,28 @@
 use super::*;
 
 impl eframe::App for SnatchApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Downloads, setup and cancellation continue while the window is hidden.
+        self.drain(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         // eframe re-applies the OS scale factor on DPI/monitor changes, so
         // the pin is re-asserted every frame, not just at startup.
         pin_pixel_scale(ctx, false);
-        self.drain(ctx);
         let log_was_open = self.show_log_window;
         // A drop while the pick modal is open would swap the URL field from
         // under the torrent being picked.
         if self.phase != Phase::Setup && self.torrent_pick.is_none() {
-            let dropped = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone()));
+            let dropped = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .map(|f| f.path().to_path_buf())
+                    .next()
+            });
             if let Some(path) = dropped {
                 self.set_torrent_file(&path);
             }
@@ -33,19 +45,19 @@ impl eframe::App for SnatchApp {
         }
 
         #[cfg(windows)]
-        self.ui_title_bar(ctx);
+        self.ui_title_bar(ui);
 
         // The mockup's footer is its own full-width band, with a hairline at
         // the top and 26px side padding. Keeping it outside the scrollable
         // form also prevents long status/warning text from overlapping it.
-        egui::TopBottomPanel::bottom("app_footer")
+        egui::Panel::bottom("app_footer")
             .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(egui::Margin::symmetric(26.0, 10.0)),
+                egui::Frame::NONE
+                    .fill(ctx.global_style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(26, 10)),
             )
             .show_separator_line(true)
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.weak(egui::RichText::new(format!("snatch {APP_VERSION}")).size(11.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -60,11 +72,11 @@ impl eframe::App for SnatchApp {
 
         egui::CentralPanel::default()
             .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.panel_fill)
-                    .inner_margin(egui::Margin::symmetric(26.0, 18.0)),
+                egui::Frame::NONE
+                    .fill(ctx.global_style().visuals.panel_fill)
+                    .inner_margin(egui::Margin::symmetric(26, 18)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
             // Choosing files (or reading a listing error) is modal: the form
             // under the dim overlay takes no clicks/keys. Its window has a
             // cancel. While the list only loads, see the form rows below.
@@ -94,7 +106,7 @@ impl eframe::App for SnatchApp {
                 // первой строки ASCII-арта, и она встаёт на символ левее остальных.
                 let lines: Vec<&str> = BANNER.trim_matches(['\r', '\n']).lines().collect();
                 let line_width = |ui: &egui::Ui, text: &str, size: f32| -> f32 {
-                    ui.fonts(|f| {
+                    ui.fonts_mut(|f| {
                         let job = egui::text::LayoutJob::single_section(
                             text.to_string(),
                             egui::TextFormat {
@@ -124,7 +136,7 @@ impl eframe::App for SnatchApp {
                             size -= 0.5;
                         }
                         let block_w = width_at(size) + 2.0;
-                        let row_h = ui.fonts(|f| {
+                        let row_h = ui.fonts_mut(|f| {
                             let job = egui::text::LayoutJob::single_section(
                                 "█".to_string(),
                                 egui::TextFormat {
@@ -231,7 +243,7 @@ impl eframe::App for SnatchApp {
             if picking {
                 // Middle order: above the panels, below the Foreground pick
                 // window. Paint only - the form itself is disabled above.
-                let screen = ctx.screen_rect();
+                let screen = ctx.content_rect();
                 ctx.layer_painter(egui::LayerId::new(
                     egui::Order::Middle,
                     egui::Id::new("torrent-pick-dim"),

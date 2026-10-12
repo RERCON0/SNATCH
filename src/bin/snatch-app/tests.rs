@@ -298,7 +298,7 @@ fn viewport_sizes_are_in_egui_points_without_a_second_scale() {
             .get_mut(&egui::ViewportId::ROOT)
             .unwrap()
             .native_pixels_per_point = Some(native);
-        let output = ctx.run(input, |ctx| pin_pixel_scale(ctx, true));
+        let output = test_ui(&ctx, input, |ui| pin_pixel_scale(ui.ctx(), true));
         let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
         assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(460.0, 720.0))));
         assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::MinInnerSize(size) if *size == egui::vec2(460.0, 600.0))));
@@ -444,8 +444,8 @@ fn job_controls_keep_same_height_with_and_without_progress() {
         ..Default::default()
     };
     let mut heights = Vec::new();
-    let _ = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let _ = test_ui(&ctx, input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let green = ui.visuals().hyperlink_color;
             let yellow = ui.visuals().warn_fg_color;
             for (progress, paused, fill, labels) in [
@@ -536,8 +536,8 @@ fn torrent_pick_rows_have_the_height_show_rows_assumes() {
         ..Default::default()
     };
     let (mut heights, mut pitch) = (Vec::new(), 0.0);
-    let _ = ctx.run(input, |ctx| {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    let _ = test_ui(&ctx, input, |ui| {
+        egui::CentralPanel::default().show(ui, |ui| {
             let row_h = torrent_row_height(ui);
             pitch = row_h + ui.spacing().item_spacing.y;
             for row in &rows {
@@ -606,7 +606,9 @@ fn torrent_pick_window_fits_the_default_window() {
                 screen_rect: Some(screen),
                 ..Default::default()
             };
-            let _ = ctx.run(input, |ctx| {
+            let _ = test_ui(&ctx, input, |ui| {
+                let ctx = ui.ctx().clone();
+                let ctx = &ctx;
                 let (act, shown) = torrent_pick_window(ctx, pick);
                 (rect, buttons) = (shown, act.buttons);
             });
@@ -684,4 +686,14 @@ fn one_frame_handles_a_bounded_batch_of_messages() {
     app.drain(&egui::Context::default());
     // The rest waits for the next frame instead of freezing this one.
     assert_eq!(app.rx.try_iter().count(), total - DRAIN_BUDGET);
+}
+
+fn test_ui(
+    ctx: &egui::Context,
+    input: egui::RawInput,
+    draw: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut output = ctx.run_ui(input, draw);
+    output.textures_delta.clear();
+    output
 }

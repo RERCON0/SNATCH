@@ -32,19 +32,21 @@ impl SnatchApp {
     }
 
     #[cfg(windows)]
-    pub(super) fn ui_title_bar(&mut self, ctx: &egui::Context) {
+    pub(super) fn ui_title_bar(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         // Borderless Windows viewport: a roomier version of the HTML titlebar, flat,
         // with a thin line below. The draggable area excludes the window
         // buttons so a click there never accidentally moves the window.
-        egui::TopBottomPanel::top("app_titlebar")
-            .exact_height(42.0)
+        egui::Panel::top("app_titlebar")
+            .exact_size(42.0)
             .show_separator_line(true)
             .frame(
-                egui::Frame::none()
-                    .fill(ctx.style().visuals.window_fill)
-                    .inner_margin(egui::Margin::symmetric(14.0, 0.0)),
+                egui::Frame::NONE
+                    .fill(ctx.global_style().visuals.window_fill)
+                    .inner_margin(egui::Margin::symmetric(14, 0)),
             )
-            .show(ctx, |ui| {
+            .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 0.0;
                     let title_width =
@@ -139,7 +141,7 @@ impl SnatchApp {
         if ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized)) {
             return;
         }
-        let screen = ctx.screen_rect();
+        let screen = ctx.content_rect();
         let e = 6.0;
         let w = screen.width();
         let h = screen.height();
@@ -235,7 +237,7 @@ impl SnatchApp {
                     .desired_width(f32::INFINITY)
                     // Default TextEdit margin is (4,2) - the mockup's inputs
                     // use `padding: 9px 11px`, noticeably roomier.
-                    .margin(egui::Margin::symmetric(11.0, 9.0))
+                    .margin(egui::Margin::symmetric(11, 9))
                     .hint_text(tr!(
                         "https://… magnet:… or a .torrent path",
                         "https://… magnet:… или путь к .torrent"
@@ -428,7 +430,7 @@ impl SnatchApp {
                     egui::TextEdit::singleline(&mut self.out_dir)
                         .font(field_font())
                         .desired_width(f32::INFINITY)
-                        .margin(egui::Margin::symmetric(11.0, 9.0)),
+                        .margin(egui::Margin::symmetric(11, 9)),
                 );
             });
             if open_browser {
