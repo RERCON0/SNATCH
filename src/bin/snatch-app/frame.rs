@@ -4,6 +4,22 @@ impl eframe::App for SnatchApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Downloads, setup and cancellation continue while the window is hidden.
         self.drain(ctx);
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested {
+            // An open pick dies with the window; its aria2c is stopped too.
+            self.cancel_torrent_pick();
+        }
+        if close_requested && !self.jobs.is_empty() {
+            // eframe exits the event loop in THIS frame unless the close is
+            // vetoed - the old flag-only version let the process die before
+            // the monitor thread (100ms poll) reached kill(), orphaning the
+            // loader mid-download. Veto, cancel properly (job object kills
+            // the whole tree), and drain() re-issues Close once everything's
+            // actually done.
+            self.close_requested = true;
+            self.cancel_all();
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -26,22 +42,6 @@ impl eframe::App for SnatchApp {
             if let Some(path) = dropped {
                 self.set_torrent_file(&path);
             }
-        }
-        let close_requested = ctx.input(|i| i.viewport().close_requested());
-        if close_requested {
-            // An open pick dies with the window; its aria2c is stopped too.
-            self.cancel_torrent_pick();
-        }
-        if close_requested && !self.jobs.is_empty() {
-            // eframe exits the event loop in THIS frame unless the close is
-            // vetoed - the old flag-only version let the process die before
-            // the monitor thread (100ms poll) reached kill(), orphaning the
-            // loader mid-download. Veto, cancel properly (job object kills
-            // the whole tree), and drain() re-issues Close once everything's
-            // actually done.
-            self.close_requested = true;
-            self.cancel_all();
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
 
         #[cfg(windows)]

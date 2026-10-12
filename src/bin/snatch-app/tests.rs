@@ -26,6 +26,48 @@ fn test_job(url: &str) -> Job {
 }
 
 #[test]
+fn closing_a_hidden_window_cancels_and_waits_for_its_downloads() {
+    let ctx = egui::Context::default();
+    let mut app = test_app();
+    let cancel = Arc::new(AtomicBool::new(false));
+    app.jobs.push(ActiveJob {
+        id: 1,
+        job: test_job("https://example.test/video"),
+        label: "video".into(),
+        progress: None,
+        status: String::new(),
+        status_kind: StatusKind::None,
+        warns: vec![],
+        cancel_flag: cancel.clone(),
+        cancelled: false,
+        pausing: false,
+        auth_seen: false,
+        drm_seen: false,
+        subs_watch: engines::SubtitleWatch::default(),
+        missing_control_file: false,
+        resumed_seen: false,
+        corrupt_part_seen: false,
+        metadata_wait: false,
+        host_refused: false,
+        started_at: std::time::SystemTime::now(),
+        no_continue: false,
+        select: torrent::Choice::default(),
+    });
+    let mut input = egui::RawInput::default();
+    let viewport = input.viewports.get_mut(&egui::ViewportId::ROOT).unwrap();
+    viewport.minimized = Some(true);
+    viewport.events.push(egui::ViewportEvent::Close);
+    let output = ctx.run_logic(&input, |ctx| {
+        eframe::App::logic(&mut app, ctx, &mut eframe::Frame::_new_kittest());
+    });
+    assert!(app.close_requested && app.jobs[0].cancelled);
+    assert!(cancel.load(Ordering::SeqCst));
+    assert!(output.viewport_commands[&egui::ViewportId::ROOT]
+        .iter()
+        .any(|command| matches!(command, egui::ViewportCommand::CancelClose)));
+}
+
+#[test]
 fn setup_progress_text_shows_bytes_percent_and_a_fallback() {
     let p = SetupProgress {
         label: "ffmpeg".to_string(),
