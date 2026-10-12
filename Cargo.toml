@@ -22,7 +22,8 @@ path = "src/bin/snatch-cli/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow"] }
+# Native Linux backends are explicit when eframe's defaults are disabled.
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 fs4 = "1.1"
 # eframe already pulls this in transitively to decode its own icons/textures
 # (see Cargo.lock) - declaring it directly just lets our own code call it too,
