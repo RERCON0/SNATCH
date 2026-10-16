@@ -44,7 +44,7 @@ tokio = { version = "1", features = ["rt", "time", "macros"] }
 # Already in the tree via inquire/indicatif (see Cargo.lock): the CLI torrent
 # picker clips rows by terminal cells, where CJK takes two.
 unicode-width = "0.2"
-zip = { version = "9", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 # Already present transitively; nonblocking opens keep planted FIFOs from
