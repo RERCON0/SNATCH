@@ -35,6 +35,8 @@ mod form;
 mod frame;
 mod launch;
 mod model;
+#[cfg(windows)]
+mod placement;
 mod session;
 mod style;
 mod torrent_ui;
@@ -60,6 +62,7 @@ const THEME_BTN_WIDTH: f32 = 56.0;
 // (accent/OK), .warn_fg_color, .error_fg_color rather than a fixed constant.
 
 struct SnatchApp {
+    startup_frames: u8,
     url: String,
     /// One debounced worker and one result; editing links cannot create an
     /// unbounded thread/cache queue. A result for an old URL is discarded.
@@ -199,6 +202,7 @@ impl SnatchApp {
         let drives = snatch_rs::ui::drive_roots();
         let dark_mode = cfg.dark_mode;
         Self {
+            startup_frames: 0,
             url: String::new(),
             link_input: String::new(),
             link_changed_at: Instant::now(),
@@ -506,6 +510,7 @@ fn main() -> eframe::Result {
     }
     let options = eframe::NativeOptions {
         viewport,
+        centered: true,
         ..Default::default()
     };
     let result = eframe::run_native(
