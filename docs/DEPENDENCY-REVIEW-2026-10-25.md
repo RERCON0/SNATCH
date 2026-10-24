@@ -5,6 +5,6 @@
 - Replace yanked clipboard-win 5.4.1 with 5.4.3.
 - The ZIP extraction advisories were already addressed by the previous zip 9.0.4 update (commit 9dba20f); retain fixed-name, bounded extraction in the installers.
 - Dependabot PR #2 proposes an eframe 0.37 migration; it is a routine 0.x API update, not an open security alert. Keep that compatibility change separate from this patch release.
-- PR #4 proposes routine grouped dependency updates; inspect its actual changes independently of the alert list.
+- PR #4 proposes routine sha2 0.11.1 and libc 0.2.191 patch updates. The inspected changes are maintenance proposals, not current security findings; keep them separate from the targeted Tokio/clipboard fixes in this release.
 
 Verdict: the remaining version proposals are maintenance updates; the security and yanked-version findings above are checked against the current locked dependency graph.
