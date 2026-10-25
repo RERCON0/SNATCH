@@ -91,6 +91,33 @@ pub(super) fn center(frame: &eframe::Frame) {
     }
 }
 
+#[link(name = "dwmapi")]
+extern "system" {
+    fn DwmSetWindowAttribute(
+        window: *mut c_void,
+        attribute: u32,
+        value: *const c_void,
+        size: u32,
+    ) -> i32;
+}
+
+pub(super) fn square_window_corners(cc: &eframe::CreationContext<'_>) {
+    let Ok(handle) = cc.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::Win32(handle) = handle.as_raw() else {
+        return;
+    };
+    let window = handle.hwnd.get() as *mut c_void;
+    let square: u32 = 1; // DWMWCP_DONOTROUND
+    let no_border: u32 = 0xfffffffe; // DWMWA_COLOR_NONE
+                                     // These attributes are ignored on Windows versions that do not support them.
+    unsafe {
+        DwmSetWindowAttribute(window, 33, (&square as *const u32).cast(), 4);
+        DwmSetWindowAttribute(window, 34, (&no_border as *const u32).cast(), 4);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

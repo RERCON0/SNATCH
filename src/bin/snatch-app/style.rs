@@ -237,6 +237,9 @@ pub(super) fn terminal_visuals(dark: bool) -> egui::Visuals {
     v.widgets.noninteractive.weak_bg_fill = bg;
     v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0_f32, line);
     v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_dim);
+    // Weak labels blend into the background using the established palette.
+    // New egui's default alpha produces brighter ASCII and muted labels.
+    v.weak_text_color = Some(egui::ecolor::tint_color_towards(text_dim, bg));
 
     v.widgets.inactive.weak_bg_fill = egui::Color32::TRANSPARENT;
     v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, line);
@@ -531,6 +534,8 @@ pub(super) fn dashed_separator(ui: &mut egui::Ui) {
 /// take egui points and winit applies the effective scale itself; multiplying
 /// those dimensions again would scale the window twice.
 pub(super) const UI_SCALE: f32 = 1.18;
+// Initial window size: about 678 x 1062 physical pixels at the pinned UI scale.
+pub(super) const WINDOW_SIZE: [f32; 2] = [575.0, 900.0];
 
 pub(super) fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     if ctx.pixels_per_point() == UI_SCALE && !resize_viewport {
@@ -538,7 +543,7 @@ pub(super) fn pin_pixel_scale(ctx: &egui::Context, resize_viewport: bool) {
     }
     ctx.set_pixels_per_point(UI_SCALE);
     if resize_viewport {
-        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(460.0, 720.0)));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(WINDOW_SIZE.into()));
     }
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
         460.0, 600.0,

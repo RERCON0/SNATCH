@@ -342,8 +342,55 @@ fn viewport_sizes_are_in_egui_points_without_a_second_scale() {
             .native_pixels_per_point = Some(native);
         let output = test_ui(&ctx, input, |ui| pin_pixel_scale(ui.ctx(), true));
         let commands = &output.viewport_output[&egui::ViewportId::ROOT].commands;
-        assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(460.0, 720.0))));
+        assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::InnerSize(size) if *size == egui::vec2(WINDOW_SIZE[0], WINDOW_SIZE[1]))));
         assert!(commands.iter().any(|c| matches!(c, egui::ViewportCommand::MinInnerSize(size) if *size == egui::vec2(460.0, 600.0))));
+    }
+}
+
+#[test]
+fn muted_ascii_uses_the_expected_palette_in_both_themes() {
+    assert_eq!(
+        terminal_visuals(true).weak_text_color(),
+        egui::Color32::from_rgb(70, 70, 77)
+    );
+    assert_eq!(
+        terminal_visuals(false).weak_text_color(),
+        egui::Color32::from_rgb(167, 167, 169)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn resize_edges_show_native_cursors() {
+    let ctx = egui::Context::default();
+    let app = test_app();
+    for (pos, expected) in [
+        (egui::pos2(2.0, 300.0), egui::CursorIcon::ResizeHorizontal),
+        (egui::pos2(573.0, 300.0), egui::CursorIcon::ResizeHorizontal),
+        (egui::pos2(200.0, 2.0), egui::CursorIcon::ResizeVertical),
+        (egui::pos2(200.0, 898.0), egui::CursorIcon::ResizeVertical),
+        (egui::pos2(2.0, 2.0), egui::CursorIcon::ResizeNwSe),
+        (egui::pos2(573.0, 898.0), egui::CursorIcon::ResizeNwSe),
+        (egui::pos2(573.0, 2.0), egui::CursorIcon::ResizeNeSw),
+        (egui::pos2(2.0, 898.0), egui::CursorIcon::ResizeNeSw),
+    ] {
+        let mut cursor = egui::CursorIcon::Default;
+        for _ in 0..3 {
+            let out = test_ui(
+                &ctx,
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(575.0, 900.0),
+                    )),
+                    events: vec![egui::Event::PointerMoved(pos)],
+                    ..Default::default()
+                },
+                |_| app.ui_resize_edges(&ctx),
+            );
+            cursor = out.platform_output.cursor_icon;
+        }
+        assert_eq!(cursor, expected, "at {pos:?}");
     }
 }
 

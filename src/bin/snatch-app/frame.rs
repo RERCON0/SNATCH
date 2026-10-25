@@ -1,6 +1,15 @@
 use super::*;
 
 impl eframe::App for SnatchApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        self.window_state.save(storage);
+    }
+
+    fn persist_egui_memory(&self) -> bool {
+        // Store native geometry only; input text and transient UI stay private.
+        false
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Downloads, setup and cancellation continue while the window is hidden.
         self.drain(ctx);
@@ -29,17 +38,27 @@ impl eframe::App for SnatchApp {
         // the pin is re-asserted every frame, not just at startup.
         pin_pixel_scale(ctx, false);
         // Center the final native size after the pinned UI scale reaches Windows.
-        if self.startup_frames < 2 && ctx.current_pass_index() == 0 {
+        if self.startup_frames < 3 && ctx.current_pass_index() == 0 {
             self.startup_frames += 1;
             if self.startup_frames == 2 {
+                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(
+                    self.window_state.size.into(),
+                ));
+            }
+            if self.startup_frames == 3 {
                 #[cfg(windows)]
                 placement::center(_frame);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(
+                    self.window_state.maximized,
+                ));
                 #[cfg(not(windows))]
                 if let Some(center) = egui::ViewportCommand::center_on_screen(ctx) {
                     ctx.send_viewport_cmd(center);
                 }
             }
             ctx.request_repaint();
+        } else if self.startup_frames == 3 && ctx.current_pass_index() == 0 {
+            self.window_state.observe(ctx);
         }
         let log_was_open = self.show_log_window;
         // A drop while the pick modal is open would swap the URL field from

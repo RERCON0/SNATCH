@@ -138,65 +138,44 @@ impl SnatchApp {
 
     #[cfg(windows)]
     pub(super) fn ui_resize_edges(&self, ctx: &egui::Context) {
-        if ctx.input(|i| i.viewport().maximized.unwrap_or(self.maximized)) {
+        if ctx.input(|i| i.viewport().maximized.unwrap_or(false)) {
             return;
         }
-        let screen = ctx.content_rect();
-        let e = 6.0;
-        let w = screen.width();
-        let h = screen.height();
-        let handles = [
-            (
-                egui::pos2(0.0, 0.0),
-                egui::vec2(e, e),
-                egui::ResizeDirection::NorthWest,
-            ),
-            (
-                egui::pos2(e, 0.0),
-                egui::vec2(w - 2.0 * e, e),
-                egui::ResizeDirection::North,
-            ),
-            (
-                egui::pos2(w - e, 0.0),
-                egui::vec2(e, e),
-                egui::ResizeDirection::NorthEast,
-            ),
-            (
-                egui::pos2(0.0, e),
-                egui::vec2(e, h - 2.0 * e),
-                egui::ResizeDirection::West,
-            ),
-            (
-                egui::pos2(w - e, e),
-                egui::vec2(e, h - 2.0 * e),
-                egui::ResizeDirection::East,
-            ),
-            (
-                egui::pos2(0.0, h - e),
-                egui::vec2(e, e),
-                egui::ResizeDirection::SouthWest,
-            ),
-            (
-                egui::pos2(e, h - e),
-                egui::vec2(w - 2.0 * e, e),
-                egui::ResizeDirection::South,
-            ),
-            (
-                egui::pos2(w - e, h - e),
-                egui::vec2(e, e),
-                egui::ResizeDirection::SouthEast,
-            ),
-        ];
-        for (i, (pos, size, direction)) in handles.into_iter().enumerate() {
-            egui::Area::new(egui::Id::new(("window_resize", i)))
-                .order(egui::Order::Foreground)
-                .fixed_pos(pos)
-                .show(ctx, |ui| {
-                    let (_, response) = ui.allocate_exact_size(size, egui::Sense::drag());
-                    if response.drag_started() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-                    }
-                });
+        let rect = ctx.input(|i| i.viewport_rect());
+        let Some(pos) = ctx.pointer_hover_pos() else {
+            return;
+        };
+        if !rect.contains(pos) {
+            return;
+        }
+        let margin = 6.0;
+        let left = pos.x < rect.left() + margin;
+        let right = pos.x > rect.right() - margin;
+        let top = pos.y < rect.top() + margin;
+        let bottom = pos.y > rect.bottom() - margin;
+        use egui::viewport::ResizeDirection as D;
+        let direction = match (left, right, top, bottom) {
+            (true, _, true, _) => Some(D::NorthWest),
+            (_, true, true, _) => Some(D::NorthEast),
+            (true, _, _, true) => Some(D::SouthWest),
+            (_, true, _, true) => Some(D::SouthEast),
+            (true, _, _, _) => Some(D::West),
+            (_, true, _, _) => Some(D::East),
+            (_, _, true, _) => Some(D::North),
+            (_, _, _, true) => Some(D::South),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            let cursor = match direction {
+                D::North | D::South => egui::CursorIcon::ResizeVertical,
+                D::East | D::West => egui::CursorIcon::ResizeHorizontal,
+                D::NorthEast | D::SouthWest => egui::CursorIcon::ResizeNeSw,
+                D::NorthWest | D::SouthEast => egui::CursorIcon::ResizeNwSe,
+            };
+            ctx.set_cursor_icon(cursor);
+            if ctx.input(|i| i.pointer.primary_pressed()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+            }
         }
     }
 

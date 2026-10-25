@@ -41,6 +41,7 @@ mod session;
 mod style;
 mod torrent_ui;
 mod view;
+mod window_state;
 use model::*;
 use style::*;
 
@@ -63,6 +64,7 @@ const THEME_BTN_WIDTH: f32 = 56.0;
 
 struct SnatchApp {
     startup_frames: u8,
+    window_state: window_state::WindowState,
     url: String,
     /// One debounced worker and one result; editing links cannot create an
     /// unbounded thread/cache queue. A result for an old URL is discarded.
@@ -155,7 +157,10 @@ impl SnatchApp {
         };
         i18n::set_language(cfg.language);
         setup_theme(&cc.egui_ctx, cfg.dark_mode);
-        pin_pixel_scale(&cc.egui_ctx, true);
+        // eframe has already restored the user's window size, if saved.
+        pin_pixel_scale(&cc.egui_ctx, false);
+        #[cfg(windows)]
+        placement::square_window_corners(cc);
         let (tx, rx) = channel();
         // Bitmask query, no filesystem I/O: the old per-letter exists() probe
         // blocked startup for seconds when a mapped network drive was dead
@@ -190,6 +195,7 @@ impl SnatchApp {
             );
             app.show_log_window = true;
         }
+        app.window_state = window_state::WindowState::load(cc.storage);
         app
     }
 
@@ -203,6 +209,7 @@ impl SnatchApp {
         let dark_mode = cfg.dark_mode;
         Self {
             startup_frames: 0,
+            window_state: window_state::WindowState::default(),
             url: String::new(),
             link_input: String::new(),
             link_changed_at: Instant::now(),
@@ -498,7 +505,7 @@ fn main() -> eframe::Result {
     }));
 
     let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([460.0, 720.0])
+        .with_inner_size(WINDOW_SIZE)
         .with_min_inner_size([460.0, 600.0])
         .with_title("SNATCH — by rercon prod.");
     #[cfg(windows)]
@@ -511,6 +518,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport,
         centered: true,
+        persist_window: false, // WindowState uses the pinned UI scale, not OS logical pixels.
         ..Default::default()
     };
     let result = eframe::run_native(
